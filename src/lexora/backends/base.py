@@ -1,0 +1,88 @@
+"""Base backend interface and exceptions."""
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+
+class BackendError(Exception):
+    """Base exception for backend errors."""
+
+    pass
+
+
+class BackendConnectionError(BackendError):
+    """Raised when connection to backend fails."""
+
+    pass
+
+
+class BackendTimeoutError(BackendError):
+    """Raised when request to backend times out."""
+
+    pass
+
+
+class BackendUnavailableError(BackendError):
+    """Raised when backend is unavailable (e.g., 503 status)."""
+
+    pass
+
+
+class Backend(ABC):
+    """Abstract base class for LLM backends."""
+
+    @abstractmethod
+    async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Send chat completion request to the backend.
+
+        Args:
+            request: OpenAI-compatible chat completion request.
+
+        Returns:
+            OpenAI-compatible chat completion response.
+
+        Raises:
+            BackendError: If the request fails.
+        """
+        pass
+
+    @abstractmethod
+    async def completions(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Send completion request to the backend.
+
+        Args:
+            request: OpenAI-compatible completion request.
+
+        Returns:
+            OpenAI-compatible completion response.
+
+        Raises:
+            BackendError: If the request fails.
+        """
+        pass
+
+    @abstractmethod
+    async def list_models(self) -> dict[str, Any]:
+        """List available models.
+
+        Returns:
+            OpenAI-compatible models list response.
+
+        Raises:
+            BackendError: If the request fails.
+        """
+        pass
+
+    @abstractmethod
+    async def health_check(self) -> bool:
+        """Check if the backend is healthy.
+
+        Returns:
+            True if backend is healthy, False otherwise.
+        """
+        pass
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Close any open connections."""
+        pass

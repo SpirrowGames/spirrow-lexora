@@ -1,0 +1,41 @@
+[Unit]
+Description=Lexora LLM Gateway
+Documentation=https://github.com/your-org/spirrow-lexora
+After=network.target
+
+[Service]
+Type=simple
+User=lexora
+Group=lexora
+WorkingDirectory=/opt/lexora
+
+# Environment variables (override in /etc/lexora/environment if needed)
+EnvironmentFile=-/etc/lexora/environment
+
+# Default environment
+Environment="LEXORA_VLLM__URL=http://localhost:8000"
+Environment="LEXORA_SERVER__HOST=0.0.0.0"
+Environment="LEXORA_SERVER__PORT=8001"
+Environment="LEXORA_LOGGING__FORMAT=json"
+Environment="LEXORA_LOGGING__LEVEL=INFO"
+
+# Main process
+ExecStart=/opt/lexora/venv/bin/python -m lexora.main
+
+# Restart configuration
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/lexora
+
+# Resource limits (adjust as needed)
+# LimitNOFILE=65535
+# MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

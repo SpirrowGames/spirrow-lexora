@@ -1,0 +1,30 @@
+# Lexora Configuration
+# Environment variables with LEXORA_ prefix override these values
+
+vllm:
+  url: "http://localhost:8000"
+  timeout: 120.0
+  connect_timeout: 5.0
+
+server:
+  host: "0.0.0.0"
+  port: 8001
+
+queue:
+  max_size: 1000
+  default_timeout: 60.0
+
+rate_limit:
+  enabled: true
+  default_rate: 10.0  # requests per second
+  default_burst: 20
+
+retry:
+  max_retries: 3
+  base_delay: 1.0     # seconds
+  max_delay: 30.0     # seconds
+  exponential_base: 2.0
+
+logging:
+  level: "INFO"
+  format: "console"   # "json" for production
