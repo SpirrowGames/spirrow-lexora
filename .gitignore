@@ -34,3 +34,6 @@ build/
 # Windows
 nul
 Thumbs.db
+
+# Misc (pip install typos, etc.)
+=*
