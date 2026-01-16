@@ -1,18 +1,21 @@
 """Main FastAPI application entry point."""
 
-import sys
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from lexora import __version__
 from lexora.api.routes import router
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import create_settings, Settings
+from lexora.services.metrics import MetricsCollector
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
+from lexora.services.router import BackendRouter
 from lexora.services.stats import StatsCollector
 from lexora.utils.logging import get_logger, setup_logging
 
@@ -35,12 +38,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Startup
     logger.info("lexora_starting", version=__version__)
 
-    # Initialize backend
-    app.state.backend = VLLMBackend(
-        base_url=settings.vllm.url,
-        timeout=settings.vllm.timeout,
-        connect_timeout=settings.vllm.connect_timeout,
+    # Initialize backend router (supports both single and multi-backend modes)
+    app.state.backend_router = BackendRouter(
+        routing_settings=settings.routing,
+        vllm_settings=settings.vllm,
     )
+    # For backward compatibility, also expose default backend as 'backend'
+    app.state.backend = app.state.backend_router.default_backend
 
     # Initialize services
     app.state.stats_collector = StatsCollector()
@@ -56,6 +60,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.rate_limit_enabled = settings.rate_limit.enabled
 
+    # Initialize metrics collector
+    app.state.metrics_collector = MetricsCollector(version=__version__)
+
     logger.info(
         "lexora_started",
         vllm_url=settings.vllm.url,
@@ -67,7 +74,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Shutdown
     logger.info("lexora_shutting_down")
-    await app.state.backend.close()
+    await app.state.backend_router.close()
     logger.info("lexora_shutdown_complete")
 
 
@@ -101,6 +108,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Include API routes
     app.include_router(router)
+
+    # Add metrics endpoint
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> PlainTextResponse:
+        """Prometheus metrics endpoint."""
+        return PlainTextResponse(
+            content=generate_latest(),
+            media_type=CONTENT_TYPE_LATEST,
+        )
 
     return app
 

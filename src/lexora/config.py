@@ -9,12 +9,32 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class BackendSettings(BaseSettings):
+    """Single backend settings."""
+
+    url: str = Field(default="http://localhost:8000", description="Backend server URL")
+    timeout: float = Field(default=120.0, description="Request timeout in seconds")
+    connect_timeout: float = Field(default=5.0, description="Connection timeout in seconds")
+    models: list[str] = Field(default_factory=list, description="Models served by this backend")
+
+
 class VLLMSettings(BaseSettings):
-    """vLLM backend settings."""
+    """vLLM backend settings (legacy, for single backend)."""
 
     url: str = Field(default="http://localhost:8000", description="vLLM server URL")
     timeout: float = Field(default=120.0, description="Request timeout in seconds")
     connect_timeout: float = Field(default=5.0, description="Connection timeout in seconds")
+
+
+class RoutingSettings(BaseSettings):
+    """Model routing settings."""
+
+    enabled: bool = Field(default=False, description="Enable multi-backend routing")
+    default_backend: str = Field(default="default", description="Default backend name")
+    backends: dict[str, BackendSettings] = Field(
+        default_factory=dict,
+        description="Backend configurations keyed by name",
+    )
 
 
 class ServerSettings(BaseSettings):
@@ -72,6 +92,7 @@ class Settings(BaseSettings):
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    routing: RoutingSettings = Field(default_factory=RoutingSettings)
 
 
 def load_yaml_config(config_path: Path | None = None) -> dict:
@@ -121,6 +142,19 @@ def create_settings(config_path: Path | None = None) -> Settings:
     rate_limit_config = yaml_config.get("rate_limit", {})
     retry_config = yaml_config.get("retry", {})
     logging_config = yaml_config.get("logging", {})
+    routing_config = yaml_config.get("routing", {})
+
+    # Parse backends if provided
+    routing_settings_kwargs: dict = {}
+    if routing_config:
+        routing_settings_kwargs["enabled"] = routing_config.get("enabled", False)
+        routing_settings_kwargs["default_backend"] = routing_config.get(
+            "default_backend", "default"
+        )
+        backends_config = routing_config.get("backends", {})
+        routing_settings_kwargs["backends"] = {
+            name: BackendSettings(**cfg) for name, cfg in backends_config.items()
+        }
 
     return Settings(
         vllm=VLLMSettings(**vllm_config),
@@ -129,6 +163,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
         rate_limit=RateLimitSettings(**rate_limit_config),
         retry=RetrySettings(**retry_config),
         logging=LoggingSettings(**logging_config),
+        routing=RoutingSettings(**routing_settings_kwargs) if routing_settings_kwargs else RoutingSettings(),
     )
 
 

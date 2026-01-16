@@ -1,16 +1,37 @@
 # Spirrow-Lexora
 
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/Version-0.1.0-orange.svg)](pyproject.toml)
+
 LLM Gateway / Router for Spirrow Platform
 
 ## Overview
 
 vLLMの前段に立つプロキシ/ゲートウェイ。OpenAI API互換のエンドポイントを提供しつつ、キューイング・レート制限・統計収集などの運用機能を追加する。
 
+**主要機能:**
+- OpenAI API互換エンドポイント（Chat Completions, Completions, Embeddings）
+- ストリーミングレスポンス対応
+- ユーザー別レート制限（Token Bucket）
+- 自動リトライ（Exponential Backoff）
+- 複数バックエンド対応・自動ルーティング
+- Prometheusメトリクス
+- 構造化ログ（structlog）
+
 ## Architecture
 
+### Single Backend Mode
 ```
 Client → Lexora (Gateway) → vLLM (推論エンジン) → GPU
             :8001              :8000
+```
+
+### Multi-Backend Mode
+```
+                              ┌→ vLLM-1 (model-a, model-b) → GPU
+Client → Lexora (Gateway) ────┤
+            :8001             └→ vLLM-2 (model-c, model-d) → GPU
 ```
 
 ## Requirements
@@ -94,15 +115,48 @@ logging:
   format: "console"     # "json" for production
 ```
 
+### Multi-Backend Routing Configuration
+
+複数のvLLMバックエンドにモデルを分散配置する場合、以下のようにルーティングを設定します：
+
+```yaml
+routing:
+  enabled: true
+  default_backend: "main"
+  backends:
+    main:
+      url: "http://localhost:8000"
+      timeout: 120.0
+      connect_timeout: 5.0
+      models:
+        - "qwen3-32b"
+        - "llama3-70b"
+    secondary:
+      url: "http://localhost:8010"
+      timeout: 120.0
+      connect_timeout: 5.0
+      models:
+        - "mistral-7b"
+        - "embedding-model"
+```
+
+**動作説明:**
+- リクエストの`model`パラメータに基づいて、適切なバックエンドにルーティング
+- 未登録のモデル名は`default_backend`にルーティング
+- `/v1/models`は全バックエンドのモデルを集約して返却
+- `/health`は全バックエンドのヘルス状態を返却（`healthy`, `degraded`, `unhealthy`）
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat completion (OpenAI compatible) |
 | `/v1/completions` | POST | Text completion (OpenAI compatible) |
+| `/v1/embeddings` | POST | Text embeddings (OpenAI compatible) |
 | `/v1/models` | GET | List available models |
 | `/health` | GET | Health check |
 | `/stats` | GET | Statistics |
+| `/metrics` | GET | Prometheus metrics |
 
 ### Example Requests
 
@@ -128,6 +182,32 @@ curl -X POST http://localhost:8001/v1/chat/completions \
     "model": "qwen3-32b",
     "messages": [{"role": "user", "content": "Hello"}],
     "user": "user-123"
+  }'
+
+# Streaming chat completion
+curl -X POST http://localhost:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-32b",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+
+# Streaming completion
+curl -X POST http://localhost:8001/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-32b",
+    "prompt": "Once upon a time",
+    "stream": true
+  }'
+
+# Embeddings
+curl -X POST http://localhost:8001/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "text-embedding-model",
+    "input": "Hello, world!"
   }'
 ```
 
@@ -200,16 +280,18 @@ sudo systemctl enable --now lexora
 
 ## Features
 
-| Feature | Status |
-|---------|--------|
-| vLLM Proxy (chat/completions) | ✅ |
-| Health Check | ✅ |
-| Statistics Collection | ✅ |
-| Rate Limiting (Token Bucket) | ✅ |
-| Auto Retry (Exponential Backoff) | ✅ |
-| Priority Queue | ✅ (component ready) |
-| Streaming | ❌ (Phase 2) |
-| Embeddings | ❌ (Phase 2) |
+| Feature | Status | Description |
+|---------|--------|-------------|
+| vLLM Proxy | ✅ | Chat Completions, Completions API |
+| Embeddings | ✅ | Text Embeddings API |
+| Streaming | ✅ | SSE対応ストリーミング |
+| Health Check | ✅ | バックエンド監視、degraded検知 |
+| Statistics Collection | ✅ | リクエスト統計、トークン集計 |
+| Rate Limiting | ✅ | Token Bucketアルゴリズム |
+| Auto Retry | ✅ | Exponential Backoff |
+| Priority Queue | ✅ | 優先度付きリクエストキュー |
+| Prometheus Metrics | ✅ | メトリクスエクスポート |
+| Multi-Backend Routing | ✅ | モデル別自動ルーティング |
 
 ## Development
 
@@ -247,6 +329,8 @@ spirrow-lexora/
 │   │   ├── queue.py         # Priority queue
 │   │   ├── rate_limiter.py  # Token bucket rate limiter
 │   │   ├── retry_handler.py # Exponential backoff retry
+│   │   ├── router.py        # Multi-backend routing
+│   │   ├── metrics.py       # Prometheus metrics
 │   │   └── stats.py         # Statistics collection
 │   ├── backends/
 │   │   ├── base.py          # Backend ABC
@@ -255,6 +339,14 @@ spirrow-lexora/
 │       └── logging.py       # structlog config
 └── tests/
 ```
+
+## Roadmap
+
+- [ ] WebSocket対応
+- [ ] 認証・認可機能
+- [ ] キャッシュ機能
+- [ ] プロンプト解析による自動モデル選択
+- [ ] Grafanaダッシュボードテンプレート
 
 ## License
 

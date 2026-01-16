@@ -23,6 +23,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     n: int | None = None
+    stream: bool = False
     max_tokens: int | None = None
     stop: str | list[str] | None = None
     presence_penalty: float | None = None
@@ -48,6 +49,7 @@ class CompletionRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     n: int | None = None
+    stream: bool = False
     logprobs: int | None = None
     echo: bool | None = None
     stop: str | list[str] | None = None
@@ -60,12 +62,25 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class EmbeddingsRequest(BaseModel):
+    """OpenAI-compatible embeddings request."""
+
+    model: str
+    input: str | list[str]
+    encoding_format: Literal["float", "base64"] | None = None
+    user: str | None = None
+
+    model_config = {"extra": "allow"}
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
-    status: Literal["healthy", "unhealthy"]
-    vllm_status: Literal["healthy", "unhealthy", "unknown"]
+    status: Literal["healthy", "unhealthy", "degraded"]
+    backends: dict[str, Literal["healthy", "unhealthy"]]
     version: str
+    # Legacy field for backward compatibility
+    vllm_status: Literal["healthy", "unhealthy", "unknown"] | None = None
 
 
 class StatsResponse(BaseModel):

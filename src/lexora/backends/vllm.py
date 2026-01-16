@@ -1,5 +1,6 @@
 """vLLM backend implementation using httpx."""
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -83,6 +84,20 @@ class VLLMBackend(Backend):
         """
         return await self._get("/v1/models")
 
+    async def embeddings(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Send embeddings request to vLLM.
+
+        Args:
+            request: OpenAI-compatible embeddings request.
+
+        Returns:
+            OpenAI-compatible embeddings response.
+
+        Raises:
+            BackendError: If the request fails.
+        """
+        return await self._post("/v1/embeddings", request)
+
     async def health_check(self) -> bool:
         """Check if vLLM is healthy.
 
@@ -98,6 +113,91 @@ class VLLMBackend(Backend):
     async def close(self) -> None:
         """Close the HTTP client."""
         await self._client.aclose()
+
+    async def chat_completions_stream(
+        self, request: dict[str, Any]
+    ) -> AsyncIterator[bytes]:
+        """Send streaming chat completion request to vLLM.
+
+        Args:
+            request: OpenAI-compatible chat completion request.
+
+        Yields:
+            SSE data chunks.
+
+        Raises:
+            BackendError: If the request fails.
+        """
+        async for chunk in self._post_stream("/v1/chat/completions", request):
+            yield chunk
+
+    async def completions_stream(
+        self, request: dict[str, Any]
+    ) -> AsyncIterator[bytes]:
+        """Send streaming completion request to vLLM.
+
+        Args:
+            request: OpenAI-compatible completion request.
+
+        Yields:
+            SSE data chunks.
+
+        Raises:
+            BackendError: If the request fails.
+        """
+        async for chunk in self._post_stream("/v1/completions", request):
+            yield chunk
+
+    async def _post_stream(
+        self, path: str, data: dict[str, Any]
+    ) -> AsyncIterator[bytes]:
+        """Send streaming POST request to vLLM.
+
+        Args:
+            path: API path.
+            data: Request body.
+
+        Yields:
+            SSE data chunks.
+
+        Raises:
+            BackendError: If the request fails.
+        """
+        try:
+            logger.debug("vllm_stream_request", path=path, model=data.get("model"))
+            async with self._client.stream("POST", path, json=data) as response:
+                if response.status_code == 503:
+                    raise BackendUnavailableError("vLLM is temporarily unavailable")
+
+                if response.status_code >= 400:
+                    # Read error body for non-streaming error response
+                    error_body = await response.aread()
+                    try:
+                        import json
+                        error_json = json.loads(error_body)
+                        error_message = error_json.get("error", {}).get(
+                            "message", error_body.decode()
+                        )
+                    except Exception:
+                        error_message = error_body.decode()
+                    raise BackendError(
+                        f"vLLM error ({response.status_code}): {error_message}"
+                    )
+
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+        except httpx.ConnectError as e:
+            logger.error("vllm_stream_connection_error", path=path, error=str(e))
+            raise BackendConnectionError(f"Failed to connect to vLLM: {e}") from e
+        except httpx.TimeoutException as e:
+            logger.error("vllm_stream_timeout", path=path, error=str(e))
+            raise BackendTimeoutError(f"vLLM request timed out: {e}") from e
+        except (BackendError, BackendUnavailableError):
+            raise
+        except httpx.HTTPError as e:
+            logger.error("vllm_stream_http_error", path=path, error=str(e))
+            raise BackendError(f"vLLM request failed: {e}") from e
 
     async def _get(self, path: str) -> dict[str, Any]:
         """Send GET request to vLLM.
