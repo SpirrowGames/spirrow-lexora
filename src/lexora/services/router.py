@@ -46,11 +46,11 @@ class BackendRouter:
                 self._backends[name] = create_backend(name, settings)
 
                 # Map models to this backend
-                for model in settings.models:
-                    self._model_to_backend[model] = name
+                for model_info in settings.models:
+                    self._model_to_backend[model_info.name] = name
                     logger.info(
                         "model_route_registered",
-                        model=model,
+                        model=model_info.name,
                         backend=name,
                         url=settings.url,
                         type=settings.type,

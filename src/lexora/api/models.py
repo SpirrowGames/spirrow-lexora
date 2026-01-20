@@ -107,3 +107,60 @@ class ErrorResponse(BaseModel):
         description="Error details",
         examples=[{"message": "Internal server error", "type": "server_error"}],
     )
+
+
+# Models for /v1/models/capabilities endpoint
+
+
+class ModelCapabilityInfo(BaseModel):
+    """Model information with capabilities."""
+
+    id: str = Field(description="Model identifier")
+    backend: str = Field(description="Backend name serving this model")
+    backend_type: str = Field(description="Backend type (vllm or openai_compatible)")
+    capabilities: list[str] = Field(description="List of capability tags")
+    description: str | None = Field(default=None, description="Model description")
+
+
+class ModelCapabilitiesResponse(BaseModel):
+    """Response for /v1/models/capabilities endpoint."""
+
+    models: list[ModelCapabilityInfo] = Field(description="List of available models")
+    available_capabilities: list[str] = Field(
+        description="List of all available capability tags"
+    )
+    default_model_for_unknown_task: str | None = Field(
+        default=None, description="Default model for unknown task types"
+    )
+
+
+# Models for /v1/classify-task endpoint
+
+
+class ClassifyTaskRequest(BaseModel):
+    """Request for /v1/classify-task endpoint."""
+
+    task_description: str = Field(
+        description="Description of the task to classify",
+        min_length=1,
+        max_length=10000,
+    )
+
+
+class ModelAlternative(BaseModel):
+    """Alternative model recommendation."""
+
+    model: str = Field(description="Model identifier")
+    score: float = Field(description="Relevance score (0.0-1.0)")
+
+
+class ClassifyTaskResponse(BaseModel):
+    """Response for /v1/classify-task endpoint."""
+
+    recommended_model: str = Field(description="Recommended model for the task")
+    task_type: str = Field(description="Classified task type/capability")
+    confidence: float = Field(description="Classification confidence (0.0-1.0)")
+    reasoning: str = Field(description="Explanation for the classification")
+    alternatives: list[ModelAlternative] = Field(
+        default_factory=list, description="Alternative model recommendations"
+    )

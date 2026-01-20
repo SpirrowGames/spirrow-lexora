@@ -2,11 +2,48 @@
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ModelInfo(BaseSettings):
+    """Individual model information with capabilities."""
+
+    name: str = Field(description="Model name/identifier")
+    capabilities: list[str] = Field(
+        default_factory=lambda: ["general"],
+        description="List of capability tags for this model",
+    )
+    description: str | None = Field(
+        default=None, description="Human-readable description of the model"
+    )
+
+
+def _normalize_model_entry(v: Any) -> ModelInfo:
+    """Normalize model entry to ModelInfo - accepts str or dict."""
+    if isinstance(v, str):
+        return ModelInfo(name=v)
+    if isinstance(v, dict):
+        return ModelInfo(**v)
+    if isinstance(v, ModelInfo):
+        return v
+    raise ValueError(f"Invalid model entry: {v}")
+
+
+def _normalize_models_list(v: Any) -> list[ModelInfo]:
+    """Normalize models list - accepts list of str or ModelInfo dicts."""
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        raise ValueError("models must be a list")
+    return [_normalize_model_entry(item) for item in v]
+
+
+# Type alias for models field with backward compatibility
+ModelsList = Annotated[list[ModelInfo], BeforeValidator(_normalize_models_list)]
 
 
 class BackendSettings(BaseSettings):
@@ -18,7 +55,10 @@ class BackendSettings(BaseSettings):
     url: str = Field(default="http://localhost:8000", description="Backend server URL")
     timeout: float = Field(default=120.0, description="Request timeout in seconds")
     connect_timeout: float = Field(default=5.0, description="Connection timeout in seconds")
-    models: list[str] = Field(default_factory=list, description="Models served by this backend")
+    models: ModelsList = Field(
+        default_factory=list,
+        description="Models served by this backend (str or ModelInfo)",
+    )
     api_key: str | None = Field(default=None, description="API key for authentication")
     api_key_env: str | None = Field(
         default=None, description="Environment variable name containing API key"
@@ -31,6 +71,10 @@ class BackendSettings(BaseSettings):
         default_factory=list, description="List of fallback backend names"
     )
 
+    def get_model_names(self) -> list[str]:
+        """Get list of model names for backward compatibility."""
+        return [m.name for m in self.models]
+
 
 class VLLMSettings(BaseSettings):
     """vLLM backend settings (legacy, for single backend)."""
@@ -38,6 +82,18 @@ class VLLMSettings(BaseSettings):
     url: str = Field(default="http://localhost:8000", description="vLLM server URL")
     timeout: float = Field(default=120.0, description="Request timeout in seconds")
     connect_timeout: float = Field(default=5.0, description="Connection timeout in seconds")
+
+
+class ClassifierSettings(BaseSettings):
+    """Task classifier settings."""
+
+    enabled: bool = Field(default=False, description="Enable task classification")
+    model: str | None = Field(
+        default=None, description="Model to use for task classification"
+    )
+    backend: str | None = Field(
+        default=None, description="Backend to use for task classification"
+    )
 
 
 class RoutingSettings(BaseSettings):
@@ -48,6 +104,14 @@ class RoutingSettings(BaseSettings):
     backends: dict[str, BackendSettings] = Field(
         default_factory=dict,
         description="Backend configurations keyed by name",
+    )
+    default_model_for_unknown_task: str | None = Field(
+        default=None,
+        description="Default model to use when task classification fails or returns unknown",
+    )
+    classifier: ClassifierSettings = Field(
+        default_factory=ClassifierSettings,
+        description="Task classifier settings",
     )
 
 
@@ -186,6 +250,14 @@ def create_settings(config_path: Path | None = None) -> Settings:
         routing_settings_kwargs["backends"] = {
             name: BackendSettings(**cfg) for name, cfg in backends_config.items()
         }
+        # New fields for capabilities/classifier
+        if "default_model_for_unknown_task" in routing_config:
+            routing_settings_kwargs["default_model_for_unknown_task"] = routing_config[
+                "default_model_for_unknown_task"
+            ]
+        classifier_config = routing_config.get("classifier", {})
+        if classifier_config:
+            routing_settings_kwargs["classifier"] = ClassifierSettings(**classifier_config)
 
     return Settings(
         vllm=VLLMSettings(**vllm_config),

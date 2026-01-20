@@ -19,6 +19,8 @@ vLLMの前段に立つプロキシ/ゲートウェイ。OpenAI API互換のエ�
 - **OpenAI互換APIバックエンド対応**（OpenAI, Azure OpenAI等）
 - **フォールバック機能**（プライマリ失敗時に代替バックエンドへ自動切替）
 - **429レート制限エラー対応**（Retry-Afterヘッダー尊重）
+- **モデル能力情報API**（モデル一覧と各モデルのcapabilities取得）
+- **タスク分類API**（タスク内容からLLMで最適なモデルを推奨）
 - Prometheusメトリクス
 - 構造化ログ（structlog）
 
@@ -136,6 +138,14 @@ logging:
 routing:
   enabled: true
   default_backend: "main"
+  default_model_for_unknown_task: "qwen3-32b"  # タスク分類失敗時のデフォルトモデル
+
+  # タスク分類設定（/v1/classify-task用）
+  classifier:
+    enabled: true
+    model: "mistral-7b"      # 分類に使うモデル（軽量モデル推奨）
+    backend: "secondary"     # 分類用バックエンド
+
   backends:
     main:
       type: "vllm"                    # vLLM backend (default)
@@ -143,8 +153,13 @@ routing:
       timeout: 120.0
       connect_timeout: 5.0
       models:
-        - "qwen3-32b"
-        - "llama3-70b"
+        # 新形式: capabilities付き（/v1/models/capabilities で取得可能）
+        - name: "qwen3-32b"
+          capabilities: ["code", "reasoning", "analysis", "general"]
+          description: "コード生成・複雑な推論向け"
+        - name: "llama3-70b"
+          capabilities: ["reasoning", "general"]
+          description: "汎用大規模モデル"
       fallback_backends:              # Fallback on failure
         - "openai_backup"
 
@@ -154,8 +169,10 @@ routing:
       timeout: 120.0
       connect_timeout: 5.0
       models:
-        - "mistral-7b"
-        - "embedding-model"
+        - name: "mistral-7b"
+          capabilities: ["summarization", "translation", "simple_qa"]
+          description: "軽量タスク向け高速モデル"
+        - "embedding-model"           # 従来形式もサポート（capabilities=["general"]）
       fallback_backends:
         - "openai_backup"
 
@@ -200,6 +217,8 @@ routing:
 | `/v1/completions` | POST | Text completion (OpenAI compatible) |
 | `/v1/embeddings` | POST | Text embeddings (OpenAI compatible) |
 | `/v1/models` | GET | List available models |
+| `/v1/models/capabilities` | GET | List models with capabilities |
+| `/v1/classify-task` | POST | Classify task and recommend model |
 | `/health` | GET | Health check |
 | `/stats` | GET | Statistics |
 | `/metrics` | GET | Prometheus metrics |
@@ -255,6 +274,16 @@ curl -X POST http://localhost:8001/v1/embeddings \
     "model": "text-embedding-model",
     "input": "Hello, world!"
   }'
+
+# Get model capabilities
+curl http://localhost:8001/v1/models/capabilities | jq
+
+# Classify task and get recommended model
+curl -X POST http://localhost:8001/v1/classify-task \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_description": "Pythonでクイックソートを実装して"
+  }' | jq
 ```
 
 ## Production Deployment (Ubuntu)
@@ -341,6 +370,8 @@ sudo systemctl enable --now lexora
 | OpenAI-Compatible Backend | ✅ | OpenAI, Azure OpenAI等のAPI対応 |
 | Fallback Support | ✅ | プライマリ失敗時の自動切替 |
 | 429 Rate Limit Handling | ✅ | Retry-Afterヘッダー尊重 |
+| Model Capabilities API | ✅ | モデル一覧と能力情報の取得 |
+| Task Classification | ✅ | LLMによるタスク分類・モデル推奨 |
 
 ## Development
 
@@ -381,7 +412,9 @@ spirrow-lexora/
 │   │   ├── router.py        # Multi-backend routing
 │   │   ├── fallback.py      # Fallback service
 │   │   ├── metrics.py       # Prometheus metrics
-│   │   └── stats.py         # Statistics collection
+│   │   ├── stats.py         # Statistics collection
+│   │   ├── model_registry.py    # Model capabilities registry
+│   │   └── task_classifier.py   # LLM-based task classification
 │   ├── backends/
 │   │   ├── base.py          # Backend ABC + exceptions
 │   │   ├── vllm.py          # vLLM client
@@ -397,10 +430,11 @@ spirrow-lexora/
 - [x] OpenAI互換APIバックエンド対応
 - [x] フォールバック機能
 - [x] 429レート制限対応（Retry-After）
+- [x] モデル能力情報API（capabilities）
+- [x] タスク分類による自動モデル推奨
 - [ ] WebSocket対応
 - [ ] 認証・認可機能
 - [ ] キャッシュ機能
-- [ ] プロンプト解析による自動モデル選択
 - [ ] Grafanaダッシュボードテンプレート
 
 ## License

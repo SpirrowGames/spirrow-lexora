@@ -10,19 +10,30 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from lexora import __version__
 from lexora.api.models import (
     ChatCompletionRequest,
+    ClassifyTaskRequest,
+    ClassifyTaskResponse,
     CompletionRequest,
     EmbeddingsRequest,
     ErrorResponse,
     HealthResponse,
+    ModelAlternative,
+    ModelCapabilitiesResponse,
+    ModelCapabilityInfo,
     StatsResponse,
 )
 from lexora.backends.base import BackendError
 from lexora.backends.vllm import VLLMBackend
 from lexora.services.metrics import MetricsCollector
+from lexora.services.model_registry import ModelRegistry
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.router import BackendRouter
 from lexora.services.stats import StatsCollector
+from lexora.services.task_classifier import (
+    TaskClassifier,
+    TaskClassifierDisabledError,
+    TaskClassifierError,
+)
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -63,6 +74,16 @@ def is_rate_limit_enabled(request: Request) -> bool:
 def get_metrics_collector(request: Request) -> MetricsCollector | None:
     """Get metrics collector from app state."""
     return getattr(request.app.state, "metrics_collector", None)
+
+
+def get_model_registry(request: Request) -> ModelRegistry | None:
+    """Get model registry from app state."""
+    return getattr(request.app.state, "model_registry", None)
+
+
+def get_task_classifier(request: Request) -> TaskClassifier | None:
+    """Get task classifier from app state."""
+    return getattr(request.app.state, "task_classifier", None)
 
 
 def check_rate_limit(
@@ -716,3 +737,113 @@ async def stats(
     """
     stats_data = stats_collector.get_stats()
     return StatsResponse(**stats_data)
+
+
+@router.get("/v1/models/capabilities", response_model=ModelCapabilitiesResponse)
+async def get_model_capabilities(
+    model_registry: ModelRegistry | None = Depends(get_model_registry),
+) -> ModelCapabilitiesResponse:
+    """Get all models with their capabilities.
+
+    Returns information about all available models including their
+    capabilities and backend information.
+
+    Args:
+        model_registry: Model registry instance.
+
+    Returns:
+        ModelCapabilitiesResponse with models and capabilities.
+    """
+    if model_registry is None:
+        logger.warning("model_capabilities_request_no_registry")
+        return ModelCapabilitiesResponse(
+            models=[],
+            available_capabilities=[],
+            default_model_for_unknown_task=None,
+        )
+
+    models = model_registry.get_all_models()
+    model_infos = [
+        ModelCapabilityInfo(
+            id=model.id,
+            backend=model.backend,
+            backend_type=model.backend_type,
+            capabilities=model.capabilities,
+            description=model.description,
+        )
+        for model in models
+    ]
+
+    return ModelCapabilitiesResponse(
+        models=model_infos,
+        available_capabilities=model_registry.get_available_capabilities(),
+        default_model_for_unknown_task=model_registry.get_default_model_for_unknown_task(),
+    )
+
+
+@router.post(
+    "/v1/classify-task",
+    response_model=ClassifyTaskResponse,
+    responses={
+        503: {"model": ErrorResponse, "description": "Classifier disabled"},
+        500: {"model": ErrorResponse, "description": "Classification error"},
+    },
+)
+async def classify_task(
+    request: ClassifyTaskRequest,
+    task_classifier: TaskClassifier | None = Depends(get_task_classifier),
+) -> ClassifyTaskResponse:
+    """Classify a task and recommend an appropriate model.
+
+    Uses an LLM to analyze the task description and classify it into
+    a capability category, then recommends the most suitable model.
+
+    Args:
+        request: ClassifyTaskRequest with task description.
+        task_classifier: Task classifier instance.
+
+    Returns:
+        ClassifyTaskResponse with recommended model and classification details.
+
+    Raises:
+        HTTPException: 503 if classifier is disabled, 500 on classification error.
+    """
+    if task_classifier is None:
+        logger.warning("classify_task_request_no_classifier")
+        raise HTTPException(
+            status_code=503,
+            detail="Task classifier is not configured",
+        )
+
+    try:
+        result = await task_classifier.classify(request.task_description)
+
+        return ClassifyTaskResponse(
+            recommended_model=result.recommended_model,
+            task_type=result.task_type,
+            confidence=result.confidence,
+            reasoning=result.reasoning,
+            alternatives=[
+                ModelAlternative(model=alt.model, score=alt.score)
+                for alt in result.alternatives
+            ],
+        )
+
+    except TaskClassifierDisabledError:
+        logger.warning("classify_task_classifier_disabled")
+        raise HTTPException(
+            status_code=503,
+            detail="Task classifier is disabled",
+        )
+    except TaskClassifierError as e:
+        logger.error("classify_task_error", error=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        logger.exception("classify_task_unexpected_error")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error during task classification: {e}",
+        ) from e

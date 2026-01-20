@@ -8,6 +8,14 @@ server:
 routing:
   enabled: true
   default_backend: "heavy"
+  default_model_for_unknown_task: "Qwen2.5-Coder-14B"
+
+  # タスク分類設定
+  classifier:
+    enabled: true
+    model: "Qwen2.5-1.5B"
+    backend: "light"
+
   backends:
     heavy:
       type: "vllm"
@@ -15,7 +23,10 @@ routing:
       timeout: 120.0
       connect_timeout: 5.0
       models:
-        - "Qwen2.5-Coder-14B"
+        # 新形式: メタデータ付き
+        - name: "Qwen2.5-Coder-14B"
+          capabilities: ["code", "reasoning", "analysis", "general"]
+          description: "コード生成・複雑な推論向け"
       fallback_backends:
         - "openai_gpt4"
 
@@ -25,7 +36,9 @@ routing:
       timeout: 60.0
       connect_timeout: 5.0
       models:
-        - "Qwen2.5-1.5B"
+        - name: "Qwen2.5-1.5B"
+          capabilities: ["summarization", "translation", "simple_qa"]
+          description: "軽量タスク向け高速モデル"
       fallback_backends:
         - "openai_gpt4"
 
@@ -37,6 +50,7 @@ routing:
       timeout: 60.0
       connect_timeout: 5.0
       models:
+        # 従来形式もサポート（後方互換: capabilities=["general"]扱い）
         - "gpt-4"
         - "gpt-4-turbo"
       model_mapping:

@@ -13,10 +13,12 @@ from lexora.api.routes import router
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import create_settings, Settings
 from lexora.services.metrics import MetricsCollector
+from lexora.services.model_registry import ModelRegistry
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.router import BackendRouter
 from lexora.services.stats import StatsCollector
+from lexora.services.task_classifier import TaskClassifier
 from lexora.utils.logging import get_logger, setup_logging
 
 
@@ -45,6 +47,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # For backward compatibility, also expose default backend as 'backend'
     app.state.backend = app.state.backend_router.default_backend
+
+    # Initialize model registry (for capabilities endpoint)
+    app.state.model_registry = ModelRegistry(routing_settings=settings.routing)
+
+    # Initialize task classifier (if enabled)
+    app.state.task_classifier = TaskClassifier(
+        model_registry=app.state.model_registry,
+        backend_router=app.state.backend_router,
+        classifier_settings=settings.routing.classifier,
+    )
 
     # Initialize services
     app.state.stats_collector = StatsCollector()
