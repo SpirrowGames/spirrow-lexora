@@ -7,6 +7,7 @@ from typing import Any, TypeVar
 
 from lexora.backends.base import (
     BackendConnectionError,
+    BackendRateLimitError,
     BackendTimeoutError,
     BackendUnavailableError,
 )
@@ -22,11 +23,14 @@ RETRYABLE_EXCEPTIONS = (
     BackendConnectionError,
     BackendTimeoutError,
     BackendUnavailableError,
+    BackendRateLimitError,
 )
 
 
 class RetryHandler:
     """Handles retry logic with exponential backoff.
+
+    Supports rate limit errors with Retry-After header respect.
 
     Args:
         max_retries: Maximum number of retry attempts.
@@ -34,6 +38,8 @@ class RetryHandler:
         max_delay: Maximum delay between retries in seconds.
         exponential_base: Base for exponential backoff calculation.
         jitter: Whether to add random jitter to delays.
+        respect_retry_after: Whether to respect Retry-After header from 429 responses.
+        max_retry_after: Maximum Retry-After delay to respect in seconds.
     """
 
     def __init__(
@@ -43,6 +49,8 @@ class RetryHandler:
         max_delay: float = 30.0,
         exponential_base: float = 2.0,
         jitter: bool = True,
+        respect_retry_after: bool = True,
+        max_retry_after: float = 60.0,
     ) -> None:
         """Initialize the retry handler.
 
@@ -52,12 +60,16 @@ class RetryHandler:
             max_delay: Maximum delay between retries in seconds.
             exponential_base: Base for exponential backoff calculation.
             jitter: Whether to add random jitter to delays.
+            respect_retry_after: Whether to respect Retry-After header from 429 responses.
+            max_retry_after: Maximum Retry-After delay to respect in seconds.
         """
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
         self.exponential_base = exponential_base
         self.jitter = jitter
+        self.respect_retry_after = respect_retry_after
+        self.max_retry_after = max_retry_after
 
     def calculate_delay(self, attempt: int) -> float:
         """Calculate delay for a given retry attempt.
@@ -75,6 +87,38 @@ class RetryHandler:
             # Add up to 25% random jitter
             jitter_amount = delay * random.uniform(0, 0.25)
             delay += jitter_amount
+
+        return delay
+
+    def calculate_delay_for_exception(
+        self, attempt: int, exception: Exception
+    ) -> float:
+        """Calculate delay considering Retry-After header from rate limit errors.
+
+        Args:
+            attempt: The retry attempt number (0-indexed).
+            exception: The exception that triggered the retry.
+
+        Returns:
+            Delay in seconds.
+        """
+        delay = self.calculate_delay(attempt)
+
+        # Check for Retry-After from rate limit errors
+        if (
+            self.respect_retry_after
+            and isinstance(exception, BackendRateLimitError)
+            and exception.retry_after is not None
+        ):
+            retry_after = min(exception.retry_after, self.max_retry_after)
+            if retry_after > delay:
+                logger.info(
+                    "using_retry_after",
+                    retry_after=retry_after,
+                    calculated_delay=delay,
+                    backend=exception.backend_name,
+                )
+                return retry_after
 
         return delay
 
@@ -109,13 +153,16 @@ class RetryHandler:
             except retryable_exceptions as e:
                 last_exception = e
                 if attempt < self.max_retries:
-                    delay = self.calculate_delay(attempt)
+                    delay = self.calculate_delay_for_exception(attempt, e)
+                    is_rate_limit = isinstance(e, BackendRateLimitError)
                     logger.warning(
                         "retry_attempt",
                         attempt=attempt + 1,
                         max_retries=self.max_retries,
                         delay=delay,
                         error=str(e),
+                        is_rate_limit=is_rate_limit,
+                        backend=getattr(e, "backend_name", None),
                     )
                     await asyncio.sleep(delay)
                     retries += 1
@@ -124,6 +171,7 @@ class RetryHandler:
                         "retry_exhausted",
                         attempts=self.max_retries + 1,
                         error=str(e),
+                        is_rate_limit=isinstance(e, BackendRateLimitError),
                     )
 
         # All retries exhausted

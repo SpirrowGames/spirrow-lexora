@@ -1,4 +1,4 @@
-"""vLLM backend implementation using httpx."""
+"""OpenAI-compatible backend implementation using httpx."""
 
 from collections.abc import AsyncIterator
 from typing import Any
@@ -18,37 +18,80 @@ from lexora.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-class VLLMBackend(Backend):
-    """vLLM backend implementation using httpx async client.
+class OpenAICompatibleBackend(Backend):
+    """OpenAI-compatible API backend implementation.
+
+    Supports any API that implements the OpenAI API specification,
+    including OpenAI itself, Azure OpenAI, and other compatible services.
 
     Args:
-        base_url: Base URL of the vLLM server.
+        base_url: Base URL of the API server.
+        api_key: API key for authentication.
         timeout: Request timeout in seconds.
         connect_timeout: Connection timeout in seconds.
+        model_mapping: Optional mapping from requested model names to actual names.
         name: Optional backend name for error messages.
     """
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8000",
-        timeout: float = 120.0,
+        base_url: str = "https://api.openai.com",
+        api_key: str | None = None,
+        timeout: float = 60.0,
         connect_timeout: float = 5.0,
+        model_mapping: dict[str, str] | None = None,
         name: str | None = None,
     ) -> None:
-        """Initialize the vLLM backend.
+        """Initialize the OpenAI-compatible backend.
 
         Args:
-            base_url: Base URL of the vLLM server.
+            base_url: Base URL of the API server.
+            api_key: API key for authentication.
             timeout: Request timeout in seconds.
             connect_timeout: Connection timeout in seconds.
+            model_mapping: Optional mapping from requested model names to actual names.
             name: Optional backend name for error messages.
         """
         self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model_mapping = model_mapping or {}
         self.name = name
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout, connect=connect_timeout),
+            headers=headers,
         )
+
+    def _map_model(self, model: str) -> str:
+        """Map requested model name to actual model name.
+
+        Args:
+            model: Requested model name.
+
+        Returns:
+            Actual model name to use.
+        """
+        return self.model_mapping.get(model, model)
+
+    def _apply_model_mapping(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Apply model mapping to request.
+
+        Args:
+            request: Original request dictionary.
+
+        Returns:
+            Request with mapped model name.
+        """
+        if "model" in request:
+            mapped_request = request.copy()
+            mapped_request["model"] = self._map_model(request["model"])
+            return mapped_request
+        return request
 
     @staticmethod
     def _parse_retry_after(response: httpx.Response) -> float | None:
@@ -65,12 +108,16 @@ class VLLMBackend(Backend):
             return None
 
         try:
+            # Try parsing as seconds (integer)
             return float(retry_after)
         except ValueError:
-            return None
+            pass
+
+        # Could also try parsing HTTP-date format, but most APIs use seconds
+        return None
 
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Send chat completion request to vLLM.
+        """Send chat completion request.
 
         Args:
             request: OpenAI-compatible chat completion request.
@@ -81,10 +128,11 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        return await self._post("/v1/chat/completions", request)
+        mapped_request = self._apply_model_mapping(request)
+        return await self._post("/v1/chat/completions", mapped_request)
 
     async def completions(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Send completion request to vLLM.
+        """Send completion request.
 
         Args:
             request: OpenAI-compatible completion request.
@@ -95,10 +143,11 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        return await self._post("/v1/completions", request)
+        mapped_request = self._apply_model_mapping(request)
+        return await self._post("/v1/completions", mapped_request)
 
     async def list_models(self) -> dict[str, Any]:
-        """List available models from vLLM.
+        """List available models.
 
         Returns:
             OpenAI-compatible models list response.
@@ -109,7 +158,7 @@ class VLLMBackend(Backend):
         return await self._get("/v1/models")
 
     async def embeddings(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Send embeddings request to vLLM.
+        """Send embeddings request.
 
         Args:
             request: OpenAI-compatible embeddings request.
@@ -120,18 +169,20 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        return await self._post("/v1/embeddings", request)
+        mapped_request = self._apply_model_mapping(request)
+        return await self._post("/v1/embeddings", mapped_request)
 
     async def health_check(self) -> bool:
-        """Check if vLLM is healthy.
+        """Check if the API is healthy.
 
         Returns:
-            True if vLLM is healthy, False otherwise.
+            True if API is healthy, False otherwise.
         """
         try:
-            response = await self._client.get("/health")
-            return response.status_code == 200
-        except httpx.HTTPError:
+            # Try to list models as a health check
+            await self._get("/v1/models")
+            return True
+        except BackendError:
             return False
 
     async def close(self) -> None:
@@ -141,7 +192,7 @@ class VLLMBackend(Backend):
     async def chat_completions_stream(
         self, request: dict[str, Any]
     ) -> AsyncIterator[bytes]:
-        """Send streaming chat completion request to vLLM.
+        """Send streaming chat completion request.
 
         Args:
             request: OpenAI-compatible chat completion request.
@@ -152,13 +203,14 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        async for chunk in self._post_stream("/v1/chat/completions", request):
+        mapped_request = self._apply_model_mapping(request)
+        async for chunk in self._post_stream("/v1/chat/completions", mapped_request):
             yield chunk
 
     async def completions_stream(
         self, request: dict[str, Any]
     ) -> AsyncIterator[bytes]:
-        """Send streaming completion request to vLLM.
+        """Send streaming completion request.
 
         Args:
             request: OpenAI-compatible completion request.
@@ -169,13 +221,14 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        async for chunk in self._post_stream("/v1/completions", request):
+        mapped_request = self._apply_model_mapping(request)
+        async for chunk in self._post_stream("/v1/completions", mapped_request):
             yield chunk
 
     async def _post_stream(
         self, path: str, data: dict[str, Any]
     ) -> AsyncIterator[bytes]:
-        """Send streaming POST request to vLLM.
+        """Send streaming POST request.
 
         Args:
             path: API path.
@@ -188,24 +241,31 @@ class VLLMBackend(Backend):
             BackendError: If the request fails.
         """
         try:
-            logger.debug("vllm_stream_request", path=path, model=data.get("model"))
+            logger.debug(
+                "openai_stream_request",
+                path=path,
+                model=data.get("model"),
+                backend=self.name,
+            )
             async with self._client.stream("POST", path, json=data) as response:
                 if response.status_code == 429:
                     retry_after = self._parse_retry_after(response)
                     raise BackendRateLimitError(
-                        "vLLM rate limit exceeded (429)",
+                        f"Rate limit exceeded (429)",
                         retry_after=retry_after,
                         backend_name=self.name,
                     )
 
                 if response.status_code == 503:
-                    raise BackendUnavailableError("vLLM is temporarily unavailable")
+                    raise BackendUnavailableError(
+                        f"Backend is temporarily unavailable"
+                    )
 
                 if response.status_code >= 400:
-                    # Read error body for non-streaming error response
                     error_body = await response.aread()
                     try:
                         import json
+
                         error_json = json.loads(error_body)
                         error_message = error_json.get("error", {}).get(
                             "message", error_body.decode()
@@ -213,26 +273,41 @@ class VLLMBackend(Backend):
                     except Exception:
                         error_message = error_body.decode()
                     raise BackendError(
-                        f"vLLM error ({response.status_code}): {error_message}"
+                        f"API error ({response.status_code}): {error_message}"
                     )
 
                 async for chunk in response.aiter_bytes():
                     yield chunk
 
         except httpx.ConnectError as e:
-            logger.error("vllm_stream_connection_error", path=path, error=str(e))
-            raise BackendConnectionError(f"Failed to connect to vLLM: {e}") from e
+            logger.error(
+                "openai_stream_connection_error",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendConnectionError(f"Failed to connect to API: {e}") from e
         except httpx.TimeoutException as e:
-            logger.error("vllm_stream_timeout", path=path, error=str(e))
-            raise BackendTimeoutError(f"vLLM request timed out: {e}") from e
+            logger.error(
+                "openai_stream_timeout",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendTimeoutError(f"API request timed out: {e}") from e
         except (BackendError, BackendUnavailableError, BackendRateLimitError):
             raise
         except httpx.HTTPError as e:
-            logger.error("vllm_stream_http_error", path=path, error=str(e))
-            raise BackendError(f"vLLM request failed: {e}") from e
+            logger.error(
+                "openai_stream_http_error",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendError(f"API request failed: {e}") from e
 
     async def _get(self, path: str) -> dict[str, Any]:
-        """Send GET request to vLLM.
+        """Send GET request.
 
         Args:
             path: API path.
@@ -244,21 +319,36 @@ class VLLMBackend(Backend):
             BackendError: If the request fails.
         """
         try:
-            logger.debug("vllm_get_request", path=path)
+            logger.debug("openai_get_request", path=path, backend=self.name)
             response = await self._client.get(path)
             return self._handle_response(response)
         except httpx.ConnectError as e:
-            logger.error("vllm_connection_error", path=path, error=str(e))
-            raise BackendConnectionError(f"Failed to connect to vLLM: {e}") from e
+            logger.error(
+                "openai_connection_error",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendConnectionError(f"Failed to connect to API: {e}") from e
         except httpx.TimeoutException as e:
-            logger.error("vllm_timeout", path=path, error=str(e))
-            raise BackendTimeoutError(f"vLLM request timed out: {e}") from e
+            logger.error(
+                "openai_timeout",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendTimeoutError(f"API request timed out: {e}") from e
         except httpx.HTTPError as e:
-            logger.error("vllm_http_error", path=path, error=str(e))
-            raise BackendError(f"vLLM request failed: {e}") from e
+            logger.error(
+                "openai_http_error",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendError(f"API request failed: {e}") from e
 
     async def _post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Send POST request to vLLM.
+        """Send POST request.
 
         Args:
             path: API path.
@@ -271,21 +361,41 @@ class VLLMBackend(Backend):
             BackendError: If the request fails.
         """
         try:
-            logger.debug("vllm_post_request", path=path, model=data.get("model"))
+            logger.debug(
+                "openai_post_request",
+                path=path,
+                model=data.get("model"),
+                backend=self.name,
+            )
             response = await self._client.post(path, json=data)
             return self._handle_response(response)
         except httpx.ConnectError as e:
-            logger.error("vllm_connection_error", path=path, error=str(e))
-            raise BackendConnectionError(f"Failed to connect to vLLM: {e}") from e
+            logger.error(
+                "openai_connection_error",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendConnectionError(f"Failed to connect to API: {e}") from e
         except httpx.TimeoutException as e:
-            logger.error("vllm_timeout", path=path, error=str(e))
-            raise BackendTimeoutError(f"vLLM request timed out: {e}") from e
+            logger.error(
+                "openai_timeout",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendTimeoutError(f"API request timed out: {e}") from e
         except httpx.HTTPError as e:
-            logger.error("vllm_http_error", path=path, error=str(e))
-            raise BackendError(f"vLLM request failed: {e}") from e
+            logger.error(
+                "openai_http_error",
+                path=path,
+                error=str(e),
+                backend=self.name,
+            )
+            raise BackendError(f"API request failed: {e}") from e
 
     def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
-        """Handle HTTP response from vLLM.
+        """Handle HTTP response.
 
         Args:
             response: HTTP response.
@@ -299,13 +409,13 @@ class VLLMBackend(Backend):
         if response.status_code == 429:
             retry_after = self._parse_retry_after(response)
             raise BackendRateLimitError(
-                "vLLM rate limit exceeded (429)",
+                f"Rate limit exceeded (429)",
                 retry_after=retry_after,
                 backend_name=self.name,
             )
 
         if response.status_code == 503:
-            raise BackendUnavailableError("vLLM is temporarily unavailable")
+            raise BackendUnavailableError("Backend is temporarily unavailable")
 
         if response.status_code >= 400:
             try:
@@ -313,6 +423,6 @@ class VLLMBackend(Backend):
                 error_message = error_body.get("error", {}).get("message", response.text)
             except Exception:
                 error_message = response.text
-            raise BackendError(f"vLLM error ({response.status_code}): {error_message}")
+            raise BackendError(f"API error ({response.status_code}): {error_message}")
 
         return response.json()

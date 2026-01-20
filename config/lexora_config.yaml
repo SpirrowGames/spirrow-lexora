@@ -1,14 +1,47 @@
-# Lexora Configuration
-# Environment variables with LEXORA_ prefix override these values
-
-vllm:
-  url: "http://localhost:8000"
-  timeout: 120.0
-  connect_timeout: 5.0
+# Lexora Configuration for AIサーバー
 
 server:
   host: "0.0.0.0"
-  port: 8001
+  port: 8110
+
+# マルチバックエンド: 14B(重量) + 1.5B(軽量) + OpenAI(フォールバック)
+routing:
+  enabled: true
+  default_backend: "heavy"
+  backends:
+    heavy:
+      type: "vllm"
+      url: "http://localhost:8000"
+      timeout: 120.0
+      connect_timeout: 5.0
+      models:
+        - "Qwen2.5-Coder-14B"
+      fallback_backends:
+        - "openai_gpt4"
+
+    light:
+      type: "vllm"
+      url: "http://localhost:8001"
+      timeout: 60.0
+      connect_timeout: 5.0
+      models:
+        - "Qwen2.5-1.5B"
+      fallback_backends:
+        - "openai_gpt4"
+
+    # OpenAI互換API例（環境変数 OPENAI_API_KEY からAPIキー取得）
+    openai_gpt4:
+      type: "openai_compatible"
+      url: "https://api.openai.com"
+      api_key_env: "OPENAI_API_KEY"
+      timeout: 60.0
+      connect_timeout: 5.0
+      models:
+        - "gpt-4"
+        - "gpt-4-turbo"
+      model_mapping:
+        "gpt-4": "gpt-4-0125-preview"
+        "gpt-4-turbo": "gpt-4-turbo-preview"
 
 queue:
   max_size: 1000
@@ -16,15 +49,21 @@ queue:
 
 rate_limit:
   enabled: true
-  default_rate: 10.0  # requests per second
+  default_rate: 10.0
   default_burst: 20
 
 retry:
   max_retries: 3
-  base_delay: 1.0     # seconds
-  max_delay: 30.0     # seconds
+  base_delay: 1.0
+  max_delay: 30.0
   exponential_base: 2.0
+  respect_retry_after: true
+  max_retry_after: 60.0
+
+fallback:
+  enabled: true
+  on_rate_limit: true
 
 logging:
   level: "INFO"
-  format: "console"   # "json" for production
+  format: "json"

@@ -12,10 +12,24 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class BackendSettings(BaseSettings):
     """Single backend settings."""
 
+    type: Literal["vllm", "openai_compatible"] = Field(
+        default="vllm", description="Backend type (vllm or openai_compatible)"
+    )
     url: str = Field(default="http://localhost:8000", description="Backend server URL")
     timeout: float = Field(default=120.0, description="Request timeout in seconds")
     connect_timeout: float = Field(default=5.0, description="Connection timeout in seconds")
     models: list[str] = Field(default_factory=list, description="Models served by this backend")
+    api_key: str | None = Field(default=None, description="API key for authentication")
+    api_key_env: str | None = Field(
+        default=None, description="Environment variable name containing API key"
+    )
+    model_mapping: dict[str, str] = Field(
+        default_factory=dict,
+        description="Model name mapping (requested_name -> actual_name)",
+    )
+    fallback_backends: list[str] = Field(
+        default_factory=list, description="List of fallback backend names"
+    )
 
 
 class VLLMSettings(BaseSettings):
@@ -66,6 +80,21 @@ class RetrySettings(BaseSettings):
     base_delay: float = Field(default=1.0, description="Base delay between retries in seconds")
     max_delay: float = Field(default=30.0, description="Maximum delay between retries in seconds")
     exponential_base: float = Field(default=2.0, description="Exponential backoff base")
+    respect_retry_after: bool = Field(
+        default=True, description="Respect Retry-After header from 429 responses"
+    )
+    max_retry_after: float = Field(
+        default=60.0, description="Maximum Retry-After delay to respect in seconds"
+    )
+
+
+class FallbackSettings(BaseSettings):
+    """Fallback settings."""
+
+    enabled: bool = Field(default=True, description="Enable fallback to alternative backends")
+    on_rate_limit: bool = Field(
+        default=True, description="Allow fallback on rate limit (429) errors"
+    )
 
 
 class LoggingSettings(BaseSettings):
@@ -93,6 +122,7 @@ class Settings(BaseSettings):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
+    fallback: FallbackSettings = Field(default_factory=FallbackSettings)
 
 
 def load_yaml_config(config_path: Path | None = None) -> dict:
@@ -143,6 +173,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
     retry_config = yaml_config.get("retry", {})
     logging_config = yaml_config.get("logging", {})
     routing_config = yaml_config.get("routing", {})
+    fallback_config = yaml_config.get("fallback", {})
 
     # Parse backends if provided
     routing_settings_kwargs: dict = {}
@@ -164,6 +195,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
         retry=RetrySettings(**retry_config),
         logging=LoggingSettings(**logging_config),
         routing=RoutingSettings(**routing_settings_kwargs) if routing_settings_kwargs else RoutingSettings(),
+        fallback=FallbackSettings(**fallback_config),
     )
 
 

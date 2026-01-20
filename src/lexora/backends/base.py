@@ -29,6 +29,27 @@ class BackendUnavailableError(BackendError):
     pass
 
 
+class BackendRateLimitError(BackendError):
+    """Raised when backend returns 429 Too Many Requests."""
+
+    def __init__(
+        self,
+        message: str,
+        retry_after: float | None = None,
+        backend_name: str | None = None,
+    ) -> None:
+        """Initialize rate limit error.
+
+        Args:
+            message: Error message.
+            retry_after: Suggested retry delay in seconds from Retry-After header.
+            backend_name: Name of the backend that returned the error.
+        """
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.backend_name = backend_name
+
+
 class Backend(ABC):
     """Abstract base class for LLM backends."""
 

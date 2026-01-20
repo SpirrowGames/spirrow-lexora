@@ -3,8 +3,9 @@
 from typing import Any
 
 from lexora.backends.base import Backend, BackendError
+from lexora.backends.factory import create_backend
 from lexora.backends.vllm import VLLMBackend
-from lexora.config import BackendSettings, RoutingSettings, VLLMSettings
+from lexora.config import RoutingSettings, VLLMSettings
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -14,7 +15,8 @@ class BackendRouter:
     """Routes requests to appropriate backends based on model name.
 
     Supports multi-backend configuration where different models can be served
-    by different backend instances.
+    by different backend instances. Also supports fallback backends when
+    primary backends fail or hit rate limits.
 
     Args:
         routing_settings: Routing configuration.
@@ -34,17 +36,15 @@ class BackendRouter:
         """
         self._routing_enabled = routing_settings.enabled
         self._default_backend_name = routing_settings.default_backend
-        self._backends: dict[str, VLLMBackend] = {}
+        self._backends: dict[str, Backend] = {}
         self._model_to_backend: dict[str, str] = {}
+        self._fallback_map: dict[str, list[str]] = {}
 
         if self._routing_enabled and routing_settings.backends:
-            # Multi-backend mode
+            # Multi-backend mode using factory
             for name, settings in routing_settings.backends.items():
-                self._backends[name] = VLLMBackend(
-                    base_url=settings.url,
-                    timeout=settings.timeout,
-                    connect_timeout=settings.connect_timeout,
-                )
+                self._backends[name] = create_backend(name, settings)
+
                 # Map models to this backend
                 for model in settings.models:
                     self._model_to_backend[model] = name
@@ -53,6 +53,16 @@ class BackendRouter:
                         model=model,
                         backend=name,
                         url=settings.url,
+                        type=settings.type,
+                    )
+
+                # Store fallback configuration
+                if settings.fallback_backends:
+                    self._fallback_map[name] = settings.fallback_backends
+                    logger.info(
+                        "fallback_registered",
+                        backend=name,
+                        fallbacks=settings.fallback_backends,
                     )
 
             logger.info(
@@ -66,6 +76,7 @@ class BackendRouter:
                 base_url=vllm_settings.url,
                 timeout=vllm_settings.timeout,
                 connect_timeout=vllm_settings.connect_timeout,
+                name="default",
             )
             self._default_backend_name = "default"
             logger.info(
@@ -73,7 +84,7 @@ class BackendRouter:
                 url=vllm_settings.url,
             )
 
-    def get_backend_for_model(self, model: str) -> VLLMBackend:
+    def get_backend_for_model(self, model: str) -> Backend:
         """Get the appropriate backend for a model.
 
         Args:
@@ -106,8 +117,56 @@ class BackendRouter:
         )
         return backend
 
+    def get_backend_name_for_model(self, model: str) -> str:
+        """Get the backend name for a model.
+
+        Args:
+            model: Model name.
+
+        Returns:
+            Backend name.
+        """
+        backend_name = self._model_to_backend.get(model)
+        if backend_name is None:
+            backend_name = self._default_backend_name
+        return backend_name
+
+    def get_fallback_backends(self, backend_name: str) -> list[Backend]:
+        """Get fallback backends for a given backend.
+
+        Args:
+            backend_name: Name of the primary backend.
+
+        Returns:
+            List of fallback backend instances.
+        """
+        fallback_names = self._fallback_map.get(backend_name, [])
+        fallbacks = []
+        for name in fallback_names:
+            backend = self._backends.get(name)
+            if backend is not None:
+                fallbacks.append(backend)
+            else:
+                logger.warning(
+                    "fallback_backend_not_found",
+                    primary=backend_name,
+                    fallback=name,
+                )
+        return fallbacks
+
+    def get_backend_by_name(self, name: str) -> Backend | None:
+        """Get a backend by its name.
+
+        Args:
+            name: Backend name.
+
+        Returns:
+            Backend instance or None if not found.
+        """
+        return self._backends.get(name)
+
     @property
-    def default_backend(self) -> VLLMBackend:
+    def default_backend(self) -> Backend:
         """Get the default backend.
 
         Returns:
@@ -116,13 +175,22 @@ class BackendRouter:
         return self._backends[self._default_backend_name]
 
     @property
-    def backends(self) -> dict[str, VLLMBackend]:
+    def backends(self) -> dict[str, Backend]:
         """Get all backends.
 
         Returns:
             Dictionary of backend name to instance.
         """
         return self._backends
+
+    @property
+    def fallback_map(self) -> dict[str, list[str]]:
+        """Get the fallback configuration map.
+
+        Returns:
+            Dictionary of backend name to list of fallback backend names.
+        """
+        return self._fallback_map
 
     @property
     def routing_enabled(self) -> bool:
