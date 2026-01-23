@@ -1,6 +1,6 @@
 [Unit]
 Description=Lexora LLM Gateway
-Documentation=https://github.com/your-org/spirrow-lexora
+Documentation=https://github.com/SpirrowGames/spirrow-lexora
 After=network.target
 
 [Service]

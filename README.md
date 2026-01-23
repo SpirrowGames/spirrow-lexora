@@ -48,7 +48,7 @@ Client → Lexora (Gateway) ────┼→ vLLM-2 (model-c, model-d) → GPU
 
 ```bash
 # Clone
-git clone https://github.com/your-org/spirrow-lexora.git
+git clone https://github.com/SpirrowGames/spirrow-lexora.git
 cd spirrow-lexora
 
 # Install
@@ -338,7 +338,7 @@ sudo chown lexora:lexora /opt/lexora
 
 # Clone and install
 cd /opt/lexora
-sudo -u lexora git clone https://github.com/your-org/spirrow-lexora.git .
+sudo -u lexora git clone https://github.com/SpirrowGames/spirrow-lexora.git .
 sudo -u lexora python3 -m venv venv
 sudo -u lexora ./venv/bin/pip install -e .
 

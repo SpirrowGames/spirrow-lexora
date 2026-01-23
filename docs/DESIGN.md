@@ -20,8 +20,8 @@ Lexora = Lexi (辞書) + Ora (語る)
 
 ## 配置
 
-- **場所**: AIサーバ
-- **理由**: GPU (RTX 5090) を活用したLLM推論
+- **場所**: LLM推論サーバー
+- **理由**: GPUを活用したLLM推論
 
 ## 設計方針
 
@@ -104,7 +104,7 @@ Lexoraはその**前段にプロキシ/ゲートウェイとして立つ**。
                                        │
                     ┌─────────────────────────────────────────┐
                     │           Hardware Layer                │
-                    │  - NVIDIA RTX 5090                      │
+                    │  - NVIDIA GPU (VRAM 24GB+)              │
                     │  - CUDA 12.x                            │
                     └─────────────────────────────────────────┘
 ```
@@ -465,7 +465,7 @@ spirrow-lexora/
 
 | 項目 | 最小要件 | 推奨要件 |
 |------|----------|----------|
-| GPU | RTX 3090 (24GB) | RTX 5090 (32GB) |
+| GPU | NVIDIA GPU (VRAM 24GB+) | NVIDIA GPU (VRAM 32GB+) |
 | RAM | 32GB | 64GB |
 | Storage | 100GB SSD | 500GB NVMe |
 
