@@ -37,3 +37,6 @@ Thumbs.db
 
 # Misc (pip install typos, etc.)
 =*
+
+# Local scripts
+start.sh
