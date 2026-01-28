@@ -10,11 +10,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from lexora import __version__
 from lexora.api.models import (
     ChatCompletionRequest,
+    ChatRequest,
+    ChatResponse,
     ClassifyTaskRequest,
     ClassifyTaskResponse,
     CompletionRequest,
     EmbeddingsRequest,
     ErrorResponse,
+    GenerateRequest,
+    GenerateResponse,
     HealthResponse,
     ModelAlternative,
     ModelCapabilitiesResponse,
@@ -847,3 +851,342 @@ async def classify_task(
             status_code=500,
             detail=f"Unexpected error during task classification: {e}",
         ) from e
+
+
+def get_default_model(
+    model_registry: ModelRegistry | None,
+) -> str | None:
+    """Get default model from registry.
+
+    Args:
+        model_registry: Model registry instance.
+
+    Returns:
+        Default model ID or None if not configured.
+    """
+    if model_registry is None:
+        return None
+    return model_registry.get_default_model_for_unknown_task()
+
+
+@router.post(
+    "/generate",
+    response_model=GenerateResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "No model available"},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def generate(
+    request: GenerateRequest,
+    backend_router: BackendRouter = Depends(get_backend_router),
+    stats_collector: StatsCollector = Depends(get_stats_collector),
+    retry_handler: RetryHandler = Depends(get_retry_handler),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
+    rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
+    metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    model_registry: ModelRegistry | None = Depends(get_model_registry),
+) -> GenerateResponse:
+    """Simple text generation endpoint.
+
+    This is a convenience endpoint that wraps /v1/completions with simpler
+    request/response formats. It's designed for magickit integration.
+
+    Args:
+        request: Simple generation request with prompt.
+        backend_router: Backend router for model routing.
+        stats_collector: Statistics collector.
+        retry_handler: Retry handler.
+        rate_limiter: Rate limiter.
+        rate_limit_enabled: Whether rate limiting is enabled.
+        metrics_collector: Prometheus metrics collector.
+        model_registry: Model registry for default model lookup.
+
+    Returns:
+        GenerateResponse with generated text.
+    """
+    endpoint = "/generate"
+
+    # Check rate limit
+    check_rate_limit(request.user, rate_limiter, rate_limit_enabled, metrics_collector)
+
+    # Determine model to use
+    model = request.model
+    if not model:
+        model = get_default_model(model_registry)
+    if not model:
+        raise HTTPException(
+            status_code=400,
+            detail="No model specified and no default model configured",
+        )
+
+    # Get backend for the model
+    backend = backend_router.get_backend_for_model(model)
+
+    # Build completions request
+    completion_request = {
+        "model": model,
+        "prompt": request.prompt,
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+    }
+
+    # Pass through extra fields
+    extra_fields = request.model_dump(
+        exclude={"prompt", "max_tokens", "temperature", "model", "user"}
+    )
+    completion_request.update(extra_fields)
+
+    stats = stats_collector.start_request(
+        endpoint=endpoint,
+        model=model,
+        user_id=request.user,
+    )
+    start_time = time.time()
+
+    if metrics_collector:
+        metrics_collector.record_request_start(endpoint)
+
+    try:
+
+        async def do_request() -> dict[str, Any]:
+            return await backend.completions(completion_request)
+
+        response, retries = await retry_handler.execute(do_request)
+
+        # Extract generated text from response
+        choices = response.get("choices", [])
+        if not choices:
+            raise HTTPException(
+                status_code=500,
+                detail="No choices in completion response",
+            )
+        text = choices[0].get("text", "")
+
+        usage = response.get("usage", {})
+        tokens_input = usage.get("prompt_tokens", 0)
+        tokens_output = usage.get("completion_tokens", 0)
+        duration = time.time() - start_time
+
+        stats_collector.complete_request(
+            stats,
+            success=True,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            retries=retries,
+        )
+
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=model,
+                status="success",
+                duration=duration,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                retries=retries,
+            )
+
+        logger.info(
+            "generate_success",
+            model=model,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            retries=retries,
+        )
+
+        return GenerateResponse(text=text)
+
+    except BackendError as e:
+        duration = time.time() - start_time
+        stats_collector.complete_request(stats, success=False, error=str(e))
+
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=model,
+                status="error",
+                duration=duration,
+            )
+
+        logger.error("generate_error", model=model, error=str(e))
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        duration = time.time() - start_time
+        stats_collector.complete_request(stats, success=False, error=str(e))
+
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=model,
+                status="error",
+                duration=duration,
+            )
+
+        logger.exception("generate_unexpected_error", model=model)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post(
+    "/chat",
+    response_model=ChatResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "No model available"},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def chat(
+    request: ChatRequest,
+    backend_router: BackendRouter = Depends(get_backend_router),
+    stats_collector: StatsCollector = Depends(get_stats_collector),
+    retry_handler: RetryHandler = Depends(get_retry_handler),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
+    rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
+    metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    model_registry: ModelRegistry | None = Depends(get_model_registry),
+) -> ChatResponse:
+    """Simple chat endpoint.
+
+    This is a convenience endpoint that wraps /v1/chat/completions with simpler
+    request/response formats. It's designed for magickit integration.
+
+    Args:
+        request: Simple chat request with messages.
+        backend_router: Backend router for model routing.
+        stats_collector: Statistics collector.
+        retry_handler: Retry handler.
+        rate_limiter: Rate limiter.
+        rate_limit_enabled: Whether rate limiting is enabled.
+        metrics_collector: Prometheus metrics collector.
+        model_registry: Model registry for default model lookup.
+
+    Returns:
+        ChatResponse with assistant response.
+    """
+    endpoint = "/chat"
+
+    # Check rate limit
+    check_rate_limit(request.user, rate_limiter, rate_limit_enabled, metrics_collector)
+
+    # Determine model to use
+    model = request.model
+    if not model:
+        model = get_default_model(model_registry)
+    if not model:
+        raise HTTPException(
+            status_code=400,
+            detail="No model specified and no default model configured",
+        )
+
+    # Get backend for the model
+    backend = backend_router.get_backend_for_model(model)
+
+    # Build chat completions request
+    chat_request = {
+        "model": model,
+        "messages": [msg.model_dump() for msg in request.messages],
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+    }
+
+    # Pass through extra fields
+    extra_fields = request.model_dump(
+        exclude={"messages", "max_tokens", "temperature", "model", "user"}
+    )
+    chat_request.update(extra_fields)
+
+    stats = stats_collector.start_request(
+        endpoint=endpoint,
+        model=model,
+        user_id=request.user,
+    )
+    start_time = time.time()
+
+    if metrics_collector:
+        metrics_collector.record_request_start(endpoint)
+
+    try:
+
+        async def do_request() -> dict[str, Any]:
+            return await backend.chat_completions(chat_request)
+
+        response, retries = await retry_handler.execute(do_request)
+
+        # Extract response text from choices
+        choices = response.get("choices", [])
+        if not choices:
+            raise HTTPException(
+                status_code=500,
+                detail="No choices in chat completion response",
+            )
+        message = choices[0].get("message", {})
+        response_text = message.get("content", "")
+
+        usage = response.get("usage", {})
+        tokens_input = usage.get("prompt_tokens", 0)
+        tokens_output = usage.get("completion_tokens", 0)
+        duration = time.time() - start_time
+
+        stats_collector.complete_request(
+            stats,
+            success=True,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            retries=retries,
+        )
+
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=model,
+                status="success",
+                duration=duration,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                retries=retries,
+            )
+
+        logger.info(
+            "chat_success",
+            model=model,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            retries=retries,
+        )
+
+        return ChatResponse(response=response_text)
+
+    except BackendError as e:
+        duration = time.time() - start_time
+        stats_collector.complete_request(stats, success=False, error=str(e))
+
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=model,
+                status="error",
+                duration=duration,
+            )
+
+        logger.error("chat_error", model=model, error=str(e))
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        duration = time.time() - start_time
+        stats_collector.complete_request(stats, success=False, error=str(e))
+
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=model,
+                status="error",
+                duration=duration,
+            )
+
+        logger.exception("chat_unexpected_error", model=model)
+        raise HTTPException(status_code=500, detail=str(e)) from e

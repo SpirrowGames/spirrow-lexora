@@ -5,6 +5,52 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
+# Convenience endpoint models for simple text generation
+
+
+class GenerateRequest(BaseModel):
+    """Simple text generation request for /generate endpoint."""
+
+    prompt: str = Field(description="The prompt to generate text from")
+    max_tokens: int = Field(default=1000, description="Maximum tokens to generate")
+    temperature: float = Field(default=0.7, description="Sampling temperature")
+    model: str | None = Field(default=None, description="Model to use (optional)")
+    user: str | None = Field(default=None, description="User identifier for rate limiting")
+
+    model_config = {"extra": "allow"}
+
+
+class GenerateResponse(BaseModel):
+    """Response for /generate endpoint."""
+
+    text: str = Field(description="Generated text")
+
+
+class SimpleChatMessage(BaseModel):
+    """Simple chat message for /chat endpoint."""
+
+    role: Literal["system", "user", "assistant"] = Field(description="Message role")
+    content: str = Field(description="Message content")
+
+
+class ChatRequest(BaseModel):
+    """Simple chat request for /chat endpoint."""
+
+    messages: list[SimpleChatMessage] = Field(description="Chat messages")
+    max_tokens: int = Field(default=1000, description="Maximum tokens to generate")
+    temperature: float = Field(default=0.7, description="Sampling temperature")
+    model: str | None = Field(default=None, description="Model to use (optional)")
+    user: str | None = Field(default=None, description="User identifier for rate limiting")
+
+    model_config = {"extra": "allow"}
+
+
+class ChatResponse(BaseModel):
+    """Response for /chat endpoint."""
+
+    response: str = Field(description="Assistant response text")
+
+
 class ChatMessage(BaseModel):
     """Chat message model."""
 
