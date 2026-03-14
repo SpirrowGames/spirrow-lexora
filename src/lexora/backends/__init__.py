@@ -1,5 +1,6 @@
 """Backend layer for Lexora."""
 
+from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import (
     Backend,
     BackendConnectionError,
@@ -23,6 +24,7 @@ __all__ = [
     # Backend implementations
     "VLLMBackend",
     "OpenAICompatibleBackend",
+    "AnthropicBackend",
     # Factory functions
     "create_backend",
     "resolve_api_key",

@@ -28,6 +28,7 @@ routing:
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "コード生成・複雑な推論向け"
       fallback_backends:
+        - "claude"
         - "openai_gpt4"
 
     light:
@@ -56,6 +57,32 @@ routing:
       model_mapping:
         "gpt-4": "gpt-4-0125-preview"
         "gpt-4-turbo": "gpt-4-turbo-preview"
+
+    # Google Gemini API (OpenAI互換エンドポイント)
+    gemini:
+      type: "openai_compatible"
+      url: "https://generativelanguage.googleapis.com/v1beta/openai"
+      api_key_env: "GEMINI_API_KEY"
+      timeout: 120.0
+      connect_timeout: 5.0
+      models:
+        - name: "gemini-2.5-flash"
+          capabilities: ["code", "reasoning", "analysis", "general"]
+          description: "Google Gemini 2.5 Flash"
+      fallback_backends: []
+
+    # Anthropic Claude API
+    claude:
+      type: "anthropic"
+      url: "https://api.anthropic.com"
+      api_key_env: "ANTHROPIC_API_KEY"
+      timeout: 120.0
+      connect_timeout: 5.0
+      models:
+        - name: "claude-sonnet-4-20250514"
+          capabilities: ["code", "reasoning", "analysis", "general"]
+          description: "Anthropic Claude Sonnet 4"
+      fallback_backends: []
 
 queue:
   max_size: 1000

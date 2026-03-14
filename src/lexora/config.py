@@ -49,8 +49,8 @@ ModelsList = Annotated[list[ModelInfo], BeforeValidator(_normalize_models_list)]
 class BackendSettings(BaseSettings):
     """Single backend settings."""
 
-    type: Literal["vllm", "openai_compatible"] = Field(
-        default="vllm", description="Backend type (vllm or openai_compatible)"
+    type: Literal["vllm", "openai_compatible", "anthropic"] = Field(
+        default="vllm", description="Backend type (vllm, openai_compatible, or anthropic)"
     )
     url: str = Field(default="http://localhost:8000", description="Backend server URL")
     timeout: float = Field(default=120.0, description="Request timeout in seconds")
