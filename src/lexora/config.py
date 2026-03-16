@@ -70,6 +70,10 @@ class BackendSettings(BaseSettings):
     fallback_backends: list[str] = Field(
         default_factory=list, description="List of fallback backend names"
     )
+    thinking_mode: Literal["think", "no_think"] | None = Field(
+        default=None,
+        description="Thinking mode to inject for Qwen3 models: 'think' or 'no_think'",
+    )
 
     def get_model_names(self) -> list[str]:
         """Get list of model names for backward compatibility."""

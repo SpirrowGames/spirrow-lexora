@@ -34,6 +34,7 @@ class VLLMBackend(Backend):
         timeout: float = 120.0,
         connect_timeout: float = 5.0,
         name: str | None = None,
+        thinking_mode: str | None = None,
     ) -> None:
         """Initialize the vLLM backend.
 
@@ -42,9 +43,11 @@ class VLLMBackend(Backend):
             timeout: Request timeout in seconds.
             connect_timeout: Connection timeout in seconds.
             name: Optional backend name for error messages.
+            thinking_mode: Thinking mode directive ('think' or 'no_think').
         """
         self.base_url = base_url.rstrip("/")
         self.name = name
+        self._thinking_mode = thinking_mode
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout, connect=connect_timeout),
@@ -69,6 +72,35 @@ class VLLMBackend(Backend):
         except ValueError:
             return None
 
+    def _inject_thinking_mode(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Inject thinking mode directive into chat messages.
+
+        Prepends /think or /no_think to the first system message,
+        or adds a new system message if none exists.
+
+        Args:
+            request: OpenAI-compatible chat completion request.
+
+        Returns:
+            Modified request with thinking directive injected.
+        """
+        if not self._thinking_mode:
+            return request
+
+        directive = f"/{self._thinking_mode}"
+        request = {**request, "messages": list(request.get("messages", []))}
+
+        messages = request["messages"]
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {
+                **messages[0],
+                "content": f"{directive}\n{messages[0].get('content', '')}",
+            }
+        else:
+            messages.insert(0, {"role": "system", "content": directive})
+
+        return request
+
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
         """Send chat completion request to vLLM.
 
@@ -81,7 +113,7 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        return await self._post("/v1/chat/completions", request)
+        return await self._post("/v1/chat/completions", self._inject_thinking_mode(request))
 
     async def completions(self, request: dict[str, Any]) -> dict[str, Any]:
         """Send completion request to vLLM.
@@ -152,7 +184,7 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        async for chunk in self._post_stream("/v1/chat/completions", request):
+        async for chunk in self._post_stream("/v1/chat/completions", self._inject_thinking_mode(request)):
             yield chunk
 
     async def completions_stream(

@@ -4,16 +4,16 @@ server:
   host: "0.0.0.0"
   port: 8110
 
-# マルチバックエンド: 14B(重量) + 1.5B(軽量) + OpenAI(フォールバック)
+# 統一バックエンド: Qwen3-32B (thinking/non-thinking切り替え)
 routing:
   enabled: true
   default_backend: "heavy"
-  default_model_for_unknown_task: "Qwen2.5-Coder-14B"
+  default_model_for_unknown_task: "Qwen3-32B"
 
   # タスク分類設定
   classifier:
     enabled: true
-    model: "Qwen2.5-1.5B"
+    model: "Qwen3-32B"
     backend: "light"
 
   backends:
@@ -22,24 +22,25 @@ routing:
       url: "http://localhost:8000"
       timeout: 120.0
       connect_timeout: 5.0
+      thinking_mode: "think"
       models:
-        # 新形式: メタデータ付き
-        - name: "Qwen2.5-Coder-14B"
-          capabilities: ["code", "reasoning", "analysis", "general"]
-          description: "コード生成・複雑な推論向け"
+        - name: "Qwen3-32B"
+          capabilities: ["code", "reasoning", "analysis"]
+          description: "複雑なタスク向け (thinking mode)"
       fallback_backends:
         - "claude"
         - "openai_gpt4"
 
     light:
       type: "vllm"
-      url: "http://localhost:8001"
+      url: "http://localhost:8000"
       timeout: 60.0
       connect_timeout: 5.0
+      thinking_mode: "no_think"
       models:
-        - name: "Qwen2.5-1.5B"
-          capabilities: ["summarization", "translation", "simple_qa"]
-          description: "軽量タスク向け高速モデル"
+        - name: "Qwen3-32B"
+          capabilities: ["summarization", "translation", "simple_qa", "general"]
+          description: "軽量タスク向け (non-thinking mode)"
       fallback_backends:
         - "openai_gpt4"
 
