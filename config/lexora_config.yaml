@@ -91,9 +91,8 @@ routing:
         "claude-code-sonnet": "sonnet"
         # Extra config via model_mapping (factory reads these)
         "model": "sonnet"  # default CLI model
-        # "allowed_tools": "Bash,Read,Edit,Write,Glob,Grep"
+        "max_turns": "1"  # prevent agentic tool use for simple completions
         # "working_dir": "/home/sgadmin"
-        # "max_turns": "5"
       fallback_backends:
         - "claude"
 
