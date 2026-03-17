@@ -72,6 +72,31 @@ routing:
           description: "Google Gemini 2.5 Flash"
       fallback_backends: []
 
+    # Claude Code CLI (non-interactive mode)
+    claude_code:
+      type: "claude_code"
+      url: "localhost"  # unused but required by schema
+      timeout: 600.0
+      connect_timeout: 5.0
+      models:
+        - name: "claude-code-opus"
+          capabilities: ["code", "reasoning", "analysis", "agentic"]
+          description: "Claude Code (Opus) - agentic coding with tool use"
+        - name: "claude-code-sonnet"
+          capabilities: ["code", "reasoning", "general"]
+          description: "Claude Code (Sonnet) - fast coding assistant"
+      model_mapping:
+        # CLI model arg (--model)
+        "claude-code-opus": "opus"
+        "claude-code-sonnet": "sonnet"
+        # Extra config via model_mapping (factory reads these)
+        "model": "sonnet"  # default CLI model
+        # "allowed_tools": "Bash,Read,Edit,Write,Glob,Grep"
+        # "working_dir": "/home/sgadmin"
+        # "max_turns": "5"
+      fallback_backends:
+        - "claude"
+
     # Anthropic Claude API
     claude:
       type: "anthropic"

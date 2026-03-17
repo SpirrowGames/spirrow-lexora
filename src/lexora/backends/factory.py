@@ -4,6 +4,7 @@ import os
 
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend
+from lexora.backends.claude_code import ClaudeCodeBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import BackendSettings
@@ -107,6 +108,30 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             api_key=api_key,
             timeout=settings.timeout,
             connect_timeout=settings.connect_timeout,
+            model_mapping=settings.model_mapping,
+            name=name,
+        )
+    elif settings.type == "claude_code":
+        # Extract extra config from model_mapping (factory convention)
+        cli_model = settings.model_mapping.get("model", "sonnet")
+        allowed_tools_str = settings.model_mapping.get("allowed_tools", "")
+        allowed_tools = [t.strip() for t in allowed_tools_str.split(",") if t.strip()] if allowed_tools_str else None
+        working_dir = settings.model_mapping.get("working_dir")
+        max_turns_str = settings.model_mapping.get("max_turns")
+        max_turns = int(max_turns_str) if max_turns_str else None
+
+        logger.info(
+            "creating_claude_code_backend",
+            name=name,
+            cli_model=cli_model,
+            has_allowed_tools=allowed_tools is not None,
+        )
+        return ClaudeCodeBackend(
+            model=cli_model,
+            timeout=settings.timeout,
+            allowed_tools=allowed_tools,
+            working_dir=working_dir,
+            max_turns=max_turns,
             model_mapping=settings.model_mapping,
             name=name,
         )
