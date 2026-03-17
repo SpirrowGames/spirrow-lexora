@@ -32,6 +32,7 @@ from lexora.services.model_registry import ModelRegistry
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.router import BackendRouter
+from lexora.services.cost_tracker import CostTracker
 from lexora.services.stats import StatsCollector
 from lexora.services.task_classifier import (
     TaskClassifier,
@@ -90,6 +91,11 @@ def get_task_classifier(request: Request) -> TaskClassifier | None:
     return getattr(request.app.state, "task_classifier", None)
 
 
+def get_cost_tracker(request: Request) -> CostTracker | None:
+    """Get cost tracker from app state."""
+    return getattr(request.app.state, "cost_tracker", None)
+
+
 def check_rate_limit(
     user_id: str | None,
     rate_limiter: RateLimiter,
@@ -138,6 +144,7 @@ async def chat_completions(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> dict[str, Any] | StreamingResponse:
     """Proxy chat completion request to vLLM.
 
@@ -293,6 +300,18 @@ async def chat_completions(
                 tokens_input=tokens_input,
                 tokens_output=tokens_output,
                 retries=retries,
+            )
+
+        # Record cost
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=request.model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(request.model),
+                user_id=request.user,
+                duration=duration,
             )
 
         logger.info(
@@ -1190,3 +1209,48 @@ async def chat(
 
         logger.exception("chat_unexpected_error", model=model)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# --- Cost tracking endpoints ---
+
+
+@router.get("/stats/costs")
+async def get_costs(
+    period: str = "today",
+    model: str | None = None,
+    user_id: str | None = None,
+    backend: str | None = None,
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+) -> dict[str, Any]:
+    """Get aggregated API costs.
+
+    Args:
+        period: "today", "month", "all", or ISO date "YYYY-MM-DD".
+        model: Filter by model name.
+        user_id: Filter by user.
+        backend: Filter by backend name.
+
+    Returns:
+        Aggregated cost data with summary, per-model breakdown, and daily totals.
+    """
+    if cost_tracker is None:
+        raise HTTPException(status_code=503, detail="Cost tracking not available")
+    return cost_tracker.get_costs(period=period, model=model, user_id=user_id, backend=backend)
+
+
+@router.get("/stats/costs/recent")
+async def get_recent_costs(
+    limit: int = 50,
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+) -> list[dict[str, Any]]:
+    """Get recent request cost records.
+
+    Args:
+        limit: Maximum number of records to return.
+
+    Returns:
+        List of recent request cost records.
+    """
+    if cost_tracker is None:
+        raise HTTPException(status_code=503, detail="Cost tracking not available")
+    return cost_tracker.get_recent(limit=limit)

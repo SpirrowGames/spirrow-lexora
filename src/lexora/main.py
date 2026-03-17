@@ -17,6 +17,7 @@ from lexora.services.model_registry import ModelRegistry
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.router import BackendRouter
+from lexora.services.cost_tracker import CostTracker
 from lexora.services.stats import StatsCollector
 from lexora.services.task_classifier import TaskClassifier
 from lexora.utils.logging import get_logger, setup_logging
@@ -60,6 +61,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Initialize services
     app.state.stats_collector = StatsCollector()
+    app.state.cost_tracker = CostTracker()
     app.state.retry_handler = RetryHandler(
         max_retries=settings.retry.max_retries,
         base_delay=settings.retry.base_delay,
