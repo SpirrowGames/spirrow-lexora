@@ -59,7 +59,7 @@ class ClaudeCodeBackend(Backend):
         self.model_mapping = model_mapping or {}
         self.name = name
 
-    def _build_command(self, prompt: str, stream: bool = False) -> list[str]:
+    def _build_command(self, prompt: str, stream: bool = False, system_prompt: str | None = None) -> list[str]:
         """Build the claude CLI command.
 
         Args:
@@ -85,8 +85,10 @@ class ClaudeCodeBackend(Backend):
         if self.allowed_tools:
             cmd.extend(["--allowedTools", ",".join(self.allowed_tools)])
 
-        if self.system_prompt:
-            cmd.extend(["--append-system-prompt", self.system_prompt])
+        # System prompt: prefer per-request, fall back to constructor default
+        effective_system = system_prompt or self.system_prompt
+        if effective_system:
+            cmd.extend(["--append-system-prompt", effective_system])
 
         if self.max_turns is not None:
             cmd.extend(["--max-turns", str(self.max_turns)])
@@ -94,17 +96,18 @@ class ClaudeCodeBackend(Backend):
         return cmd
 
     @staticmethod
-    def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
-        """Convert OpenAI-style messages to a single prompt string.
+    def _messages_to_prompt(messages: list[dict[str, Any]]) -> tuple[str | None, str]:
+        """Convert OpenAI-style messages to system prompt and user prompt.
 
-        System messages are prepended, then user/assistant messages
-        are formatted as a conversation.
+        System messages are extracted separately to be passed via
+        --append-system-prompt (avoids prompt injection detection).
+        User/assistant messages become the main prompt.
 
         Args:
             messages: List of OpenAI-style message dicts.
 
         Returns:
-            Combined prompt string.
+            Tuple of (system_prompt or None, user_prompt).
         """
         system_parts: list[str] = []
         conversation_parts: list[str] = []
@@ -130,13 +133,10 @@ class ClaudeCodeBackend(Backend):
             elif role == "assistant":
                 conversation_parts.append(f"[Previous assistant response]\n{content}")
 
-        parts = []
-        if system_parts:
-            parts.append("[System Instructions]\n" + "\n\n".join(system_parts))
-        if conversation_parts:
-            parts.append("\n\n".join(conversation_parts))
+        system_prompt = "\n\n".join(system_parts) if system_parts else None
+        user_prompt = "\n\n".join(conversation_parts) if conversation_parts else ""
 
-        return "\n\n".join(parts)
+        return system_prompt, user_prompt
 
     def _make_openai_response(
         self,
@@ -190,13 +190,13 @@ class ClaudeCodeBackend(Backend):
             OpenAI-compatible chat completion response.
         """
         messages = request.get("messages", [])
-        prompt = self._messages_to_prompt(messages)
+        system_prompt, prompt = self._messages_to_prompt(messages)
         requested_model = request.get("model", self.model)
 
         # Temporarily set self.model to the requested model for _build_command
         original_model = self.model
         self.model = requested_model
-        cmd = self._build_command(prompt, stream=False)
+        cmd = self._build_command(prompt, stream=False, system_prompt=system_prompt)
         self.model = original_model
 
         logger.info(
@@ -290,12 +290,12 @@ class ClaudeCodeBackend(Backend):
             SSE data chunks in OpenAI format.
         """
         messages = request.get("messages", [])
-        prompt = self._messages_to_prompt(messages)
+        system_prompt, prompt = self._messages_to_prompt(messages)
         requested_model = request.get("model", self.model)
 
         original_model = self.model
         self.model = requested_model
-        cmd = self._build_command(prompt, stream=True)
+        cmd = self._build_command(prompt, stream=True, system_prompt=system_prompt)
         self.model = original_model
         model = requested_model
 
@@ -310,12 +310,14 @@ class ClaudeCodeBackend(Backend):
         )
 
         try:
+            # Increase buffer limit for large JSON lines from Claude Code
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.working_dir,
+                limit=1024 * 1024,  # 1MB line buffer
             )
 
             # Send prompt via stdin and close it
