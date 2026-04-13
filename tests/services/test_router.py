@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from lexora.backends.base import BackendError
-from lexora.config import BackendSettings, RoutingSettings, VLLMSettings
+from lexora.config import BackendSettings, RoutingSettings, TierSettings, VLLMSettings
 from lexora.services.router import BackendRouter
 
 
@@ -358,3 +358,92 @@ class TestBackendRouterClose:
 
         router.backends["backend1"].close.assert_called_once()
         router.backends["backend2"].close.assert_called_once()
+
+
+class TestBackendRouterTierRouting:
+    """Tests for BackendRouter tier-based routing."""
+
+    def _make_router(
+        self,
+        tiers: dict[str, TierSettings] | None = None,
+    ) -> BackendRouter:
+        """Create a router with tier configuration."""
+        routing_settings = RoutingSettings(
+            enabled=True,
+            default_backend="backend1",
+            backends={
+                "backend1": BackendSettings(
+                    url="http://localhost:8001",
+                    models=["model-a"],
+                ),
+                "backend2": BackendSettings(
+                    url="http://localhost:8002",
+                    models=["model-b"],
+                ),
+            },
+            tiers=tiers or {},
+        )
+        vllm_settings = VLLMSettings(url="http://localhost:8000")
+        return BackendRouter(
+            routing_settings=routing_settings,
+            vllm_settings=vllm_settings,
+        )
+
+    def test_tier_routes_to_correct_backend(self) -> None:
+        """Test that tier names route to the configured backend."""
+        router = self._make_router(
+            tiers={
+                "light": TierSettings(backend="backend1"),
+                "heavy": TierSettings(backend="backend2"),
+            }
+        )
+
+        assert router.get_backend_for_model("light") is router.backends["backend1"]
+        assert router.get_backend_for_model("heavy") is router.backends["backend2"]
+
+    def test_tier_takes_precedence_over_model(self) -> None:
+        """Test that tier mapping takes precedence when name collides with model."""
+        router = self._make_router(
+            tiers={
+                "model-a": TierSettings(backend="backend2"),
+            }
+        )
+
+        # "model-a" is registered as both a model (→backend1) and a tier (→backend2)
+        # Tier should win
+        assert router.get_backend_for_model("model-a") is router.backends["backend2"]
+
+    def test_unknown_name_falls_to_default(self) -> None:
+        """Test that names matching neither tier nor model fall to default."""
+        router = self._make_router(
+            tiers={
+                "light": TierSettings(backend="backend1"),
+            }
+        )
+
+        backend = router.get_backend_for_model("unknown")
+        assert backend is router.backends["backend1"]  # default
+
+    def test_tier_with_invalid_backend_is_skipped(self) -> None:
+        """Test that tiers referencing non-existent backends are not registered."""
+        router = self._make_router(
+            tiers={
+                "broken": TierSettings(backend="nonexistent"),
+                "valid": TierSettings(backend="backend2"),
+            }
+        )
+
+        # "broken" tier should not be registered
+        assert router.get_backend_for_model("broken") is router.backends["backend1"]  # falls to default
+        # "valid" tier should work
+        assert router.get_backend_for_model("valid") is router.backends["backend2"]
+
+    def test_get_backend_name_for_model_resolves_tier(self) -> None:
+        """Test that get_backend_name_for_model also resolves tiers."""
+        router = self._make_router(
+            tiers={
+                "light": TierSettings(backend="backend2"),
+            }
+        )
+
+        assert router.get_backend_name_for_model("light") == "backend2"

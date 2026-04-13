@@ -40,6 +40,8 @@ class BackendRouter:
         self._model_to_backend: dict[str, str] = {}
         self._fallback_map: dict[str, list[str]] = {}
 
+        self._tier_to_backend: dict[str, str] = {}
+
         if self._routing_enabled and routing_settings.backends:
             # Multi-backend mode using factory
             for name, settings in routing_settings.backends.items():
@@ -63,6 +65,22 @@ class BackendRouter:
                         "fallback_registered",
                         backend=name,
                         fallbacks=settings.fallback_backends,
+                    )
+
+            # Register tier mappings
+            for tier_name, tier_settings in routing_settings.tiers.items():
+                if tier_settings.backend in self._backends:
+                    self._tier_to_backend[tier_name] = tier_settings.backend
+                    logger.info(
+                        "tier_registered",
+                        tier=tier_name,
+                        backend=tier_settings.backend,
+                    )
+                else:
+                    logger.warning(
+                        "tier_backend_not_found",
+                        tier=tier_name,
+                        backend=tier_settings.backend,
                     )
 
             logger.info(
@@ -96,11 +114,11 @@ class BackendRouter:
         Raises:
             BackendError: If no backend is available for the model.
         """
-        # Check if model has explicit mapping
-        backend_name = self._model_to_backend.get(model)
-
+        # Check tier mapping first, then model mapping, then default
+        backend_name = self._tier_to_backend.get(model)
         if backend_name is None:
-            # Use default backend
+            backend_name = self._model_to_backend.get(model)
+        if backend_name is None:
             backend_name = self._default_backend_name
 
         backend = self._backends.get(backend_name)
@@ -126,7 +144,9 @@ class BackendRouter:
         Returns:
             Backend name.
         """
-        backend_name = self._model_to_backend.get(model)
+        backend_name = self._tier_to_backend.get(model)
+        if backend_name is None:
+            backend_name = self._model_to_backend.get(model)
         if backend_name is None:
             backend_name = self._default_backend_name
         return backend_name

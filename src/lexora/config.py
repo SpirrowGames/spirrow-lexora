@@ -88,6 +88,15 @@ class VLLMSettings(BaseSettings):
     connect_timeout: float = Field(default=5.0, description="Connection timeout in seconds")
 
 
+class TierSettings(BaseSettings):
+    """Tier configuration — maps a tier name to a backend."""
+
+    backend: str = Field(description="Backend name this tier routes to")
+    description: str | None = Field(
+        default=None, description="Human-readable tier description"
+    )
+
+
 class ClassifierSettings(BaseSettings):
     """Task classifier settings."""
 
@@ -112,6 +121,10 @@ class RoutingSettings(BaseSettings):
     default_model_for_unknown_task: str | None = Field(
         default=None,
         description="Default model to use when task classification fails or returns unknown",
+    )
+    tiers: dict[str, TierSettings] = Field(
+        default_factory=dict,
+        description="Tier-to-backend mapping (e.g., light, medium, heavy)",
     )
     classifier: ClassifierSettings = Field(
         default_factory=ClassifierSettings,
@@ -259,6 +272,11 @@ def create_settings(config_path: Path | None = None) -> Settings:
             routing_settings_kwargs["default_model_for_unknown_task"] = routing_config[
                 "default_model_for_unknown_task"
             ]
+        tiers_config = routing_config.get("tiers", {})
+        if tiers_config:
+            routing_settings_kwargs["tiers"] = {
+                name: TierSettings(**cfg) for name, cfg in tiers_config.items()
+            }
         classifier_config = routing_config.get("classifier", {})
         if classifier_config:
             routing_settings_kwargs["classifier"] = ClassifierSettings(**classifier_config)

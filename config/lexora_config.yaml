@@ -10,6 +10,19 @@ routing:
   default_backend: "heavy"
   default_model_for_unknown_task: "Qwen3-32B"
 
+  # ティアベースルーティング
+  # 呼び出し側は model: "light" 等のティア名を指定するだけでよい
+  tiers:
+    light:
+      backend: "light"
+      description: "軽量タスク (no thinking)"
+    medium:
+      backend: "heavy"
+      description: "標準タスク (with thinking)"
+    heavy:
+      backend: "claude"
+      description: "複雑なタスク (Claude API)"
+
   # タスク分類設定
   classifier:
     enabled: true
