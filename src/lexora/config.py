@@ -89,9 +89,13 @@ class VLLMSettings(BaseSettings):
 
 
 class TierSettings(BaseSettings):
-    """Tier configuration — maps a tier name to a backend."""
+    """Tier configuration — maps a tier name to a backend and model."""
 
     backend: str = Field(description="Backend name this tier routes to")
+    model: str | None = Field(
+        default=None,
+        description="Model name to send to backend (defaults to backend's first model)",
+    )
     description: str | None = Field(
         default=None, description="Human-readable tier description"
     )

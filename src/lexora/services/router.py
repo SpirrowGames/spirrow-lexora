@@ -41,6 +41,7 @@ class BackendRouter:
         self._fallback_map: dict[str, list[str]] = {}
 
         self._tier_to_backend: dict[str, str] = {}
+        self._tier_to_model: dict[str, str] = {}
 
         if self._routing_enabled and routing_settings.backends:
             # Multi-backend mode using factory
@@ -71,10 +72,18 @@ class BackendRouter:
             for tier_name, tier_settings in routing_settings.tiers.items():
                 if tier_settings.backend in self._backends:
                     self._tier_to_backend[tier_name] = tier_settings.backend
+                    # Resolve model name: explicit > backend's first model
+                    backend_settings = routing_settings.backends[tier_settings.backend]
+                    model_name = tier_settings.model
+                    if model_name is None and backend_settings.models:
+                        model_name = backend_settings.models[0].name
+                    if model_name:
+                        self._tier_to_model[tier_name] = model_name
                     logger.info(
                         "tier_registered",
                         tier=tier_name,
                         backend=tier_settings.backend,
+                        model=model_name,
                     )
                 else:
                     logger.warning(
@@ -150,6 +159,20 @@ class BackendRouter:
         if backend_name is None:
             backend_name = self._default_backend_name
         return backend_name
+
+    def resolve_model(self, model: str) -> str:
+        """Resolve tier name to actual model name.
+
+        If the model is a tier name, returns the configured model name.
+        Otherwise returns the model name as-is.
+
+        Args:
+            model: Model or tier name.
+
+        Returns:
+            Resolved model name.
+        """
+        return self._tier_to_model.get(model, model)
 
     def get_fallback_backends(self, backend_name: str) -> list[Backend]:
         """Get fallback backends for a given backend.

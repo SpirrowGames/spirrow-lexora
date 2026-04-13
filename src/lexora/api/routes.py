@@ -167,9 +167,11 @@ async def chat_completions(
 
     # Get backend for the requested model
     backend = backend_router.get_backend_for_model(request.model)
+    resolved_model = backend_router.resolve_model(request.model)
 
     # Convert to dict, excluding None values
     request_dict = request.model_dump(exclude_none=True)
+    request_dict["model"] = resolved_model
 
     # Handle streaming request
     if request.stream:
@@ -390,9 +392,11 @@ async def completions(
 
     # Get backend for the requested model
     backend = backend_router.get_backend_for_model(request.model)
+    resolved_model = backend_router.resolve_model(request.model)
 
     # Convert to dict, excluding None values
     request_dict = request.model_dump(exclude_none=True)
+    request_dict["model"] = resolved_model
 
     # Handle streaming request
     if request.stream:
@@ -598,10 +602,11 @@ async def embeddings(
 
     # Get backend for the requested model
     backend = backend_router.get_backend_for_model(request.model)
+    resolved_model = backend_router.resolve_model(request.model)
 
     stats = stats_collector.start_request(
         endpoint=endpoint,
-        model=request.model,
+        model=resolved_model,
         user_id=request.user,
     )
     start_time = time.time()
