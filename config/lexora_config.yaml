@@ -22,6 +22,13 @@ routing:
     heavy:
       backend: "claude"
       description: "複雑なタスク (Claude API)"
+    # role ルート: naysayer は別訓練分布 (Gemini) で最大独立性を取る
+    # (ADR-2026-05-31-15 D-2「2 協調 1 独立」)。呼び出し側は model: "naysayer"
+    # を指定する。context-bundle 組み立ては呼び出し側 (オーケストレーション層) の責務。
+    naysayer:
+      backend: "gemini"
+      model: "gemini-2.5-flash"
+      description: "naysayer (別訓練分布・最大独立性、native generateContent gate)"
 
   # タスク分類設定
   classifier:
@@ -72,17 +79,21 @@ routing:
         "gpt-4": "gpt-4-0125-preview"
         "gpt-4-turbo": "gpt-4-turbo-preview"
 
-    # Google Gemini API (OpenAI互換エンドポイント)
+    # Google Gemini API (ネイティブ generateContent)
+    # naysayer ルート専用バックエンド (ADR-2026-05-31-14 / -15)。
+    # データ統治 gate: 素の generateContent のみ。tools/grounding/File API/
+    # 明示キャッシュ/Live API/Interactions API は adapter 層で拒否。
+    # 不変条件: paid 鍵 + ZDR 申請 (free 鍵厳禁、一次文面で学習利用確定)。
     gemini:
-      type: "openai_compatible"
-      url: "https://generativelanguage.googleapis.com/v1beta/openai"
+      type: "gemini"
+      url: "https://generativelanguage.googleapis.com"
       api_key_env: "GEMINI_API_KEY"
       timeout: 120.0
       connect_timeout: 5.0
       models:
         - name: "gemini-2.5-flash"
           capabilities: ["code", "reasoning", "analysis", "general"]
-          description: "Google Gemini 2.5 Flash"
+          description: "Google Gemini 2.5 Flash (naysayer, native generateContent)"
       fallback_backends: []
 
     # Claude Code CLI (non-interactive mode)
