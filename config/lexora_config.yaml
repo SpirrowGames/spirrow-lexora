@@ -83,7 +83,9 @@ routing:
     # naysayer ルート専用バックエンド (ADR-2026-05-31-14 / -15)。
     # データ統治 gate: 素の generateContent のみ。tools/grounding/File API/
     # 明示キャッシュ/Live API/Interactions API は adapter 層で拒否。
-    # 不変条件: paid 鍵 + ZDR 申請 (free 鍵厳禁、一次文面で学習利用確定)。
+    # 必須不変条件: paid 鍵のみ (free 鍵厳禁 — 一次文面で学習利用確定)。
+    # ZDR は推奨 (ベター)・必須ではない (T-zdr-invariant-downgrade, Takahito 2026-06-01)。
+    # 「他人の個人データを LLM 経路に載せる」用途が出たら project 単位で ZDR 再必須化検討。
     gemini:
       type: "gemini"
       url: "https://generativelanguage.googleapis.com"

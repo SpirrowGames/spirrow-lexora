@@ -11,8 +11,14 @@ the Anthropic boundary (ADR-15 C-2), this adapter enforces a **data-governance
 gate**: only the plain ``generateContent`` surface is reachable. Grounding
 (google_search / retrieval), function-calling / tools, the File API, explicit
 context caching, the Live API and the Interactions API are all refused at the
-adapter boundary so that a ZDR-approved, training-excluded paid key stays on
-the one surface the data-governance invariant permits (ADR-14 D-4).
+adapter boundary so that a training-excluded paid key stays on the one surface
+the data-governance invariant permits (ADR-14 D-4).
+
+The required invariant is a **paid key** (free keys are training-included and
+forbidden). ZDR is *recommended*, not required, as of the
+T-zdr-invariant-downgrade decision (Takahito, 2026-06-01): it is re-required
+per project only when someone else's personal data goes on the LLM path. The
+gate is independent of ZDR and stays as-is either way.
 
 Context assembly (the N-1 "context-bundle builder" that injects ADR/diff/thread
 text for the naysayer) is intentionally NOT done here: Lexora is a gateway and
@@ -101,6 +107,9 @@ class GeminiBackend(Backend):
         connect_timeout: Connection timeout in seconds.
         model_mapping: Optional mapping from requested model names to actual names.
         name: Optional backend name for error messages.
+        health_check_model: Model name health_check probes. Should be supplied
+            from config (e.g. the backend's first configured model) so the
+            health probe tracks the served model instead of a hard-coded name.
     """
 
     def __init__(
@@ -111,11 +120,16 @@ class GeminiBackend(Backend):
         connect_timeout: float = 5.0,
         model_mapping: dict[str, str] | None = None,
         name: str | None = None,
+        health_check_model: str | None = None,
     ) -> None:
         self.base_url = self._normalize_base_url(base_url)
         self.api_key = api_key
         self.model_mapping = model_mapping or {}
         self.name = name
+        # Model used by health_check. Defaults to a known model but should be
+        # supplied from config so health probes the same model the backend
+        # actually serves (rather than a hard-coded name).
+        self.health_check_model = health_check_model or "gemini-2.5-flash"
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
@@ -295,6 +309,11 @@ class GeminiBackend(Backend):
             finish_reason = _FINISH_REASON_MAP.get(
                 candidate.get("finishReason", "STOP"), "stop"
             )
+        elif gemini_resp.get("promptFeedback", {}).get("blockReason"):
+            # Prompt blocked before any candidate was produced (safety/block).
+            # Surface as content_filter so a block is observable symmetrically
+            # with the streaming path, not silently reported as "stop".
+            finish_reason = "content_filter"
 
         usage = gemini_resp.get("usageMetadata", {})
         prompt_tokens = usage.get("promptTokenCount", 0)
@@ -469,6 +488,23 @@ class GeminiBackend(Backend):
 
                     candidates = event.get("candidates", [])
                     if not candidates:
+                        # Prompt-level block (no candidate): surface as
+                        # content_filter so a block is observable symmetrically
+                        # with the non-streaming path.
+                        block = event.get("promptFeedback", {}).get("blockReason")
+                        if block:
+                            if not role_sent:
+                                yield self._sse_chunk(
+                                    chunk_id,
+                                    created,
+                                    model,
+                                    {"role": "assistant", "content": ""},
+                                    None,
+                                )
+                                role_sent = True
+                            yield self._sse_chunk(
+                                chunk_id, created, model, {}, "content_filter"
+                            )
                         continue
                     candidate = candidates[0]
                     parts = candidate.get("content", {}).get("parts", [])
@@ -551,7 +587,7 @@ class GeminiBackend(Backend):
             "data-governance gate: legacy text completions are not part of the "
             "naysayer surface (use chat_completions / generateContent)"
         )
-        yield b""  # Make this an async generator
+        yield b""  # pragma: no cover  # async-generator marker; unreachable after raise
 
     async def embeddings(self, request: dict[str, Any]) -> dict[str, Any]:
         """Not supported: embedContent is a separate, gated surface."""
@@ -575,7 +611,7 @@ class GeminiBackend(Backend):
         Sends a minimal generateContent request.
         """
         try:
-            model = self._map_model("gemini-2.5-flash")
+            model = self._map_model(self.health_check_model)
             response = await self._client.post(
                 self._model_path(model, "generateContent"),
                 json={

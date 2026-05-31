@@ -300,6 +300,47 @@ class TestResponseConversion:
         assert result["choices"][0]["message"]["content"] == ""
         assert result["choices"][0]["finish_reason"] == "stop"
 
+    def test_prompt_level_block_is_content_filter(self, backend):
+        # No candidates but a prompt-level block must surface as content_filter
+        # (symmetric with the streaming path), not silently "stop".
+        gemini_resp = {"promptFeedback": {"blockReason": "SAFETY"}}
+        result = backend._to_openai_response(gemini_resp, "m")
+        assert result["choices"][0]["finish_reason"] == "content_filter"
+
+
+class TestHealthCheckModel:
+    """B-1: health_check must probe a configurable model, not a hard-coded one."""
+
+    def test_default_health_model(self):
+        backend = GeminiBackend()
+        assert backend.health_check_model == "gemini-2.5-flash"
+
+    def test_configured_health_model(self):
+        backend = GeminiBackend(health_check_model="gemini-3.1-pro")
+        assert backend.health_check_model == "gemini-3.1-pro"
+
+    @pytest.mark.asyncio
+    async def test_health_check_uses_configured_model(self):
+        backend = GeminiBackend(
+            api_key="gm-test", health_check_model="gemini-3.1-pro"
+        )
+        backend._client.post = AsyncMock(return_value=_mock_response(200, {}))
+        await backend.health_check()
+        called_path = backend._client.post.call_args[0][0]
+        assert "gemini-3.1-pro:generateContent" in called_path
+
+    @pytest.mark.asyncio
+    async def test_health_model_respects_mapping(self):
+        backend = GeminiBackend(
+            api_key="gm-test",
+            health_check_model="naysayer",
+            model_mapping={"naysayer": "gemini-2.5-flash"},
+        )
+        backend._client.post = AsyncMock(return_value=_mock_response(200, {}))
+        await backend.health_check()
+        called_path = backend._client.post.call_args[0][0]
+        assert "gemini-2.5-flash:generateContent" in called_path
+
 
 def _mock_response(status_code=200, json_body=None, headers=None):
     """Build a MagicMock httpx.Response."""
