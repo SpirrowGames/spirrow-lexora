@@ -5,6 +5,7 @@ import os
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend
 from lexora.backends.claude_code import ClaudeCodeBackend
+from lexora.backends.gemini import GeminiBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import BackendSettings
@@ -87,6 +88,31 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             connect_timeout=settings.connect_timeout,
             model_mapping=settings.model_mapping,
             name=name,
+        )
+    elif settings.type == "gemini":
+        api_key = resolve_api_key(settings)
+        if api_key is None:
+            logger.warning(
+                "gemini_no_api_key",
+                name=name,
+                url=settings.url,
+            )
+        logger.info(
+            "creating_gemini_backend",
+            name=name,
+            url=settings.url,
+            has_api_key=api_key is not None,
+            model_mapping_count=len(settings.model_mapping),
+        )
+        model_names = settings.get_model_names()
+        return GeminiBackend(
+            base_url=settings.url,
+            api_key=api_key,
+            timeout=settings.timeout,
+            connect_timeout=settings.connect_timeout,
+            model_mapping=settings.model_mapping,
+            name=name,
+            health_check_model=model_names[0] if model_names else None,
         )
     elif settings.type == "anthropic":
         api_key = resolve_api_key(settings)
