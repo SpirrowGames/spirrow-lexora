@@ -36,21 +36,6 @@ routing:
     backend: "light"
 
   backends:
-    # 独立批判者 (naysayer): DeepSeek V4-Flash, ローカル CPU 推論 (antirez fork llama-server :8003)
-    # ADR-05 §5: Claude 族とも既存 Qwen 群とも別系統で独立性を確保。
-    # reasoning モデル: 回答は content、熟考は reasoning_content。max_tokens は大きめ (>=1500) 推奨。
-    # 実効 context は llama-server 側 --ctx-size 65536 で確定 (Lexora は openai_compatible パススルー、截ち落とし無し)。
-    naysayer:
-      type: "openai_compatible"
-      url: "http://127.0.0.1:8003"
-      timeout: 900.0
-      connect_timeout: 10.0
-      models:
-        - name: "deepseek-v4-flash"
-          capabilities: ["reasoning", "analysis", "code", "critique"]
-          description: "DeepSeek V4-Flash Q4 (CPU, 独立批判者/naysayer, antirez fork)"
-      fallback_backends: []
-
     heavy:
       type: "vllm"
       url: "http://localhost:8000"
