@@ -110,6 +110,13 @@ class GeminiBackend(Backend):
         health_check_model: Model name health_check probes. Should be supplied
             from config (e.g. the backend's first configured model) so the
             health probe tracks the served model instead of a hard-coded name.
+        paid_key_acknowledged: Operator affirmation that ``api_key`` is a
+            paid/billing-enabled key. Required (fail-closed) when an api_key is
+            configured — see ADR-2026-05-31-14 D-4 paid-key guarantee.
+
+    Raises:
+        GeminiGovernanceError: If an api_key is configured without
+            paid_key_acknowledged.
     """
 
     def __init__(
@@ -121,11 +128,31 @@ class GeminiBackend(Backend):
         model_mapping: dict[str, str] | None = None,
         name: str | None = None,
         health_check_model: str | None = None,
+        paid_key_acknowledged: bool = False,
     ) -> None:
+        # Paid-key structural guarantee (ADR-2026-05-31-14 D-4): with ZDR
+        # downgraded to recommended, the paid key is the last line of defense
+        # against training use of naysayer content. Gemini keys do not encode
+        # their billing tier in the string, so we cannot probe paid/free at
+        # runtime; instead we fail closed unless the operator has explicitly
+        # affirmed (in config) that the configured key is a paid/billing-enabled
+        # key. A key without that affirmation is refused — no accidental free-key
+        # use via defaults.
+        if api_key and not paid_key_acknowledged:
+            raise GeminiGovernanceError(
+                "paid-key guarantee: a GEMINI_API_KEY is configured but "
+                "paid_key_acknowledged is not set. Set paid_key_acknowledged: "
+                "true in the gemini backend config only after confirming the "
+                "key belongs to a billing-enabled (paid) Google project. Free "
+                "keys are training-included and forbidden for the naysayer "
+                "route (ADR-2026-05-31-14 D-4)."
+            )
+
         self.base_url = self._normalize_base_url(base_url)
         self.api_key = api_key
         self.model_mapping = model_mapping or {}
         self.name = name
+        self.paid_key_acknowledged = paid_key_acknowledged
         # Model used by health_check. Defaults to a known model but should be
         # supplied from config so health probes the same model the backend
         # actually serves (rather than a hard-coded name).
