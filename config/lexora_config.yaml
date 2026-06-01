@@ -24,10 +24,9 @@ routing:
       description: "複雑なタスク (Claude API)"
     # role ルート: naysayer は別訓練分布 (Gemini) で最大独立性を取る
     # (ADR-2026-05-31-15 D-2「2 協調 1 独立」)。呼び出し側は model: "naysayer"
-    # を指定する。context-bundle 組み立ては呼び出し側 (オーケストレーション層) の責務。
     naysayer:
       backend: "gemini"
-      model: "gemini-2.5-flash"
+      model: "gemini-3.1-pro-preview"
       description: "naysayer (別訓練分布・最大独立性、native generateContent gate)"
 
   # タスク分類設定
@@ -37,11 +36,26 @@ routing:
     backend: "light"
 
   backends:
+    # 独立批判者 (naysayer): DeepSeek V4-Flash, ローカル CPU 推論 (antirez fork llama-server :8003)
+    # ADR-05 §5: Claude 族とも既存 Qwen 群とも別系統で独立性を確保。
+    # reasoning モデル: 回答は content、熟考は reasoning_content。max_tokens は大きめ (>=1500) 推奨。
+    # 実効 context は llama-server 側 --ctx-size 65536 で確定 (Lexora は openai_compatible パススルー、截ち落とし無し)。
+    naysayer:
+      type: "openai_compatible"
+      url: "http://127.0.0.1:8003"
+      timeout: 900.0
+      connect_timeout: 10.0
+      models:
+        - name: "deepseek-v4-flash"
+          capabilities: ["reasoning", "analysis", "code", "critique"]
+          description: "DeepSeek V4-Flash Q4 (CPU, 独立批判者/naysayer, antirez fork)"
+      fallback_backends: []
+
     heavy:
       type: "vllm"
       url: "http://localhost:8000"
-      timeout: 120.0
-      connect_timeout: 5.0
+      timeout: 300.0
+      connect_timeout: 10.0
       thinking_mode: "think"
       models:
         - name: "Qwen3-32B"
@@ -54,8 +68,8 @@ routing:
     light:
       type: "vllm"
       url: "http://localhost:8000"
-      timeout: 60.0
-      connect_timeout: 5.0
+      timeout: 300.0
+      connect_timeout: 10.0
       thinking_mode: "no_think"
       models:
         - name: "Qwen3-32B"
@@ -79,28 +93,21 @@ routing:
         "gpt-4": "gpt-4-0125-preview"
         "gpt-4-turbo": "gpt-4-turbo-preview"
 
-    # Google Gemini API (ネイティブ generateContent)
-    # naysayer ルート専用バックエンド (ADR-2026-05-31-14 / -15)。
-    # データ統治 gate: 素の generateContent のみ。tools/grounding/File API/
-    # 明示キャッシュ/Live API/Interactions API は adapter 層で拒否。
-    # 必須不変条件: paid 鍵のみ (free 鍵厳禁 — 一次文面で学習利用確定)。
-    # ZDR は推奨 (ベター)・必須ではない (T-zdr-invariant-downgrade, Takahito 2026-06-01)。
-    # 「他人の個人データを LLM 経路に載せる」用途が出たら project 単位で ZDR 再必須化検討。
+    # Google Gemini API (native generateContent, naysayer 用)
     gemini:
       type: "gemini"
       url: "https://generativelanguage.googleapis.com"
       api_key_env: "GEMINI_API_KEY"
       # paid 鍵の構造的保証 (ADR-14 D-4): Gemini 鍵は文字列から paid/free を判別
       # できないため、運用者が「課金有効 project の鍵である」ことを明示 affirm する。
-      # false のままだと鍵設定時に backend 構築が fail-closed で拒否される
-      # (free 鍵の誤用を default で防ぐ)。請求有効化を確認後に true へ。
-      paid_key_acknowledged: false
+      # false のままだと鍵設定時に backend 構築が fail-closed で拒否される。
+      paid_key_acknowledged: true
       timeout: 120.0
       connect_timeout: 5.0
       models:
-        - name: "gemini-2.5-flash"
+        - name: "gemini-3.1-pro-preview"
           capabilities: ["code", "reasoning", "analysis", "general"]
-          description: "Google Gemini 2.5 Flash (naysayer, native generateContent)"
+          description: "Google Gemini 3.1 Pro Preview (naysayer, native generateContent)"
       fallback_backends: []
 
     # Claude Code CLI (non-interactive mode)
