@@ -50,7 +50,8 @@ logger = get_logger(__name__)
 GEMINI_API_VERSION = "v1beta"
 
 # Default output token cap when the caller does not specify max_tokens.
-DEFAULT_MAX_OUTPUT_TOKENS = 4096
+# reasoning モデル (例: Gemini 3.1 Pro) は thinking が output を消費するため本文確保用に引き上げ。
+DEFAULT_MAX_OUTPUT_TOKENS = 16000
 
 # Data-governance gate (ADR-2026-05-31-14 D-4 / ADR-2026-05-31-15 C-2):
 # OpenAI-compatible request keys whose presence implies a Gemini surface
