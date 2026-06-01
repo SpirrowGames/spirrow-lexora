@@ -41,7 +41,7 @@ class TestGeminiBackendInit:
         assert backend.base_url == "https://generativelanguage.googleapis.com"
 
     def test_with_api_key_sets_header(self):
-        backend = GeminiBackend(api_key="gm-test")
+        backend = GeminiBackend(api_key="gm-test", paid_key_acknowledged=True)
         assert backend.api_key == "gm-test"
         assert backend._client.headers["x-goog-api-key"] == "gm-test"
 
@@ -62,12 +62,37 @@ class TestGeminiBackendInit:
         )
 
 
+class TestPaidKeyGuarantee:
+    """ADR-14 D-4: fail-closed paid-key affirmation when a key is configured."""
+
+    def test_key_without_ack_refused(self):
+        with pytest.raises(GeminiGovernanceError, match="paid-key guarantee"):
+            GeminiBackend(api_key="gm-test")
+
+    def test_key_with_ack_constructs(self):
+        backend = GeminiBackend(api_key="gm-test", paid_key_acknowledged=True)
+        assert backend.api_key == "gm-test"
+        assert backend.paid_key_acknowledged is True
+
+    def test_keyless_construction_allowed_without_ack(self):
+        # No key configured -> nothing to mis-bill; construction is allowed
+        # (e.g. for unit-testing conversion helpers).
+        backend = GeminiBackend()
+        assert backend.api_key is None
+        assert backend.paid_key_acknowledged is False
+
+    def test_paid_key_guarantee_error_is_backend_error(self):
+        assert issubclass(GeminiGovernanceError, BackendError)
+
+
 class TestGovernanceGate:
     """Tests for the data-governance gate (plain generateContent only)."""
 
     @pytest.fixture
     def backend(self):
-        return GeminiBackend(name="naysayer", api_key="gm-test")
+        return GeminiBackend(
+            name="naysayer", api_key="gm-test", paid_key_acknowledged=True
+        )
 
     @pytest.mark.parametrize(
         "forbidden_key",
@@ -322,7 +347,9 @@ class TestHealthCheckModel:
     @pytest.mark.asyncio
     async def test_health_check_uses_configured_model(self):
         backend = GeminiBackend(
-            api_key="gm-test", health_check_model="gemini-3.1-pro"
+            api_key="gm-test",
+            health_check_model="gemini-3.1-pro",
+            paid_key_acknowledged=True,
         )
         backend._client.post = AsyncMock(return_value=_mock_response(200, {}))
         await backend.health_check()
@@ -335,6 +362,7 @@ class TestHealthCheckModel:
             api_key="gm-test",
             health_check_model="naysayer",
             model_mapping={"naysayer": "gemini-2.5-flash"},
+            paid_key_acknowledged=True,
         )
         backend._client.post = AsyncMock(return_value=_mock_response(200, {}))
         await backend.health_check()
@@ -357,7 +385,9 @@ class TestChatCompletions:
 
     @pytest.fixture
     def backend(self):
-        return GeminiBackend(name="naysayer", api_key="gm-test")
+        return GeminiBackend(
+            name="naysayer", api_key="gm-test", paid_key_acknowledged=True
+        )
 
     @pytest.mark.asyncio
     async def test_successful_request(self, backend):

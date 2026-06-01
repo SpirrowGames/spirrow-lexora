@@ -80,6 +80,14 @@ class BackendSettings(BaseSettings):
         default=None,
         description="Thinking mode to inject for Qwen3 models: 'think' or 'no_think'",
     )
+    paid_key_acknowledged: bool = Field(
+        default=False,
+        description=(
+            "Gemini backend only: operator affirmation that api_key is a "
+            "paid/billing-enabled key. Fail-closed when a key is configured "
+            "(ADR-2026-05-31-14 D-4 paid-key guarantee)."
+        ),
+    )
 
     def get_model_names(self) -> list[str]:
         """Get list of model names for backward compatibility."""

@@ -113,6 +113,7 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             model_mapping=settings.model_mapping,
             name=name,
             health_check_model=model_names[0] if model_names else None,
+            paid_key_acknowledged=settings.paid_key_acknowledged,
         )
     elif settings.type == "anthropic":
         api_key = resolve_api_key(settings)
