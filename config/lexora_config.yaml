@@ -89,6 +89,10 @@ routing:
       paid_key_acknowledged: true
       timeout: 120.0
       connect_timeout: 5.0
+      # max_tokens 未指定リクエスト時の出力上限。reasoning モデル (Gemini 3.1 Pro)
+      # は thinking が output 枠を消費するため、本文確保用に余裕を持たせる。
+      # リクエストが max_tokens を明示した場合はそちらが優先される。
+      default_max_tokens: 16000
       models:
         - name: "gemini-3.1-pro-preview"
           capabilities: ["code", "reasoning", "analysis", "general"]

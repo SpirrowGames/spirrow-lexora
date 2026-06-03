@@ -206,6 +206,22 @@ class TestRequestConversion:
             == DEFAULT_MAX_OUTPUT_TOKENS
         )
 
+    def test_configured_default_max_tokens_used_when_omitted(self):
+        backend = GeminiBackend(name="test", default_max_tokens=8000)
+        request = {"messages": [{"role": "user", "content": "Hi"}]}
+        result = backend._to_gemini_request(request)
+        assert result["generationConfig"]["maxOutputTokens"] == 8000
+
+    def test_request_max_tokens_overrides_configured_default(self):
+        backend = GeminiBackend(name="test", default_max_tokens=8000)
+        request = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 42}
+        result = backend._to_gemini_request(request)
+        assert result["generationConfig"]["maxOutputTokens"] == 42
+
+    def test_none_default_falls_back_to_module_constant(self):
+        backend = GeminiBackend(name="test", default_max_tokens=None)
+        assert backend.default_max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
+
     def test_system_instruction_extraction(self, backend):
         request = {
             "messages": [

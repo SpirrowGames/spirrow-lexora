@@ -114,6 +114,8 @@ class GeminiBackend(Backend):
         paid_key_acknowledged: Operator affirmation that ``api_key`` is a
             paid/billing-enabled key. Required (fail-closed) when an api_key is
             configured — see ADR-2026-05-31-14 D-4 paid-key guarantee.
+        default_max_tokens: Output cap applied when a request omits max_tokens.
+            Defaults to ``DEFAULT_MAX_OUTPUT_TOKENS`` when None.
 
     Raises:
         GeminiGovernanceError: If an api_key is configured without
@@ -130,6 +132,7 @@ class GeminiBackend(Backend):
         name: str | None = None,
         health_check_model: str | None = None,
         paid_key_acknowledged: bool = False,
+        default_max_tokens: int | None = None,
     ) -> None:
         # Paid-key structural guarantee (ADR-2026-05-31-14 D-4): with ZDR
         # downgraded to recommended, the paid key is the last line of defense
@@ -158,6 +161,14 @@ class GeminiBackend(Backend):
         # supplied from config so health probes the same model the backend
         # actually serves (rather than a hard-coded name).
         self.health_check_model = health_check_model or "gemini-2.5-flash"
+        # Output cap used when a request omits max_tokens. Configurable so the
+        # operator can tune headroom for reasoning models (whose thinking spends
+        # the output budget); falls back to the module default when unset.
+        self.default_max_tokens = (
+            default_max_tokens
+            if default_max_tokens is not None
+            else DEFAULT_MAX_OUTPUT_TOKENS
+        )
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
@@ -298,7 +309,7 @@ class GeminiBackend(Backend):
             }
 
         generation_config: dict[str, Any] = {
-            "maxOutputTokens": request.get("max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+            "maxOutputTokens": request.get("max_tokens", self.default_max_tokens)
         }
         if "temperature" in request:
             generation_config["temperature"] = request["temperature"]

@@ -114,6 +114,7 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             name=name,
             health_check_model=model_names[0] if model_names else None,
             paid_key_acknowledged=settings.paid_key_acknowledged,
+            default_max_tokens=settings.default_max_tokens,
         )
     elif settings.type == "anthropic":
         api_key = resolve_api_key(settings)

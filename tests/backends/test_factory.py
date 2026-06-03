@@ -5,6 +5,7 @@ import pytest
 from unittest.mock import patch
 
 from lexora.backends.factory import create_backend, resolve_api_key
+from lexora.backends.gemini import DEFAULT_MAX_OUTPUT_TOKENS, GeminiBackend
 from lexora.backends.vllm import VLLMBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
 from lexora.config import BackendSettings
@@ -86,6 +87,37 @@ class TestCreateBackend:
         assert backend.api_key == "sk-test-key"
         assert backend.model_mapping == {"gpt-4": "gpt-4-turbo"}
         assert backend.name == "openai_prod"
+
+    def test_create_gemini_backend_passes_default_max_tokens(self):
+        """Configured default_max_tokens reaches the Gemini backend."""
+        settings = BackendSettings(
+            type="gemini",
+            url="https://generativelanguage.googleapis.com",
+            api_key="gm-test",
+            paid_key_acknowledged=True,
+            default_max_tokens=8000,
+            models=[{"name": "gemini-3.1-pro-preview"}],
+        )
+
+        backend = create_backend("gemini", settings)
+
+        assert isinstance(backend, GeminiBackend)
+        assert backend.default_max_tokens == 8000
+
+    def test_create_gemini_backend_default_max_tokens_falls_back(self):
+        """Unset default_max_tokens falls back to the module constant."""
+        settings = BackendSettings(
+            type="gemini",
+            url="https://generativelanguage.googleapis.com",
+            api_key="gm-test",
+            paid_key_acknowledged=True,
+            models=[{"name": "gemini-3.1-pro-preview"}],
+        )
+
+        backend = create_backend("gemini", settings)
+
+        assert isinstance(backend, GeminiBackend)
+        assert backend.default_max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
 
     def test_create_openai_compatible_with_env_key(self):
         """Test creating OpenAI-compatible backend with env var API key."""

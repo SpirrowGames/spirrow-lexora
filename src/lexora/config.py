@@ -80,6 +80,15 @@ class BackendSettings(BaseSettings):
         default=None,
         description="Thinking mode to inject for Qwen3 models: 'think' or 'no_think'",
     )
+    default_max_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Default max output tokens applied when a request omits max_tokens. "
+            "Currently consumed by the gemini backend (reasoning models spend "
+            "output budget on thinking, so a generous default avoids empty "
+            "responses). None falls back to the backend's built-in default."
+        ),
+    )
     paid_key_acknowledged: bool = Field(
         default=False,
         description=(
