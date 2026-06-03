@@ -51,6 +51,48 @@ class ChatResponse(BaseModel):
     response: str = Field(description="Assistant response text")
 
 
+# Anthropic Messages API-compatible request (for /v1/messages)
+
+
+class AnthropicMessage(BaseModel):
+    """A single message in an Anthropic Messages API request.
+
+    ``content`` may be a plain string or a list of content blocks (text, image,
+    tool_use, tool_result, ...). Blocks are passed through to the compatibility
+    layer, which forwards non-text blocks verbatim so backend gates can reject
+    them where applicable.
+    """
+
+    role: Literal["user", "assistant"] = Field(description="Message role")
+    content: str | list[dict[str, Any]] = Field(description="Message content")
+
+
+class MessagesRequest(BaseModel):
+    """Anthropic Messages API-compatible request for /v1/messages.
+
+    Mirrors the public Anthropic Messages API. ``model`` accepts either a real
+    model name or a Lexora tier name (e.g. ``naysayer``); tier resolution is
+    handled by the router. Extra fields are allowed for forward compatibility.
+    """
+
+    model: str = Field(description="Model or Lexora tier name (e.g. 'naysayer')")
+    messages: list[AnthropicMessage] = Field(description="Conversation messages")
+    max_tokens: int = Field(description="Maximum tokens to generate")
+    system: str | list[dict[str, Any]] | None = Field(
+        default=None, description="System prompt (string or content blocks)"
+    )
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    stop_sequences: list[str] | None = None
+    stream: bool = False
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+
+    model_config = {"extra": "allow"}
+
+
 class ChatMessage(BaseModel):
     """Chat message model."""
 

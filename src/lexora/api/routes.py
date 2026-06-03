@@ -8,6 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from lexora import __version__
+from lexora.api.anthropic_compat import (
+    anthropic_error_body,
+    anthropic_stream_from_openai,
+    anthropic_to_openai_request,
+    extract_user_id,
+    openai_to_anthropic_response,
+)
 from lexora.api.models import (
     ChatCompletionRequest,
     ChatRequest,
@@ -20,12 +27,14 @@ from lexora.api.models import (
     GenerateRequest,
     GenerateResponse,
     HealthResponse,
+    MessagesRequest,
     ModelAlternative,
     ModelCapabilitiesResponse,
     ModelCapabilityInfo,
     StatsResponse,
 )
 from lexora.backends.base import BackendError
+from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
 from lexora.services.metrics import MetricsCollector
 from lexora.services.model_registry import ModelRegistry
@@ -1214,6 +1223,248 @@ async def chat(
 
         logger.exception("chat_unexpected_error", model=model)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post(
+    "/v1/messages",
+    response_model=None,
+    responses={429: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+async def messages(
+    request: MessagesRequest,
+    backend_router: BackendRouter = Depends(get_backend_router),
+    stats_collector: StatsCollector = Depends(get_stats_collector),
+    retry_handler: RetryHandler = Depends(get_retry_handler),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
+    rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
+    metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+) -> dict[str, Any] | JSONResponse | StreamingResponse:
+    """Anthropic Messages API-compatible endpoint.
+
+    Accepts an Anthropic Messages request, translates it to Lexora's internal
+    OpenAI-compatible format, routes it through the normal backend router (so
+    ``model: "naysayer"`` reaches the Gemini naysayer tier and its
+    data-governance gate), and translates the response back to the Anthropic
+    Messages shape. Errors are returned in the Anthropic ``{"type": "error",
+    ...}`` shape so the ``anthropic`` SDK parses them natively.
+
+    Args:
+        request: Anthropic Messages API request.
+        backend_router: Backend router for model/tier routing.
+        stats_collector: Statistics collector.
+        retry_handler: Retry handler.
+        rate_limiter: Rate limiter.
+        rate_limit_enabled: Whether rate limiting is enabled.
+        metrics_collector: Prometheus metrics collector.
+        cost_tracker: Cost tracker.
+
+    Returns:
+        Anthropic Messages response (dict), an Anthropic-shaped error
+        (JSONResponse), or a streaming SSE response.
+    """
+    endpoint = "/v1/messages"
+
+    req_dict = request.model_dump(exclude_none=True)
+    user_id = extract_user_id(req_dict)
+
+    # Rate limiting (Anthropic-shaped 429 so the SDK parses it).
+    if rate_limit_enabled:
+        effective_user_id = user_id or "anonymous"
+        if not rate_limiter.consume(effective_user_id):
+            wait_time = rate_limiter.time_until_allowed(effective_user_id)
+            if metrics_collector:
+                metrics_collector.record_rate_limit_rejection(effective_user_id)
+            return JSONResponse(
+                status_code=429,
+                content=anthropic_error_body(
+                    "rate_limit_error",
+                    f"Rate limit exceeded. Retry after {wait_time:.1f} seconds.",
+                ),
+                headers={"Retry-After": str(int(wait_time) + 1)},
+            )
+
+    backend = backend_router.get_backend_for_model(request.model)
+    resolved_model = backend_router.resolve_model(request.model)
+
+    openai_request = anthropic_to_openai_request(req_dict)
+    openai_request["model"] = resolved_model
+
+    # Streaming path: pre-flight the backend stream so governance/connection
+    # errors surface as proper HTTP status codes before any SSE headers are sent.
+    if request.stream:
+        openai_request["stream"] = True
+        byte_iter = backend.chat_completions_stream(openai_request).__aiter__()
+        try:
+            first_chunk = await byte_iter.__anext__()
+        except StopAsyncIteration:
+            first_chunk = None
+        except GeminiGovernanceError as e:
+            return JSONResponse(
+                status_code=400,
+                content=anthropic_error_body("invalid_request_error", str(e)),
+            )
+        except BackendError as e:
+            logger.error("messages_stream_error", model=request.model, error=str(e))
+            return JSONResponse(
+                status_code=502,
+                content=anthropic_error_body("api_error", str(e)),
+            )
+
+        stats = stats_collector.start_request(
+            endpoint=endpoint, model=request.model, user_id=user_id
+        )
+        if metrics_collector:
+            metrics_collector.record_request_start(endpoint)
+        start_time = time.time()
+
+        async def replayed() -> AsyncIterator[bytes]:
+            if first_chunk is not None:
+                yield first_chunk
+            async for chunk in byte_iter:
+                yield chunk
+
+        async def stream_generator() -> AsyncIterator[bytes]:
+            try:
+                async for event in anthropic_stream_from_openai(
+                    replayed(), request.model
+                ):
+                    yield event
+                stats_collector.complete_request(stats, success=True)
+                if metrics_collector:
+                    metrics_collector.record_request_end(
+                        endpoint=endpoint,
+                        model=request.model,
+                        status="success",
+                        duration=time.time() - start_time,
+                        streaming=True,
+                    )
+            except Exception as e:  # noqa: BLE001
+                stats_collector.complete_request(stats, success=False, error=str(e))
+                if metrics_collector:
+                    metrics_collector.record_request_end(
+                        endpoint=endpoint,
+                        model=request.model,
+                        status="error",
+                        duration=time.time() - start_time,
+                        streaming=True,
+                    )
+                logger.exception("messages_stream_unexpected_error", model=request.model)
+                raise
+
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Non-streaming path.
+    stats = stats_collector.start_request(
+        endpoint=endpoint, model=request.model, user_id=user_id
+    )
+    start_time = time.time()
+    if metrics_collector:
+        metrics_collector.record_request_start(endpoint)
+
+    try:
+
+        async def do_request() -> dict[str, Any]:
+            return await backend.chat_completions(openai_request)
+
+        response, retries = await retry_handler.execute(do_request)
+
+        anthropic_response = openai_to_anthropic_response(response, request.model)
+
+        usage = response.get("usage", {})
+        tokens_input = usage.get("prompt_tokens", 0)
+        tokens_output = usage.get("completion_tokens", 0)
+        duration = time.time() - start_time
+
+        stats_collector.complete_request(
+            stats,
+            success=True,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            retries=retries,
+        )
+
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=request.model,
+                status="success",
+                duration=duration,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                retries=retries,
+            )
+
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=request.model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(request.model),
+                user_id=user_id,
+                duration=duration,
+            )
+
+        logger.info(
+            "messages_success",
+            model=request.model,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            retries=retries,
+        )
+        return anthropic_response
+
+    except GeminiGovernanceError as e:
+        stats_collector.complete_request(stats, success=False, error=str(e))
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=request.model,
+                status="error",
+                duration=time.time() - start_time,
+            )
+        logger.warning("messages_governance_refused", model=request.model, error=str(e))
+        return JSONResponse(
+            status_code=400,
+            content=anthropic_error_body("invalid_request_error", str(e)),
+        )
+    except BackendError as e:
+        stats_collector.complete_request(stats, success=False, error=str(e))
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=request.model,
+                status="error",
+                duration=time.time() - start_time,
+            )
+        logger.error("messages_error", model=request.model, error=str(e))
+        return JSONResponse(
+            status_code=502,
+            content=anthropic_error_body("api_error", str(e)),
+        )
+    except Exception as e:
+        stats_collector.complete_request(stats, success=False, error=str(e))
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=request.model,
+                status="error",
+                duration=time.time() - start_time,
+            )
+        logger.exception("messages_unexpected_error", model=request.model)
+        return JSONResponse(
+            status_code=500,
+            content=anthropic_error_body("api_error", str(e)),
+        )
 
 
 # --- Cost tracking endpoints ---
