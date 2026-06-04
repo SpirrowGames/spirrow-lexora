@@ -97,6 +97,17 @@ class BackendSettings(BaseSettings):
             "(ADR-2026-05-31-14 D-4 paid-key guarantee)."
         ),
     )
+    governance_gate_enabled: bool = Field(
+        default=True,
+        description=(
+            "Gemini backend only: enforce the naysayer data-governance gate "
+            "(plain generateContent only; tools / grounding / cached-content / "
+            "non-text parts refused — ADR-2026-05-31-14 D-4 / ADR-15 C-2). "
+            "Defaults True (fail-closed). Set false to disable the gate and let "
+            "tools/non-text surfaces through — this relaxes the ADR data-"
+            "governance invariant, so flip it only with explicit owner sign-off."
+        ),
+    )
 
     def get_model_names(self) -> list[str]:
         """Get list of model names for backward compatibility."""

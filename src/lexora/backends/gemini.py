@@ -133,6 +133,7 @@ class GeminiBackend(Backend):
         health_check_model: str | None = None,
         paid_key_acknowledged: bool = False,
         default_max_tokens: int | None = None,
+        governance_gate_enabled: bool = True,
     ) -> None:
         # Paid-key structural guarantee (ADR-2026-05-31-14 D-4): with ZDR
         # downgraded to recommended, the paid key is the last line of defense
@@ -157,6 +158,11 @@ class GeminiBackend(Backend):
         self.model_mapping = model_mapping or {}
         self.name = name
         self.paid_key_acknowledged = paid_key_acknowledged
+        # When False, _enforce_governance_gate is bypassed so tools / grounding /
+        # cached-content / non-text parts pass through. This relaxes the ADR-14
+        # D-4 / ADR-15 C-2 data-governance invariant and must be set only with
+        # explicit owner sign-off (config: governance_gate_enabled: false).
+        self.governance_gate_enabled = governance_gate_enabled
         # Model used by health_check. Defaults to a known model but should be
         # supplied from config so health probes the same model the backend
         # actually serves (rather than a hard-coded name).
@@ -230,6 +236,20 @@ class GeminiBackend(Backend):
         Raises:
             GeminiGovernanceError: If a forbidden surface is requested.
         """
+        if not self.governance_gate_enabled:
+            # Gate disabled by config (owner sign-off). Emit a warning so the
+            # relaxed data-governance posture is visible in logs rather than silent.
+            logger.warning(
+                "gemini_governance_gate_disabled",
+                name=self.name,
+                detail=(
+                    "data-governance gate bypassed: tools / grounding / "
+                    "cached-content / non-text parts are NOT refused "
+                    "(ADR-14 D-4 / ADR-15 C-2 invariant relaxed by config)"
+                ),
+            )
+            return
+
         present_forbidden = _FORBIDDEN_REQUEST_KEYS.intersection(request)
         if present_forbidden:
             raise GeminiGovernanceError(
