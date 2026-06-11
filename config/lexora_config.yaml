@@ -91,7 +91,10 @@ routing:
       # tools / grounding / cached-content / 非テキスト part を拒否しなくなる。
       # ADR-2026-05-31-14 D-4 / ADR-15 C-2 の不変条件を緩める設定 — 再有効化は true。
       governance_gate_enabled: false
-      timeout: 120.0
+      # naysayer の長い生成 (output budget 32k, reasoning 込み) が Gemini 高レイテンシ
+      # 時間帯に 120s を超えて 502 になっていたため、呼び出し側 mindwire の想定
+      # ゲートウェイ timeout=900s (client は 930s 待機) に合わせる。2026-06-11。
+      timeout: 900.0
       connect_timeout: 5.0
       # max_tokens 未指定リクエスト時の出力上限。reasoning モデル (Gemini 3.1 Pro)
       # は thinking が output 枠を消費するため、本文確保用に余裕を持たせる。
