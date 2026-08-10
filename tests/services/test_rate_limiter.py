@@ -1,10 +1,33 @@
-"""Tests for rate limiter."""
+"""Tests for rate limiter.
+
+Note on comparing token counts: the bucket refills lazily, so `available()`
+recomputes from `time.monotonic()` on every call. Any count *below capacity*
+is therefore a function of how long ago the last update was, and two adjacent
+Python statements are never zero seconds apart -- at rate=10 the gap measures
+~2e-6 tokens. Exact equality survives only where the capacity clamp pins the
+value (a full bucket, or a consume that was refused), which is why some
+assertions here can use `==` and the below-capacity ones cannot.
+"""
 
 import time
 
 import pytest
 
 from lexora.services.rate_limiter import RateLimiter, TokenBucket
+
+#: Tolerance for a below-capacity token count, in tokens.
+#:
+#: 0.01 at rate=10 is a millisecond of refill. The measured gap between two
+#: adjacent statements is ~2e-6 tokens (max 3e-5 over 2000 runs), so this
+#: leaves room for a scheduler hiccup or a GC pause without flaking -- which
+#: matters more than tightness here, since a unit test that goes red on a
+#: busy machine is the failure this file is being fixed for.
+#:
+#: Mutation-checked: `tokens + 0.02` in `consume` is caught, `tokens * 0.999`
+#: (a 0.005-token error) is not. Nothing between those is a defect anyone
+#: would ship -- getting the arithmetic wrong is off by >= 1 token.
+TOKENS = pytest.approx
+TOKEN_SLACK = 0.01
 
 
 class TestTokenBucket:
@@ -19,7 +42,8 @@ class TestTokenBucket:
         """Test successful token consumption."""
         bucket = TokenBucket(rate=10.0, capacity=20.0)
         assert bucket.consume(5.0) is True
-        assert bucket.available() == 15.0
+        # Below capacity, so the clamp does not pin it: see the module docstring.
+        assert bucket.available() == TOKENS(15.0, abs=TOKEN_SLACK)
 
     def test_consume_failure(self) -> None:
         """Test failed consumption when not enough tokens."""
@@ -119,7 +143,7 @@ class TestRateLimiter:
         assert info["user_id"] == "user-1"
         assert info["rate"] == 10.0
         assert info["burst"] == 20
-        assert info["available_tokens"] == 15.0
+        assert info["available_tokens"] == TOKENS(15.0, abs=TOKEN_SLACK)
         assert info["is_custom_limit"] is False
 
     def test_time_until_allowed(self, limiter: RateLimiter) -> None:
