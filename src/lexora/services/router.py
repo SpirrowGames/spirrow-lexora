@@ -1,5 +1,6 @@
 """Backend router for multi-model support."""
 
+import asyncio
 from typing import Any
 
 from lexora.backends.base import Backend, BackendError
@@ -37,6 +38,9 @@ class BackendRouter:
         self._routing_enabled = routing_settings.enabled
         self._default_backend_name = routing_settings.default_backend
         self._backends: dict[str, Backend] = {}
+        #: Backends that opted into GET /health. Absent name == checked, so
+        #: legacy single-backend mode keeps its probe without saying so.
+        self._health_checked: dict[str, bool] = {}
         self._model_to_backend: dict[str, str] = {}
         self._fallback_map: dict[str, list[str]] = {}
 
@@ -47,6 +51,9 @@ class BackendRouter:
             # Multi-backend mode using factory
             for name, settings in routing_settings.backends.items():
                 self._backends[name] = create_backend(name, settings)
+                self._health_checked[name] = settings.health_check
+                if not settings.health_check:
+                    logger.info("backend_health_check_skipped", backend=name)
 
                 # Map models to this backend
                 for model_info in settings.models:
@@ -244,15 +251,47 @@ class BackendRouter:
         """
         return self._routing_enabled
 
-    async def health_check(self) -> dict[str, bool]:
-        """Check health of all backends.
+    async def health_check(self) -> dict[str, bool | None]:
+        """Check health of every backend that opted into being checked.
+
+        ``None`` means the backend was skipped (``health_check: false``), not
+        that it is unhealthy or absent -- callers must keep those apart, since
+        a skipped backend still serves traffic.
+
+        Backends are probed concurrently. Serially, the total was the sum of
+        every probe, so one slow remote API set the latency of the whole
+        endpoint: measured 2026-08-11, a single unauthenticated
+        ``openai_compatible`` backend stalled ``GET /health`` for 20-40s while
+        every other probe stayed at its usual few milliseconds.
 
         Returns:
-            Dictionary of backend name to health status.
+            Backend name -> True (healthy) / False (unhealthy) / None (skipped).
         """
-        health = {}
-        for name, backend in self._backends.items():
-            health[name] = await backend.health_check()
+        checked = [
+            (name, backend)
+            for name, backend in self._backends.items()
+            if self._health_checked.get(name, True)
+        ]
+
+        results = await asyncio.gather(
+            *(backend.health_check() for _, backend in checked),
+            return_exceptions=True,
+        )
+
+        health: dict[str, bool | None] = {
+            name: None for name in self._backends if name not in dict(checked)
+        }
+        for (name, _), result in zip(checked, results):
+            if isinstance(result, BaseException):
+                # A probe that raised has not said the backend is down; it has
+                # said the probe failed. Reporting False is the safe reading
+                # for a health endpoint, but log it so the two are separable.
+                logger.warning(
+                    "backend_health_check_error", backend=name, error=str(result)
+                )
+                health[name] = False
+            else:
+                health[name] = bool(result)
         return health
 
     async def list_all_models(self) -> dict[str, Any]:
