@@ -164,8 +164,14 @@ class EmbeddingsRequest(BaseModel):
 class HealthResponse(BaseModel):
     """Health check response."""
 
-    status: Literal["healthy", "unhealthy", "degraded"]
-    backends: dict[str, Literal["healthy", "unhealthy"]]
+    # "unknown" is only reachable when every backend opted out of being
+    # checked: with nothing probed, "healthy" would be a claim nobody made.
+    status: Literal["healthy", "unhealthy", "degraded", "unknown"]
+    # "skipped" == `health_check: false`, NOT unhealthy and NOT absent. The
+    # backend still serves traffic; it just is not probed (see
+    # BackendSettings.health_check for why). Skipped backends are excluded
+    # from `status`.
+    backends: dict[str, Literal["healthy", "unhealthy", "skipped"]]
     version: str
     # Legacy field for backward compatibility
     vllm_status: Literal["healthy", "unhealthy", "unknown"] | None = None

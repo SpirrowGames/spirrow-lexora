@@ -48,7 +48,6 @@ routing:
           description: "複雑なタスク向け (thinking mode)"
       fallback_backends:
         - "claude"
-        - "openai_gpt4"
 
     light:
       type: "vllm"
@@ -60,23 +59,15 @@ routing:
         - name: "Qwen3-32B"
           capabilities: ["summarization", "translation", "simple_qa", "general"]
           description: "軽量タスク向け (non-thinking mode)"
-      fallback_backends:
-        - "openai_gpt4"
+      fallback_backends: []
 
-    # OpenAI互換API例（環境変数 OPENAI_API_KEY からAPIキー取得）
-    openai_gpt4:
-      type: "openai_compatible"
-      url: "https://api.openai.com"
-      api_key_env: "OPENAI_API_KEY"
-      timeout: 60.0
-      connect_timeout: 5.0
-      models:
-        # 従来形式もサポート（後方互換: capabilities=["general"]扱い）
-        - "gpt-4"
-        - "gpt-4-turbo"
-      model_mapping:
-        "gpt-4": "gpt-4-0125-preview"
-        "gpt-4-turbo": "gpt-4-turbo-preview"
+    # openai_gpt4 backend removed 2026-08-11.
+    # OPENAI_API_KEY は設定されておらず、常に 401 = 常に unhealthy だった。
+    # その上で GET /health は毎回 api.openai.com を叩いており、遠端が不定期に
+    # 停止して 20〜40s ブロックする (素の curl でも再現、time_connect /
+    # time_appconnect は常に高速で time_starttransfer だけが伸びる)。
+    # heavy / light の fallback 先でもあったが、キーが無いのでフォールバック
+    # しても 401 になるだけだった。再導入するならキー設定が先。
 
     # Google Gemini API (native generateContent, naysayer 用)
     gemini:
@@ -100,6 +91,12 @@ routing:
       # は thinking が output 枠を消費するため、本文確保用に余裕を持たせる。
       # リクエストが max_tokens を明示した場合はそちらが優先される。
       default_max_tokens: 16000
+      # health probe を外す (2026-08-11)。この backend の health_check は本物の
+      # generateContent を投げる ∴ /health の 1 回ごとに課金対象の推論が 1 回走り、
+      # Google 側のレイテンシ (実測 中央値 1.2s) をそのまま /health が被る。
+      # 異常が出ても運用側に打てる手が無いため、確認しない方を選ぶ。
+      # backend 自体は有効 — naysayer はこれで動いている。
+      health_check: false
       models:
         - name: "gemini-3.1-pro-preview"
           capabilities: ["code", "reasoning", "analysis", "general"]
@@ -137,6 +134,12 @@ routing:
       api_key_env: "ANTHROPIC_API_KEY"
       timeout: 120.0
       connect_timeout: 5.0
+      # health probe を外す (2026-08-11)。gemini と同じく本物の /v1/messages を
+      # 投げる。加えてこの backend の health_check は「5xx でなければ到達可能」と
+      # 判定するため、ANTHROPIC_API_KEY 未設定でも 401 を healthy と報告していた
+      # = リクエストを処理できない backend が healthy に見えていた。
+      # 誤った緑を出し続けるくらいなら、確認していないと言う方がよい。
+      health_check: false
       models:
         - name: "claude-sonnet-4-20250514"
           capabilities: ["code", "reasoning", "analysis", "general"]

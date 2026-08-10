@@ -324,6 +324,69 @@ class TestHealth(TestAPI):
         assert data["backends"]["backend1"] == "healthy"
         assert data["backends"]["backend2"] == "unhealthy"
 
+    def test_skipped_backend_is_reported_but_not_counted(
+        self, client: TestClient, mock_backend_router: MagicMock
+    ) -> None:
+        """`health_check: false` means "not asked", not "down" and not "absent".
+
+        Dropping the name would read as "not configured" for a backend that is
+        still serving traffic; counting it as unhealthy would make the whole
+        gateway look degraded because someone chose not to pay for a probe.
+        """
+        mock_backend_router.health_check.return_value = {
+            "vllm": True,
+            "gemini": None,
+        }
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["backends"]["gemini"] == "skipped"
+        assert data["status"] == "healthy"
+
+    def test_status_is_unknown_when_nothing_was_probed(
+        self, client: TestClient, mock_backend_router: MagicMock
+    ) -> None:
+        """`all([])` is True, so the empty case has to be handled first --
+        otherwise opting every backend out would report a green nobody checked."""
+        mock_backend_router.health_check.return_value = {"a": None, "b": None}
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "unknown"
+
+    def test_a_skipped_default_backend_does_not_borrow_healthy(
+        self, client: TestClient, mock_backend_router: MagicMock
+    ) -> None:
+        """The legacy `vllm_status` field defaults to True when the key is
+        absent; None must not ride that path into "healthy"."""
+        mock_backend_router.health_check.return_value = {"default": None}
+
+        response = client.get("/health")
+
+        assert response.json()["vllm_status"] == "unknown"
+
+    def test_a_skipped_backend_is_not_recorded_as_a_metric(
+        self, client: TestClient, mock_backend_router: MagicMock
+    ) -> None:
+        """set_backend_health takes a bool; None is not a verdict to record.
+
+        The shared client fixture overrides the collector to None, so this one
+        supplies its own — the assertion is about what reaches the collector.
+        """
+        mock_backend_router.health_check.return_value = {"a": True, "b": None}
+        metrics = MagicMock()
+        client.app.dependency_overrides[get_metrics_collector] = lambda: metrics
+
+        client.get("/health")
+
+        recorded = {
+            call.args[0] for call in metrics.set_backend_health.call_args_list
+        }
+        assert recorded == {"a"}
+
 
 class TestStats(TestAPI):
     """Tests for /stats endpoint."""

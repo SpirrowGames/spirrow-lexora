@@ -116,6 +116,44 @@ class VLLMBackend:
     async def health_check() -> bool
 ```
 
+## ヘルスチェック (`GET /health`)
+
+`BackendRouter.health_check()` が各 backend を**並行に**叩き、`routes.py` が集計する。
+
+**backend ごとに `health_check: false` で probe を外せる。** 外した backend は
+`"skipped"` として**表示され続ける** — 名前ごと落とすと「設定されていない」と読めるが、
+skipped な backend は普通にトラフィックを捌いているので別物。集計 (`status`) からは除外する。
+
+| 値 | 意味 |
+|---|---|
+| `healthy` / `unhealthy` | 訊いて答えが返った |
+| `skipped` | `health_check: false`。**訊いていない**。down でも未設定でもない |
+| `status: unknown` | probe 対象が 1 つも無かった。`all([])` は True なので空を先に弾く必要がある |
+
+**なぜ外すか (2026-08-11 の調査)** — probe の中身は backend 型ごとに全く違う:
+
+- `vllm` — ローカル `GET /health` (0.00s)
+- `claude_code` — `claude --version` のサブプロセス起動 (0.05s)
+- `anthropic` — **本物の `/v1/messages` 推論リクエスト** (0.20s)
+- `gemini` — **本物の `generateContent` 推論リクエスト** (1.2s)
+- `openai_compatible` — `GET /v1/models`
+
+∴ `/health` の 1 回ごとにリモート API の課金対象呼び出しが走り、そのプロバイダのレイテンシを
+そのまま被る。gemini / claude は `health_check: false` にした — 異常が出ても運用側に打てる手が
+無いため。**backend 自体は有効** (naysayer は gemini で動いている)。
+
+`anthropic` の probe には別の問題もある: 「5xx でなければ到達可能」と判定するため、
+`ANTHROPIC_API_KEY` 未設定でも 401 を **healthy と報告していた** = リクエストを処理できない
+backend が緑に見えていた。
+
+**`openai_gpt4` backend は 2026-08-11 に削除した。** `OPENAI_API_KEY` が無く常に 401 =
+常に unhealthy でありながら、遠端 (`api.openai.com`) が不定期に停止して `/health` を
+**20〜40s ブロック**していた (素の curl でも再現。`time_connect` / `time_appconnect` は常に高速で
+`time_starttransfer` だけが伸びる ∴ こちら側の問題ではない)。`heavy` / `light` の fallback 先でも
+あったが、キーが無いのでフォールバックしても 401 になるだけだった。再導入するならキー設定が先。
+
+結果: `/health` は 2.5s (最大 40s) → **0.056s、スパイクなし** (20 回連続で計測)。
+
 ## 設定
 
 `config/lexora_config.yaml` を参照。環境変数でオーバーライド可能。

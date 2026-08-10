@@ -726,31 +726,47 @@ async def health(
     """
     backend_health = await backend_router.health_check()
 
-    # Record backend health in metrics
+    # `None` == skipped (`health_check: false`). It is not a health verdict,
+    # so it is neither recorded as a metric nor counted toward `status` --
+    # folding it into either would turn "we did not ask" into an answer.
+    probed = {
+        name: healthy
+        for name, healthy in backend_health.items()
+        if healthy is not None
+    }
+
     if metrics_collector:
-        for backend_name, is_healthy in backend_health.items():
+        for backend_name, is_healthy in probed.items():
             metrics_collector.set_backend_health(backend_name, is_healthy)
 
-    # Convert bool to status strings
     backends_status = {
-        name: "healthy" if healthy else "unhealthy"
+        name: "skipped"
+        if healthy is None
+        else ("healthy" if healthy else "unhealthy")
         for name, healthy in backend_health.items()
     }
 
-    # Determine overall status
-    all_healthy = all(backend_health.values())
-    any_healthy = any(backend_health.values())
-
-    if all_healthy:
+    # Determine overall status over the probed subset. `all([])` is True, so
+    # the empty case is handled first: with nothing probed there is no
+    # evidence for "healthy", and claiming it would be the same mistake as
+    # counting a skip as a pass.
+    if not probed:
+        overall_status = "unknown"
+    elif all(probed.values()):
         overall_status = "healthy"
-    elif any_healthy:
+    elif any(probed.values()):
         overall_status = "degraded"
     else:
         overall_status = "unhealthy"
 
-    # Legacy vllm_status for backward compatibility
+    # Legacy vllm_status for backward compatibility. A skipped or absent
+    # default backend reports "unknown" rather than borrowing "healthy".
     default_backend_healthy = backend_health.get("default", True)
-    vllm_status = "healthy" if default_backend_healthy else "unhealthy"
+    vllm_status = (
+        "unknown"
+        if default_backend_healthy is None
+        else ("healthy" if default_backend_healthy else "unhealthy")
+    )
 
     return HealthResponse(
         status=overall_status,

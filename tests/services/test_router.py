@@ -447,3 +447,91 @@ class TestBackendRouterTierRouting:
         )
 
         assert router.get_backend_name_for_model("light") == "backend2"
+
+
+class TestBackendRouterHealthCheckOptOut:
+    """`health_check: false` — a backend that serves traffic but is not probed.
+
+    Added 2026-08-11. Two of the configured backends (gemini, anthropic) probe
+    by sending a real inference request to a remote API, so every GET /health
+    billed a call and inherited that provider's latency; a third
+    (openai_compatible, unauthenticated) intermittently stalled the endpoint
+    for 20-40s. Skipping has to stay distinguishable from "unhealthy" and from
+    "not configured", which is what these tests pin.
+    """
+
+    @staticmethod
+    def _router(**flags: bool) -> BackendRouter:
+        backends = {
+            name: BackendSettings(
+                type="vllm",
+                url="http://localhost:8000",
+                models=[f"model-{name}"],
+                health_check=checked,
+            )
+            for name, checked in flags.items()
+        }
+        return BackendRouter(
+            routing_settings=RoutingSettings(enabled=True, backends=backends),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_skipped_backend_reports_none_not_false(self) -> None:
+        """False would mean "we asked and it is down"."""
+        router = self._router(probed=True, quiet=False)
+        router.backends["probed"].health_check = AsyncMock(return_value=True)
+        router.backends["quiet"].health_check = AsyncMock(return_value=True)
+
+        health = await router.health_check()
+
+        assert health == {"probed": True, "quiet": None}
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_backend_is_never_probed(self) -> None:
+        """The whole point is not paying for the call."""
+        router = self._router(quiet=False)
+        probe = AsyncMock(return_value=True)
+        router.backends["quiet"].health_check = probe
+
+        await router.health_check()
+
+        probe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_backends_default_to_being_checked(self) -> None:
+        """Opting out must be explicit; silence means "probe me"."""
+        router = self._router(a=True)
+        router.backends["a"].health_check = AsyncMock(return_value=True)
+
+        assert await router.health_check() == {"a": True}
+
+    @pytest.mark.asyncio
+    async def test_a_probe_that_raises_is_not_confused_with_a_skip(self) -> None:
+        """gather(return_exceptions=True) must not leak an exception object
+        into a field typed as a health verdict."""
+        router = self._router(boom=True)
+        router.backends["boom"].health_check = AsyncMock(
+            side_effect=RuntimeError("probe blew up")
+        )
+
+        assert await router.health_check() == {"boom": False}
+
+    @pytest.mark.asyncio
+    async def test_probes_run_concurrently(self) -> None:
+        """Serially, one slow remote set the latency of the whole endpoint."""
+        import asyncio
+
+        async def slow() -> bool:
+            await asyncio.sleep(0.15)
+            return True
+
+        router = self._router(a=True, b=True, c=True)
+        for name in ("a", "b", "c"):
+            router.backends[name].health_check = slow
+
+        start = asyncio.get_event_loop().time()
+        await router.health_check()
+        elapsed = asyncio.get_event_loop().time() - start
+
+        assert elapsed < 0.3, f"probes look serial: {elapsed:.2f}s for 3x0.15s"

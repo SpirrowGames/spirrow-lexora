@@ -109,6 +109,20 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    health_check: bool = Field(
+        default=True,
+        description=(
+            "Include this backend in GET /health. Turn it off for backends "
+            "whose probe costs more than the answer is worth: the gemini and "
+            "anthropic probes each send a real inference request to a remote "
+            "API, so every poll bills a call and inherits that provider's "
+            "latency, and nothing here can act on the result anyway. A skipped "
+            "backend is reported as 'skipped' rather than omitted -- it still "
+            "serves traffic, and dropping the name would read as 'not "
+            "configured'. Skipping does NOT disable the backend."
+        ),
+    )
+
     def get_model_names(self) -> list[str]:
         """Get list of model names for backward compatibility."""
         return [m.name for m in self.models]
