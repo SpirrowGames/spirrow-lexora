@@ -40,7 +40,7 @@ Thumbs.db
 
 # Local scripts
 start.sh
-data/
+data
 
 # Local snapshots written by scripts/backup.sh
-backups/
+backups
