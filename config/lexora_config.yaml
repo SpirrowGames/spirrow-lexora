@@ -24,8 +24,8 @@ routing:
       backend: "heavy"
       description: "標準タスク (with thinking)"
     heavy:
-      backend: "claude"
-      description: "複雑なタスク (Claude API)"
+      backend: "deep"
+      description: "複雑なタスク (Qwen3.8-27B, reasoning_effort=xhigh)"
     # role ルート: naysayer は別訓練分布 (Gemini) で最大独立性を取る
     # (ADR-2026-05-31-15 D-2「2 協調 1 独立」)。呼び出し側は model: "naysayer"
     naysayer:
@@ -66,6 +66,30 @@ routing:
         - name: "Qwen3.8-27B"
           capabilities: ["summarization", "translation", "simple_qa", "general"]
           description: "軽量タスク向け (non-thinking mode)"
+      fallback_backends: []
+
+    # heavy ティア用。2026-08-18 に Anthropic API から移した。
+    # 背景: ANTHROPIC_API_KEY 未設定で heavy は 502 のまま死んでいた。CPU + メインメモリ
+    # で別モデルを立てる案を検討したが、実測 44.6GB/s の帯域では
+    # 収まる中で最良の Ornith-1.0-397B (SWE-bench Pro 62.2) でも約6〜7 tok/s、
+    # しかもスコアは GPU の Qwen3.8-27B (61.7) とほぼ同点で上積みが無かった。
+    # ∴ 同じ vLLM を向き、段差は reasoning_effort だけで付ける。
+    # backend "heavy" (= medium ティア) との違いは xhigh のみ。モデルもURLも同じ。
+    # ("heavy" という backend 名が medium ティアを指しているのは以前からの経緯)
+    deep:
+      type: "vllm"
+      url: "http://localhost:8000"
+      # xhigh は思考が長くなるので medium (300s) より緩める
+      timeout: 600.0
+      connect_timeout: 10.0
+      thinking_mode: "think"
+      reasoning_effort: "xhigh"
+      models:
+        - name: "Qwen3.8-27B"
+          capabilities: ["code", "reasoning", "analysis", "general"]
+          description: "複雑なタスク向け (thinking mode, reasoning_effort=xhigh)"
+      # fallback は付けない。同じ vLLM を見ている medium が死ぬときは deep も死ぬし、
+      # 鍵の無い claude に落としても 502 が別の 502 になるだけで診断を濁す。
       fallback_backends: []
 
     # openai_gpt4 backend removed 2026-08-11.
