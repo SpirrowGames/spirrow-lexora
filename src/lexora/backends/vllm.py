@@ -35,6 +35,7 @@ class VLLMBackend(Backend):
         connect_timeout: float = 5.0,
         name: str | None = None,
         thinking_mode: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Initialize the vLLM backend.
 
@@ -44,10 +45,13 @@ class VLLMBackend(Backend):
             connect_timeout: Connection timeout in seconds.
             name: Optional backend name for error messages.
             thinking_mode: Thinking mode directive ('think' or 'no_think').
+            reasoning_effort: Thinking depth when thinking_mode is 'think'
+                ('low', 'medium' or 'xhigh'). Ignored for 'no_think'.
         """
         self.base_url = base_url.rstrip("/")
         self.name = name
         self._thinking_mode = thinking_mode
+        self._reasoning_effort = reasoning_effort
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout, connect=connect_timeout),
@@ -72,32 +76,48 @@ class VLLMBackend(Backend):
         except ValueError:
             return None
 
-    def _inject_thinking_mode(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Inject thinking mode directive into chat messages.
+    def _apply_thinking_controls(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Apply the thinking-mode controls via chat template kwargs.
 
-        Prepends /think or /no_think to the first system message,
-        or adds a new system message if none exists.
+        Qwen3 (2025) 世代は system メッセージ先頭の ``/no_think`` 文字列で
+        thinking を切る方式だったが、Qwen3.5 以降は thinking が既定 ON になり、
+        制御は chat template の ``enable_thinking`` / ``reasoning_effort``
+        kwargs に移った。文字列 directive は黙って無視される (= light ティアが
+        気付かないまま thinking で走る) ため、kwargs 方式に統一する。
+        ``enable_thinking`` は Qwen3-32B の chat template も解釈するので、
+        旧モデルへ切り戻しても同じ経路で効く。
 
         Args:
             request: OpenAI-compatible chat completion request.
 
         Returns:
-            Modified request with thinking directive injected.
+            Modified request with chat_template_kwargs populated.
         """
         if not self._thinking_mode:
             return request
 
-        directive = f"/{self._thinking_mode}"
-        request = {**request, "messages": list(request.get("messages", []))}
+        kwargs = dict(request.get("chat_template_kwargs") or {})
 
-        messages = request["messages"]
-        if messages and messages[0].get("role") == "system":
-            messages[0] = {
-                **messages[0],
-                "content": f"{directive}\n{messages[0].get('content', '')}",
-            }
+        if self._thinking_mode == "no_think":
+            kwargs.setdefault("enable_thinking", False)
         else:
-            messages.insert(0, {"role": "system", "content": directive})
+            kwargs.setdefault("enable_thinking", True)
+            if self._reasoning_effort:
+                kwargs.setdefault("reasoning_effort", self._reasoning_effort)
+
+        request = {**request, "chat_template_kwargs": kwargs}
+
+        # vLLM のトップレベル reasoning_effort は Literal["low","medium","high"]
+        # だが、Qwen3.5+ の chat template が受け付けるのは low/medium/xhigh で、
+        # "high" は raise_exception → 400 になる。トップレベル値は
+        # chat_template_kwargs より優先されるので、ここで吸収しておく。
+        caller_effort = request.get("reasoning_effort")
+        if caller_effort == "high":
+            request.pop("reasoning_effort")
+            kwargs["reasoning_effort"] = "xhigh"
+            logger.debug(
+                "vllm_reasoning_effort_remapped", requested="high", applied="xhigh"
+            )
 
         return request
 
@@ -113,7 +133,7 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        return await self._post("/v1/chat/completions", self._inject_thinking_mode(request))
+        return await self._post("/v1/chat/completions", self._apply_thinking_controls(request))
 
     async def completions(self, request: dict[str, Any]) -> dict[str, Any]:
         """Send completion request to vLLM.
@@ -184,7 +204,7 @@ class VLLMBackend(Backend):
         Raises:
             BackendError: If the request fails.
         """
-        async for chunk in self._post_stream("/v1/chat/completions", self._inject_thinking_mode(request)):
+        async for chunk in self._post_stream("/v1/chat/completions", self._apply_thinking_controls(request)):
             yield chunk
 
     async def completions_stream(

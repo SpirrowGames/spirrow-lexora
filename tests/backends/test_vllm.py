@@ -395,3 +395,80 @@ class TestCompletionsStream:
                 received_chunks.append(chunk)
 
             assert len(received_chunks) == 3
+
+
+class TestThinkingControls:
+    """Tests for _apply_thinking_controls (chat_template_kwargs 方式)."""
+
+    def test_no_thinking_mode_leaves_request_untouched(self) -> None:
+        """thinking_mode 未設定なら request をそのまま返す。"""
+        backend = VLLMBackend()
+        request = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        assert backend._apply_thinking_controls(request) is request
+
+    def test_no_think_disables_thinking(self) -> None:
+        """no_think は enable_thinking=False を kwargs に載せる。"""
+        backend = VLLMBackend(thinking_mode="no_think")
+        result = backend._apply_thinking_controls({"messages": []})
+        assert result["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_no_think_does_not_touch_messages(self) -> None:
+        """旧方式の /no_think 文字列注入が残っていないこと。"""
+        backend = VLLMBackend(thinking_mode="no_think")
+        messages = [{"role": "system", "content": "you are helpful"}]
+        result = backend._apply_thinking_controls({"messages": messages})
+        assert result["messages"] == messages
+        assert "/no_think" not in str(result["messages"])
+
+    def test_think_sets_effort(self) -> None:
+        """think + reasoning_effort は両方 kwargs に載る。"""
+        backend = VLLMBackend(thinking_mode="think", reasoning_effort="medium")
+        result = backend._apply_thinking_controls({"messages": []})
+        assert result["chat_template_kwargs"] == {
+            "enable_thinking": True,
+            "reasoning_effort": "medium",
+        }
+
+    def test_think_without_effort_omits_effort(self) -> None:
+        """reasoning_effort 未設定ならモデル既定に委ねる。"""
+        backend = VLLMBackend(thinking_mode="think")
+        result = backend._apply_thinking_controls({"messages": []})
+        assert result["chat_template_kwargs"] == {"enable_thinking": True}
+
+    def test_no_think_ignores_effort(self) -> None:
+        """no_think のとき reasoning_effort は載せない。"""
+        backend = VLLMBackend(thinking_mode="no_think", reasoning_effort="xhigh")
+        result = backend._apply_thinking_controls({"messages": []})
+        assert result["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_caller_kwargs_win(self) -> None:
+        """呼び出し側が明示した kwargs を上書きしない。"""
+        backend = VLLMBackend(thinking_mode="no_think")
+        result = backend._apply_thinking_controls(
+            {"messages": [], "chat_template_kwargs": {"enable_thinking": True}}
+        )
+        assert result["chat_template_kwargs"]["enable_thinking"] is True
+
+    def test_caller_high_effort_remapped_to_xhigh(self) -> None:
+        """vLLM の Literal 'high' は Qwen3.5+ template で raise するので xhigh に寄せる。"""
+        backend = VLLMBackend(thinking_mode="think")
+        result = backend._apply_thinking_controls(
+            {"messages": [], "reasoning_effort": "high"}
+        )
+        assert "reasoning_effort" not in result
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "xhigh"
+
+    def test_caller_low_effort_preserved(self) -> None:
+        """low/medium は template が解釈できるのでトップレベルのまま通す。"""
+        backend = VLLMBackend(thinking_mode="think")
+        result = backend._apply_thinking_controls(
+            {"messages": [], "reasoning_effort": "low"}
+        )
+        assert result["reasoning_effort"] == "low"
+
+    def test_original_request_not_mutated(self) -> None:
+        """入力 dict を破壊しないこと。"""
+        backend = VLLMBackend(thinking_mode="no_think")
+        request = {"messages": []}
+        backend._apply_thinking_controls(request)
+        assert "chat_template_kwargs" not in request

@@ -78,7 +78,20 @@ class BackendSettings(BaseSettings):
     )
     thinking_mode: Literal["think", "no_think"] | None = Field(
         default=None,
-        description="Thinking mode to inject for Qwen3 models: 'think' or 'no_think'",
+        description=(
+            "Thinking mode for Qwen models: 'think' or 'no_think'. vllm backend "
+            "only. chat template の enable_thinking kwarg として送る "
+            "(Qwen3 / Qwen3.5+ どちらの template も解釈する)"
+        ),
+    )
+    reasoning_effort: Literal["low", "medium", "xhigh"] | None = Field(
+        default=None,
+        description=(
+            "Thinking depth when thinking_mode='think'. vllm backend only. "
+            "Qwen3.5+ の chat template が受け付けるのは low / medium / xhigh "
+            "(既定 xhigh)。Qwen3 (2025) 世代の template は解釈せず無視するだけ "
+            "なので、旧モデルへ切り戻しても無害。None は model 側の既定に従う"
+        ),
     )
     default_max_tokens: int | None = Field(
         default=None,

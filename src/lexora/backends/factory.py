@@ -65,6 +65,7 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             connect_timeout=settings.connect_timeout,
             name=name,
             thinking_mode=settings.thinking_mode,
+            reasoning_effort=settings.reasoning_effort,
         )
     elif settings.type == "openai_compatible":
         api_key = resolve_api_key(settings)

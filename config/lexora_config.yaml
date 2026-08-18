@@ -4,11 +4,15 @@ server:
   host: "0.0.0.0"
   port: 8110
 
-# 統一バックエンド: Qwen3-32B (thinking/non-thinking切り替え)
+# 統一バックエンド: Qwen3.8-27B (thinking/non-thinking切り替え)
+# 2026-08-18 に Qwen3-32B (2025-04公開) から載せ替え。thinking の制御は
+# system メッセージへの /no_think 注入から chat template kwargs
+# (enable_thinking / reasoning_effort) に変更済み。vLLM 側は旧名 Qwen3-32B も
+# 別名で serve しているので、モデル名直指定の呼び出し元は落ちない。
 routing:
   enabled: true
   default_backend: "heavy"
-  default_model_for_unknown_task: "Qwen3-32B"
+  default_model_for_unknown_task: "Qwen3.8-27B"
 
   # ティアベースルーティング
   # 呼び出し側は model: "light" 等のティア名を指定するだけでよい
@@ -32,7 +36,7 @@ routing:
   # タスク分類設定
   classifier:
     enabled: true
-    model: "Qwen3-32B"
+    model: "Qwen3.8-27B"
     backend: "light"
 
   backends:
@@ -42,8 +46,11 @@ routing:
       timeout: 300.0
       connect_timeout: 10.0
       thinking_mode: "think"
+      # Qwen3.8 の chat template 既定は xhigh (最も長く考える)。medium ティアの
+      # 「標準タスク」用途には過剰なので medium に落としている。low / xhigh も可。
+      reasoning_effort: "medium"
       models:
-        - name: "Qwen3-32B"
+        - name: "Qwen3.8-27B"
           capabilities: ["code", "reasoning", "analysis"]
           description: "複雑なタスク向け (thinking mode)"
       fallback_backends:
@@ -56,7 +63,7 @@ routing:
       connect_timeout: 10.0
       thinking_mode: "no_think"
       models:
-        - name: "Qwen3-32B"
+        - name: "Qwen3.8-27B"
           capabilities: ["summarization", "translation", "simple_qa", "general"]
           description: "軽量タスク向け (non-thinking mode)"
       fallback_backends: []
