@@ -194,6 +194,15 @@ retry:
   respect_retry_after: true
   max_retry_after: 60.0
 
+# fallback: このセクションと各 backend の fallback_backends は
+# `FallbackService` (src/lexora/services/fallback.py) に読ませる意図で
+# 書かれているが、2026-08-31 時点でこのサービスは main.py から構築されて
+# おらず、routes.py はどこからも呼んでいない。∴ 実行時にはフォールバック
+# は一度も走らない — `heavy: fallback_backends: ["claude"]` は「効いている
+# opt-in」ではなく、機構が復活した時のための宣言。逆に空リスト
+# (deep / gemini / claude) も「効いている opt-out」ではなく、機構が復活
+# した時に落ちないという宣言。frontier を追加するときも同じ規律で書く。
+# 配線するか削除するかは follow-up 予定 (owner: Bohr)。
 fallback:
   enabled: true
   on_rate_limit: true

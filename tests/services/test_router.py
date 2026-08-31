@@ -535,3 +535,63 @@ class TestBackendRouterHealthCheckOptOut:
         elapsed = asyncio.get_event_loop().time() - start
 
         assert elapsed < 0.3, f"probes look serial: {elapsed:.2f}s for 3x0.15s"
+
+
+class TestBackendRouterIsTier:
+    """T-frontier-tier D-6b: is_tier() disambiguates aliases from model IDs."""
+
+    def _router_with_tiers(self) -> BackendRouter:
+        return BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(url="http://localhost:1", models=["m1"]),
+                    "b2": BackendSettings(url="http://localhost:2", models=["m2"]),
+                },
+                tiers={
+                    "frontier": TierSettings(backend="b2", model="m2"),
+                },
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+
+    def test_is_tier_true_for_registered(self) -> None:
+        assert self._router_with_tiers().is_tier("frontier") is True
+
+    def test_is_tier_false_for_concrete_model(self) -> None:
+        assert self._router_with_tiers().is_tier("m1") is False
+
+    def test_is_tier_false_for_unknown(self) -> None:
+        assert self._router_with_tiers().is_tier("no-such-thing") is False
+
+
+class TestBackendRouterListModelsTierEntries:
+    """T-frontier-tier D-5: /v1/models exposes tier aliases with resolved model."""
+
+    @pytest.mark.asyncio
+    async def test_tier_alias_appears_with_resolved_model(self) -> None:
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(url="http://localhost:1", models=["real-model"]),
+                },
+                tiers={
+                    "frontier": TierSettings(backend="b1", model="real-model"),
+                },
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        router.backends["b1"].list_models = AsyncMock(
+            return_value={"object": "list", "data": [{"id": "real-model", "object": "model"}]}
+        )
+
+        listing = await router.list_all_models()
+        tier_entries = [m for m in listing["data"] if m.get("type") == "tier"]
+        assert len(tier_entries) == 1
+        entry = tier_entries[0]
+        assert entry["id"] == "frontier"
+        assert entry["resolved_model"] == "real-model"
+        assert entry["backend"] == "b1"

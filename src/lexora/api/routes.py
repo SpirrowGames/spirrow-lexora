@@ -313,16 +313,19 @@ async def chat_completions(
                 retries=retries,
             )
 
-        # Record cost
+        # Record cost. The tier alias (if any) goes to its own column; the
+        # `model` column carries the resolved concrete model ID so pricing
+        # tracks the actual upstream, not the caller's alias.
         if cost_tracker and (tokens_input > 0 or tokens_output > 0):
             cost_tracker.record(
-                model=request.model,
+                model=resolved_model,
                 endpoint=endpoint,
                 tokens_input=tokens_input,
                 tokens_output=tokens_output,
                 backend=backend_router.get_backend_name_for_model(request.model),
                 user_id=request.user,
                 duration=duration,
+                tier=request.model if backend_router.is_tier(request.model) else None,
             )
 
         logger.info(
@@ -1421,13 +1424,14 @@ async def messages(
 
         if cost_tracker and (tokens_input > 0 or tokens_output > 0):
             cost_tracker.record(
-                model=request.model,
+                model=resolved_model,
                 endpoint=endpoint,
                 tokens_input=tokens_input,
                 tokens_output=tokens_output,
                 backend=backend_router.get_backend_name_for_model(request.model),
                 user_id=user_id,
                 duration=duration,
+                tier=request.model if backend_router.is_tier(request.model) else None,
             )
 
         logger.info(
@@ -1492,22 +1496,31 @@ async def get_costs(
     model: str | None = None,
     user_id: str | None = None,
     backend: str | None = None,
+    tier: str | None = None,
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> dict[str, Any]:
     """Get aggregated API costs.
 
     Args:
         period: "today", "month", "all", or ISO date "YYYY-MM-DD".
-        model: Filter by model name.
+        model: Filter by resolved model name (concrete upstream ID).
         user_id: Filter by user.
         backend: Filter by backend name.
+        tier: Filter by tier alias (``frontier``, ``naysayer``, ...). Since
+            2026-08-31 the ledger stores tier aliases in a dedicated
+            column, so ``?model=frontier`` no longer matches; use
+            ``?tier=frontier`` instead. Requests sent as concrete model
+            IDs are never matched by a tier filter.
 
     Returns:
-        Aggregated cost data with summary, per-model breakdown, and daily totals.
+        Aggregated cost data with summary, per-model breakdown, per-tier
+        breakdown, daily totals, and any models seen without a known price.
     """
     if cost_tracker is None:
         raise HTTPException(status_code=503, detail="Cost tracking not available")
-    return cost_tracker.get_costs(period=period, model=model, user_id=user_id, backend=backend)
+    return cost_tracker.get_costs(
+        period=period, model=model, user_id=user_id, backend=backend, tier=tier
+    )
 
 
 @router.get("/stats/costs/recent")

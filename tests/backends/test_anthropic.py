@@ -114,6 +114,40 @@ class TestRequestConversion:
         result = backend._to_anthropic_request(request)
         assert result["max_tokens"] == DEFAULT_MAX_TOKENS
 
+    def test_default_max_tokens_configurable(self):
+        """T-frontier-tier D-7: BackendSettings.default_max_tokens is honoured.
+
+        A frontier tier that reserves a larger output budget (e.g. reasoning
+        models where thinking eats into the completion budget) needs to raise
+        this ceiling without touching the module constant.
+        """
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 8000
+
+    def test_default_max_tokens_none_falls_back(self):
+        backend = AnthropicBackend(default_max_tokens=None)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == DEFAULT_MAX_TOKENS
+
+    def test_explicit_max_tokens_wins_over_default(self):
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100,
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 100
+
     def test_optional_params_passed(self, backend):
         request = {
             "model": "claude-sonnet-4-20250514",
@@ -233,6 +267,40 @@ class TestResponseConversion:
         }
         result = backend._to_openai_response(anthropic_resp, "claude-sonnet-4-20250514")
         assert result["choices"][0]["message"]["content"] == ""
+
+    def test_refusal_stop_reason_maps_to_content_filter(self, backend):
+        """T-frontier-tier D-4-4: safety classifier refusal is visible.
+
+        Previously the `refusal` stop_reason (emitted by the Anthropic
+        safety classifier on Fable/Opus 5-class models) fell through the
+        map to `stop`, making a decline indistinguishable from an ordinary
+        completion. The frontier tier spec requires the classifier's signal
+        to survive translation.
+        """
+        anthropic_resp = {
+            "id": "msg_refuse",
+            "content": [{"type": "text", "text": "I can't help with that."}],
+            "stop_reason": "refusal",
+            "usage": {"input_tokens": 10, "output_tokens": 6},
+        }
+        result = backend._to_openai_response(anthropic_resp, "claude-sonnet-4-20250514")
+        assert result["choices"][0]["finish_reason"] == "content_filter"
+
+    def test_unknown_stop_reason_still_produces_valid_shape(self, backend, caplog):
+        """Unmapped stop_reason coerces to `stop` and logs the raw value.
+
+        The OpenAI response shape stays valid, but the raw upstream signal
+        is recorded so a future new refusal / safety code is not silently
+        rounded off.
+        """
+        anthropic_resp = {
+            "id": "msg_novel",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "some_future_reason",
+            "usage": {"input_tokens": 5, "output_tokens": 3},
+        }
+        result = backend._to_openai_response(anthropic_resp, "claude-sonnet-4-20250514")
+        assert result["choices"][0]["finish_reason"] == "stop"
 
 
 class TestErrorHandling:

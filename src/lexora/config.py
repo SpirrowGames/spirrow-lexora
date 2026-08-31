@@ -97,7 +97,7 @@ class BackendSettings(BaseSettings):
         default=None,
         description=(
             "Default max output tokens applied when a request omits max_tokens. "
-            "Currently consumed by the gemini backend (reasoning models spend "
+            "Consumed by the gemini and anthropic backends (reasoning models spend "
             "output budget on thinking, so a generous default avoids empty "
             "responses). None falls back to the backend's built-in default."
         ),

@@ -181,6 +181,24 @@ class BackendRouter:
         """
         return self._tier_to_model.get(model, model)
 
+    def is_tier(self, name: str) -> bool:
+        """Return True if ``name`` is a registered tier alias.
+
+        Kept separate from ``resolve_model`` because tier detection cannot be
+        derived from ``resolved != requested``: a tier can legitimately share
+        its concrete model name (e.g. a tier deliberately named after the
+        model it fronts), and the callsite must not confuse "tier alias" with
+        "coincidentally-equal name". Consumed by the cost tracker to record
+        the tier alongside — and distinct from — the resolved model ID.
+
+        Args:
+            name: Candidate name.
+
+        Returns:
+            True iff ``name`` is a registered tier.
+        """
+        return name in self._tier_to_backend
+
     def get_fallback_backends(self, backend_name: str) -> list[Backend]:
         """Get fallback backends for a given backend.
 
@@ -295,7 +313,14 @@ class BackendRouter:
         return health
 
     async def list_all_models(self) -> dict[str, Any]:
-        """List models from all backends.
+        """List models and tier aliases from all backends.
+
+        Every configured tier is emitted as its own entry so callers reading
+        ``/v1/models`` can see the tier names the router actually accepts
+        (``naysayer``, ``heavy``, ``frontier``, ...) alongside the concrete
+        model IDs that back them. Tier entries carry ``resolved_model`` so
+        an env override (e.g. ``LEXORA_FRONTIER_MODEL``) is observable here
+        rather than needing a separate probe.
 
         Returns:
             Combined models list in OpenAI format.
@@ -315,6 +340,21 @@ class BackendRouter:
                     backend=name,
                     error=str(e),
                 )
+
+        # Tier aliases. Emitted after backend models so a listing consumer
+        # reading top-down sees concrete IDs first, then the tier names that
+        # route to them. `object` is left as "model" for OpenAI-client
+        # compatibility, with `type: "tier"` as an additive marker.
+        for tier_name, backend_name in self._tier_to_backend.items():
+            all_models.append(
+                {
+                    "id": tier_name,
+                    "object": "model",
+                    "type": "tier",
+                    "backend": backend_name,
+                    "resolved_model": self._tier_to_model.get(tier_name),
+                }
+            )
 
         return {
             "object": "list",
