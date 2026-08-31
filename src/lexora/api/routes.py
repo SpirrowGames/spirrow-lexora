@@ -55,6 +55,32 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
+def _anthropic_passthrough_body(e: BackendUpstreamError) -> dict[str, Any]:
+    """Shape a `BackendUpstreamError` body for /v1/messages passthrough.
+
+    D-4′: an anthropic-type backend's error body is already the
+    ``{"type": "error", "error": {...}}`` shape the anthropic SDK parses
+    natively, so it can be forwarded verbatim. Anything else (a future
+    non-anthropic passthrough backend on /v1/messages, or a plaintext
+    error page) is wrapped so the endpoint's response envelope stays
+    consistent — the upstream body is preserved inside ``error.upstream``
+    rather than dropped, so a shape mismatch never becomes data loss.
+    """
+    body = e.body
+    if isinstance(body, dict) and body.get("type") == "error" and "error" in body:
+        return body
+    envelope: dict[str, Any] = {
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": str(e),
+        },
+    }
+    if body is not None:
+        envelope["error"]["upstream"] = body
+    return envelope
+
+
 def get_backend(request: Request) -> VLLMBackend:
     """Get default vLLM backend from app state."""
     return request.app.state.backend
@@ -485,6 +511,36 @@ async def completions(
 
     # Handle streaming request
     if request.stream:
+        # D-4′: mirror the /v1/chat/completions streaming pre-flight for
+        # passthrough backends so a refusal / auth failure yields the real
+        # HTTP status instead of a 200 SSE that closes with an error frame.
+        first_chunk: bytes | None = None
+        byte_iter = None
+        passthrough = getattr(backend, "error_passthrough", False)
+        if passthrough:
+            byte_iter = backend.completions_stream(request_dict).__aiter__()
+            try:
+                first_chunk = await byte_iter.__anext__()
+            except StopAsyncIteration:
+                first_chunk = None
+            except BackendUpstreamError as e:
+                logger.warning(
+                    "completion_stream_upstream_passthrough",
+                    model=request.model,
+                    upstream_status=e.status_code,
+                )
+                content = (
+                    e.body if e.body is not None else {"error": {"message": str(e)}}
+                )
+                return JSONResponse(status_code=e.status_code, content=content)
+            except BackendError as e:
+                logger.error(
+                    "completion_stream_preflight_error",
+                    model=request.model,
+                    error=str(e),
+                )
+                raise HTTPException(status_code=502, detail=str(e)) from e
+
         stats = stats_collector.start_request(
             endpoint=endpoint,
             model=request.model,
@@ -498,8 +554,14 @@ async def completions(
 
         async def stream_generator() -> AsyncIterator[bytes]:
             try:
-                async for chunk in backend.completions_stream(request_dict):
-                    yield chunk
+                if passthrough and byte_iter is not None:
+                    if first_chunk is not None:
+                        yield first_chunk
+                    async for chunk in byte_iter:
+                        yield chunk
+                else:
+                    async for chunk in backend.completions_stream(request_dict):
+                        yield chunk
 
                 # Mark as successful on stream completion
                 duration = time.time() - start_time
@@ -586,7 +648,19 @@ async def completions(
         async def do_request() -> dict[str, Any]:
             return await backend.completions(request_dict)
 
-        response, retries = await retry_handler.execute(do_request)
+        # D-4′: `error_passthrough` is a property of the backend / tier, not
+        # of one endpoint. `/v1/completions` respects it identically to
+        # `/v1/chat/completions` so a passthrough tier reached via either
+        # OpenAI-family surface behaves the same way — no retry on
+        # billed classes, and upstream 4xx/5xx forwarded verbatim.
+        retryable = (
+            ()
+            if getattr(backend, "error_passthrough", False)
+            else None
+        )
+        response, retries = await retry_handler.execute(
+            do_request, retryable_exceptions=retryable
+        )
 
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
@@ -623,6 +697,26 @@ async def completions(
 
         return response
 
+    except BackendUpstreamError as e:
+        duration = time.time() - start_time
+        stats_collector.complete_request(stats, success=False, error=str(e))
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=request.model,
+                status="error",
+                duration=duration,
+            )
+        if getattr(backend, "error_passthrough", False):
+            logger.warning(
+                "completion_upstream_passthrough",
+                model=request.model,
+                upstream_status=e.status_code,
+            )
+            content = e.body if e.body is not None else {"error": {"message": str(e)}}
+            return JSONResponse(status_code=e.status_code, content=content)
+        logger.error("completion_error", model=request.model, error=str(e))
+        raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
         duration = time.time() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
@@ -1382,6 +1476,8 @@ async def messages(
     openai_request = anthropic_to_openai_request(req_dict)
     openai_request["model"] = resolved_model
 
+    passthrough = getattr(backend, "error_passthrough", False)
+
     # Streaming path: pre-flight the backend stream so governance/connection
     # errors surface as proper HTTP status codes before any SSE headers are sent.
     if request.stream:
@@ -1395,6 +1491,26 @@ async def messages(
             return JSONResponse(
                 status_code=400,
                 content=anthropic_error_body("invalid_request_error", str(e)),
+            )
+        except BackendUpstreamError as e:
+            # D-4′: passthrough backends forward the upstream status. For an
+            # anthropic-shaped body (Fable/Opus decline), reuse it directly
+            # — it is already `{"type": "error", "error": {...}}` and the
+            # anthropic SDK will parse it natively. For any other body
+            # shape carry it inside the endpoint's error envelope so the
+            # shape mismatch never becomes data loss.
+            if passthrough:
+                logger.warning(
+                    "messages_stream_upstream_passthrough",
+                    model=request.model,
+                    upstream_status=e.status_code,
+                )
+                content = _anthropic_passthrough_body(e)
+                return JSONResponse(status_code=e.status_code, content=content)
+            logger.error("messages_stream_error", model=request.model, error=str(e))
+            return JSONResponse(
+                status_code=502,
+                content=anthropic_error_body("api_error", str(e)),
             )
         except BackendError as e:
             logger.error("messages_stream_error", model=request.model, error=str(e))
@@ -1467,7 +1583,13 @@ async def messages(
         async def do_request() -> dict[str, Any]:
             return await backend.chat_completions(openai_request)
 
-        response, retries = await retry_handler.execute(do_request)
+        # D-4′: passthrough backends must not retry billed classes on
+        # /v1/messages either — the retry policy is a property of the
+        # tier/backend, not of the endpoint.
+        retryable = () if passthrough else None
+        response, retries = await retry_handler.execute(
+            do_request, retryable_exceptions=retryable
+        )
 
         anthropic_response = openai_to_anthropic_response(response, request.model)
 
@@ -1529,6 +1651,28 @@ async def messages(
         return JSONResponse(
             status_code=400,
             content=anthropic_error_body("invalid_request_error", str(e)),
+        )
+    except BackendUpstreamError as e:
+        stats_collector.complete_request(stats, success=False, error=str(e))
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=request.model,
+                status="error",
+                duration=time.time() - start_time,
+            )
+        if passthrough:
+            logger.warning(
+                "messages_upstream_passthrough",
+                model=request.model,
+                upstream_status=e.status_code,
+            )
+            content = _anthropic_passthrough_body(e)
+            return JSONResponse(status_code=e.status_code, content=content)
+        logger.error("messages_error", model=request.model, error=str(e))
+        return JSONResponse(
+            status_code=502,
+            content=anthropic_error_body("api_error", str(e)),
         )
     except BackendError as e:
         stats_collector.complete_request(stats, success=False, error=str(e))

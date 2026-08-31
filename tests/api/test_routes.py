@@ -820,3 +820,80 @@ class TestChatCompletionsErrorPassthrough(TestAPI):
         assert response.status_code == 502
         # max_retries=1 → 2 calls total: initial + one retry.
         assert mock_backend.chat_completions.await_count == 2
+
+
+class TestCompletionsErrorPassthrough(TestAPI):
+    """T-frontier-tier D-4′: /v1/completions honours `error_passthrough` too.
+
+    The passthrough contract is a property of the tier/backend, not of
+    one OpenAI-family endpoint. These tests pin the equivalent behaviour
+    for /v1/completions so a passthrough backend reached via that surface
+    behaves the same as via /v1/chat/completions.
+    """
+
+    def test_upstream_error_default_backend_returns_502(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        from lexora.backends.base import BackendUpstreamError
+
+        mock_backend.completions.side_effect = BackendUpstreamError(
+            "API error (400): bad",
+            status_code=400,
+            body={"error": {"message": "bad"}},
+            backend_name="claude",
+        )
+        response = client.post(
+            "/v1/completions",
+            json={"model": "claude-sonnet-4-20250514", "prompt": "Hi"},
+        )
+        assert response.status_code == 502
+
+    def test_upstream_error_passthrough_forwards_status_and_body(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        from lexora.backends.base import BackendUpstreamError
+
+        mock_backend.error_passthrough = True
+        mock_backend.completions.side_effect = BackendUpstreamError(
+            "API error (400): declined",
+            status_code=400,
+            body={"error": {"type": "refusal", "message": "declined"}},
+            backend_name="frontier",
+        )
+        response = client.post(
+            "/v1/completions",
+            json={"model": "frontier", "prompt": "Hi"},
+        )
+        assert response.status_code == 400
+        assert response.json() == {"error": {"type": "refusal", "message": "declined"}}
+
+    def test_passthrough_disables_retry_on_rate_limit(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        from lexora.backends.base import BackendRateLimitError
+
+        mock_backend.error_passthrough = True
+        mock_backend.completions.side_effect = BackendRateLimitError(
+            "rate limited", retry_after=1.0, backend_name="frontier"
+        )
+        response = client.post(
+            "/v1/completions",
+            json={"model": "frontier", "prompt": "Hi"},
+        )
+        assert response.status_code == 502
+        assert mock_backend.completions.await_count == 1
+
+    def test_non_passthrough_still_retries_rate_limit(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        from lexora.backends.base import BackendRateLimitError
+
+        mock_backend.completions.side_effect = BackendRateLimitError(
+            "rate limited", retry_after=0.001, backend_name="claude"
+        )
+        response = client.post(
+            "/v1/completions",
+            json={"model": "claude-sonnet-4-20250514", "prompt": "Hi"},
+        )
+        assert response.status_code == 502
+        assert mock_backend.completions.await_count == 2
