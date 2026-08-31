@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Green predicate for spirrow-lexora. Single source of truth:
+# .github/workflows/ci.yml calls this file; the implementer adapter runs the
+# same file locally. Do not duplicate test commands in the workflow.
+#
+# Why only pytest (2026-08-31, T-lexora-gate-and-ci):
+#   At main 4d8d2e2 this repo measures 380 passed, but
+#   ruff check = 56 errors, ruff format --check = 30 files,
+#   mypy (strict) = 21 errors in 7 files.
+#   A gate may not be stricter than the bar this repo's PRs were actually
+#   judged by, and until now that bar was nothing. Paying down the lint/type
+#   debt and then adding those checks here is a separate thread. The absence
+#   of ruff/mypy below is a decision, not an omission.
+#
+# Why --extra dev: lexora declares dev deps under
+# [project.optional-dependencies], not [dependency-groups]. A plain `uv sync`
+# installs no pytest here. This is the opposite of spirrow-verimend; do not
+# copy that repo's gate verbatim.
+#
+# Why --locked on BOTH lines: a bare `uv sync` OR `uv run` may re-resolve and
+# rewrite uv.lock. On a CI runner that rewrite is invisible and discarded, so
+# CI would report green against a dependency set the repo does not keep.
+# --locked asserts the lock matches pyproject and never writes it. --frozen is
+# NOT a substitute: it also declines to write, but it does not detect drift.
+# If a line below fails, fix uv.lock in a commit -- do not remove the flag.
+#
+# No exec bit is required: CI and the implementer adapter both invoke this
+# file as `bash .mindwire-gate`, so chmod +x would be dead weight.
+set -euo pipefail
+cd "$(dirname "$0")"
+uv sync --locked --extra dev
+uv run --locked --extra dev pytest

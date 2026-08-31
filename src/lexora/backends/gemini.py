@@ -328,9 +328,14 @@ class GeminiBackend(Backend):
                 "parts": [{"text": "\n\n".join(system_parts)}]
             }
 
-        generation_config: dict[str, Any] = {
-            "maxOutputTokens": request.get("max_tokens", self.default_max_tokens)
-        }
+        # Same explicit-None branch as AnthropicBackend._to_anthropic_request;
+        # see the reasoning there. Kept in step deliberately: this backend
+        # serves the loop's own independent naysayer, so fixing only the
+        # anthropic side would leave the reviewer on the unfixed path.
+        max_tokens = request.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = self.default_max_tokens
+        generation_config: dict[str, Any] = {"maxOutputTokens": max_tokens}
         if "temperature" in request:
             generation_config["temperature"] = request["temperature"]
         if "top_p" in request:
@@ -519,13 +524,35 @@ class GeminiBackend(Backend):
                     )
                 if response.status_code >= 400:
                     error_body = await response.aread()
+                    # Same defect and same fix as the anthropic streaming
+                    # error path: decode once, with replacement. Both call
+                    # sites here could raise UnicodeDecodeError -- the eager
+                    # `.get(..., default)` inside the `try` (Python evaluates
+                    # the default even when the key exists) and the bare
+                    # `.decode()` in the `except`, which is not itself
+                    # guarded and so escaped this async generator.
+                    #
+                    # This backend serves the loop's own independent
+                    # naysayer; a crash class fixed for one distribution is
+                    # fixed for both. The non-streaming twin above uses
+                    # `httpx.Response.text` (replacement decode already) and
+                    # is deliberately untouched.
+                    error_text = (
+                        error_body.decode(errors="replace") if error_body else ""
+                    )
                     try:
                         error_json = json.loads(error_body)
-                        error_message = error_json.get("error", {}).get(
-                            "message", error_body.decode()
-                        )
                     except Exception:
-                        error_message = error_body.decode()
+                        error_json = None
+                    if isinstance(error_json, dict):
+                        error_obj = error_json.get("error")
+                        error_message = (
+                            error_obj.get("message", error_text)
+                            if isinstance(error_obj, dict)
+                            else error_text
+                        )
+                    else:
+                        error_message = error_text
                     raise BackendError(
                         f"API error ({response.status_code}): {error_message}"
                     )

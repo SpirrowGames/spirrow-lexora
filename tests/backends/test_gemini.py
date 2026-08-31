@@ -218,6 +218,25 @@ class TestRequestConversion:
         result = backend._to_gemini_request(request)
         assert result["generationConfig"]["maxOutputTokens"] == 42
 
+    def test_explicit_none_max_tokens_falls_back_to_default(self):
+        """Same boundary as AnthropicBackend: present-but-None hits the default.
+
+        Kept in step with the anthropic backend on purpose -- this backend
+        serves the loop's own independent naysayer, so fixing only one side
+        would leave the reviewer on the unfixed path.
+        """
+        backend = GeminiBackend(name="test", default_max_tokens=8000)
+        request = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": None}
+        result = backend._to_gemini_request(request)
+        assert result["generationConfig"]["maxOutputTokens"] == 8000
+
+    def test_explicit_zero_max_tokens_is_not_replaced_by_default(self):
+        """Regression detector for an `or`-shaped fix; 0 must survive."""
+        backend = GeminiBackend(name="test", default_max_tokens=8000)
+        request = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 0}
+        result = backend._to_gemini_request(request)
+        assert result["generationConfig"]["maxOutputTokens"] == 0
+
     def test_none_default_falls_back_to_module_constant(self):
         backend = GeminiBackend(name="test", default_max_tokens=None)
         assert backend.default_max_tokens == DEFAULT_MAX_OUTPUT_TOKENS
@@ -478,3 +497,73 @@ class TestListAndClose:
         backend._client.aclose = AsyncMock()
         await backend.close()
         backend._client.aclose.assert_awaited_once()
+
+
+class TestStreamingErrorBodyDecoding:
+    """O-5 symmetry: the gemini streaming error path had the same defect.
+
+    Identical shape to `anthropic.py` — a bare `bytes.decode()` in the
+    `except`, and an eagerly evaluated `.get(..., decode())` default that
+    ran even on the success path. This backend serves the loop's own
+    independent naysayer, so a crash class fixed for one distribution is
+    fixed for both (same rule as the max_tokens fix in the previous
+    round).
+
+    Gemini keeps raising plain `BackendError` here: it does not implement
+    `error_passthrough` and this round does not wire it (see the
+    `ERROR_PASSTHROUGH_TYPES` validator in config.py).
+    """
+
+    class _FakeStreamResponse:
+        def __init__(self, status_code: int, body: bytes = b"") -> None:
+            self.status_code = status_code
+            self._body = body
+            self.headers: dict[str, str] = {}
+
+        async def aread(self) -> bytes:
+            return self._body
+
+        async def aiter_lines(self):  # pragma: no cover - error paths only
+            return
+            yield ""
+
+    class _FakeStreamCM:
+        def __init__(self, response) -> None:
+            self._response = response
+
+        async def __aenter__(self):
+            return self._response
+
+        async def __aexit__(self, *exc_info: object) -> bool:
+            return False
+
+    async def _drain(self, backend: GeminiBackend, response) -> None:
+        backend._client.stream = MagicMock(return_value=self._FakeStreamCM(response))
+        request = {
+            "model": "gemini-3.1-pro-preview",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 16,
+        }
+        async for _ in backend.chat_completions_stream(request):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_invalid_utf8_error_body_yields_backend_error(self):
+        backend = GeminiBackend(name="naysayer")
+        response = self._FakeStreamResponse(
+            500, body=b"\xff\xfe\x00binary WAF payload\x80\x81"
+        )
+
+        with pytest.raises(BackendError):
+            await self._drain(backend, response)
+
+    @pytest.mark.asyncio
+    async def test_utf16_json_error_body_yields_backend_error(self):
+        backend = GeminiBackend(name="naysayer")
+        payload = json.dumps({"error": {"message": "declined"}}).encode("utf-16")
+        response = self._FakeStreamResponse(400, body=payload)
+
+        with pytest.raises(BackendError) as exc_info:
+            await self._drain(backend, response)
+
+        assert "declined" in str(exc_info.value)

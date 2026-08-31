@@ -16,8 +16,7 @@ class BackendRouter:
     """Routes requests to appropriate backends based on model name.
 
     Supports multi-backend configuration where different models can be served
-    by different backend instances. Also supports fallback backends when
-    primary backends fail or hit rate limits.
+    by different backend instances.
 
     Args:
         routing_settings: Routing configuration.
@@ -42,7 +41,6 @@ class BackendRouter:
         #: legacy single-backend mode keeps its probe without saying so.
         self._health_checked: dict[str, bool] = {}
         self._model_to_backend: dict[str, str] = {}
-        self._fallback_map: dict[str, list[str]] = {}
 
         self._tier_to_backend: dict[str, str] = {}
         self._tier_to_model: dict[str, str] = {}
@@ -64,15 +62,6 @@ class BackendRouter:
                         backend=name,
                         url=settings.url,
                         type=settings.type,
-                    )
-
-                # Store fallback configuration
-                if settings.fallback_backends:
-                    self._fallback_map[name] = settings.fallback_backends
-                    logger.info(
-                        "fallback_registered",
-                        backend=name,
-                        fallbacks=settings.fallback_backends,
                     )
 
             # Register tier mappings
@@ -181,28 +170,23 @@ class BackendRouter:
         """
         return self._tier_to_model.get(model, model)
 
-    def get_fallback_backends(self, backend_name: str) -> list[Backend]:
-        """Get fallback backends for a given backend.
+    def is_tier(self, name: str) -> bool:
+        """Return True if ``name`` is a registered tier alias.
+
+        Kept separate from ``resolve_model`` because tier detection cannot be
+        derived from ``resolved != requested``: a tier can legitimately share
+        its concrete model name (e.g. a tier deliberately named after the
+        model it fronts), and the callsite must not confuse "tier alias" with
+        "coincidentally-equal name". Consumed by the cost tracker to record
+        the tier alongside — and distinct from — the resolved model ID.
 
         Args:
-            backend_name: Name of the primary backend.
+            name: Candidate name.
 
         Returns:
-            List of fallback backend instances.
+            True iff ``name`` is a registered tier.
         """
-        fallback_names = self._fallback_map.get(backend_name, [])
-        fallbacks = []
-        for name in fallback_names:
-            backend = self._backends.get(name)
-            if backend is not None:
-                fallbacks.append(backend)
-            else:
-                logger.warning(
-                    "fallback_backend_not_found",
-                    primary=backend_name,
-                    fallback=name,
-                )
-        return fallbacks
+        return name in self._tier_to_backend
 
     def get_backend_by_name(self, name: str) -> Backend | None:
         """Get a backend by its name.
@@ -232,15 +216,6 @@ class BackendRouter:
             Dictionary of backend name to instance.
         """
         return self._backends
-
-    @property
-    def fallback_map(self) -> dict[str, list[str]]:
-        """Get the fallback configuration map.
-
-        Returns:
-            Dictionary of backend name to list of fallback backend names.
-        """
-        return self._fallback_map
 
     @property
     def routing_enabled(self) -> bool:
@@ -295,7 +270,40 @@ class BackendRouter:
         return health
 
     async def list_all_models(self) -> dict[str, Any]:
-        """List models from all backends.
+        """List models and tier aliases from all backends.
+
+        Every configured tier is emitted as its own entry so callers reading
+        ``/v1/models`` can see the tier names the router actually accepts
+        (``naysayer``, ``heavy``, ``frontier``, ...) alongside the concrete
+        model IDs that back them. Tier entries carry ``resolved_model`` so
+        an env override (e.g. ``LEXORA_FRONTIER_MODEL``) is observable here
+        rather than needing a separate probe.
+
+        Every entry -- tier aliases included -- carries the four fields the
+        OpenAI Model object declares: ``id`` / ``object`` / ``created`` /
+        ``owned_by``. Omitting them does not raise in ``openai-python`` (it
+        builds responses through a non-validating path), which is worse than
+        a crash: the attributes come back as ``None`` on fields declared
+        ``int`` / ``str`` and blow up later and elsewhere, in
+        ``datetime.fromtimestamp(m.created)`` or a group-by on ``owned_by``.
+        Strictly-validating clients (``Model.model_validate``, typed Go/TS
+        clients, a schema-checking proxy) do reject the entry outright.
+
+        The two values for a tier alias:
+
+        * ``owned_by: "lexora"`` is a fact, not a placeholder. A tier alias is
+          defined by this gateway, not by the upstream vendor that serves the
+          resolved model.
+        * ``created: 0`` is a sentinel meaning "no creation time exists". A
+          tier alias is a config entry, not a published artifact. Mirroring
+          the resolved model's ``created`` was considered and rejected: it
+          would assert "this alias was created when that model was", which is
+          false, and a fabricated-but-plausible timestamp is worse than an
+          obvious epoch sentinel.
+
+        The additive keys (``type`` / ``backend`` / ``resolved_model``) are
+        kept: extra fields do not fail OpenAI-client validation, only missing
+        declared ones do.
 
         Returns:
             Combined models list in OpenAI format.
@@ -315,6 +323,26 @@ class BackendRouter:
                     backend=name,
                     error=str(e),
                 )
+
+        # Tier aliases. Emitted after backend models so a listing consumer
+        # reading top-down sees concrete IDs first, then the tier names that
+        # route to them. `object` is left as "model" for OpenAI-client
+        # compatibility, with `type: "tier"` as an additive marker.
+        for tier_name, backend_name in self._tier_to_backend.items():
+            all_models.append(
+                {
+                    "id": tier_name,
+                    "object": "model",
+                    # See the docstring: `owned_by` is a fact, `created: 0` is
+                    # a sentinel, and neither is mirrored from the resolved
+                    # model.
+                    "created": 0,
+                    "owned_by": "lexora",
+                    "type": "tier",
+                    "backend": backend_name,
+                    "resolved_model": self._tier_to_model.get(tier_name),
+                }
+            )
 
         return {
             "object": "list",

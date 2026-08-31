@@ -535,3 +535,97 @@ class TestBackendRouterHealthCheckOptOut:
         elapsed = asyncio.get_event_loop().time() - start
 
         assert elapsed < 0.3, f"probes look serial: {elapsed:.2f}s for 3x0.15s"
+
+
+class TestBackendRouterIsTier:
+    """T-frontier-tier D-6b: is_tier() disambiguates aliases from model IDs."""
+
+    def _router_with_tiers(self) -> BackendRouter:
+        return BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(url="http://localhost:1", models=["m1"]),
+                    "b2": BackendSettings(url="http://localhost:2", models=["m2"]),
+                },
+                tiers={
+                    "frontier": TierSettings(backend="b2", model="m2"),
+                },
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+
+    def test_is_tier_true_for_registered(self) -> None:
+        assert self._router_with_tiers().is_tier("frontier") is True
+
+    def test_is_tier_false_for_concrete_model(self) -> None:
+        assert self._router_with_tiers().is_tier("m1") is False
+
+    def test_is_tier_false_for_unknown(self) -> None:
+        assert self._router_with_tiers().is_tier("no-such-thing") is False
+
+
+class TestBackendRouterListModelsTierEntries:
+    """T-frontier-tier D-5: /v1/models exposes tier aliases with resolved model."""
+
+    @pytest.mark.asyncio
+    async def test_tier_alias_appears_with_resolved_model(self) -> None:
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(url="http://localhost:1", models=["real-model"]),
+                },
+                tiers={
+                    "frontier": TierSettings(backend="b1", model="real-model"),
+                },
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        # Shaped like a real upstream /v1/models row: the passthrough backends
+        # (vllm, openai_compatible) forward the origin server's payload
+        # verbatim, and the config-backed ones return an empty data list. The
+        # only rows lexora fabricates are the tier aliases below.
+        router.backends["b1"].list_models = AsyncMock(
+            return_value={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "real-model",
+                        "object": "model",
+                        "created": 1756600000,
+                        "owned_by": "vllm",
+                    }
+                ],
+            }
+        )
+
+        listing = await router.list_all_models()
+
+        # Structural check over EVERY entry, not just the tier ones: the
+        # failure this guards against is a row injected into the listing
+        # without the fields the OpenAI Model object declares, and the next
+        # such row will not be a tier. Omitting them does not raise in
+        # openai-python -- it builds responses through a non-validating path,
+        # so `created` / `owned_by` come back as None on int/str-declared
+        # fields and break somewhere else entirely. Strictly-validating
+        # clients reject the entry outright.
+        for model in listing["data"]:
+            for field in ("id", "object", "created", "owned_by"):
+                assert field in model, f"{model.get('id')!r} is missing {field!r}"
+
+        tier_entries = [m for m in listing["data"] if m.get("type") == "tier"]
+        assert len(tier_entries) == 1
+        entry = tier_entries[0]
+        assert entry["id"] == "frontier"
+        assert entry["resolved_model"] == "real-model"
+        assert entry["backend"] == "b1"
+        # owned_by is a fact (lexora defines the alias, not the upstream
+        # vendor); created is a sentinel for "no creation time exists" and is
+        # deliberately NOT mirrored from the resolved model, which would
+        # assert a false creation date.
+        assert entry["owned_by"] == "lexora"
+        assert entry["created"] == 0
+        assert entry["created"] != 1756600000

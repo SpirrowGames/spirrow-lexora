@@ -1,12 +1,22 @@
 """Configuration management for Lexora using Pydantic Settings."""
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BeforeValidator, Field
+from pydantic import BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Backend types whose implementation actually honours ``error_passthrough``.
+#: This is a wiring fact, not a policy: ``backends/factory.py`` passes the
+#: flag to ``AnthropicBackend`` only, and only the anthropic backend raises
+#: ``BackendUpstreamError`` (gemini / vllm / openai_compatible raise plain
+#: ``BackendError``, which the routes flatten to 502 by design). Extending
+#: passthrough to a second backend means implementing it there and adding
+#: the type here — in that order.
+ERROR_PASSTHROUGH_TYPES: frozenset[str] = frozenset({"anthropic"})
 
 
 class ModelInfo(BaseSettings):
@@ -73,9 +83,6 @@ class BackendSettings(BaseSettings):
         default_factory=dict,
         description="Model name mapping (requested_name -> actual_name)",
     )
-    fallback_backends: list[str] = Field(
-        default_factory=list, description="List of fallback backend names"
-    )
     thinking_mode: Literal["think", "no_think"] | None = Field(
         default=None,
         description=(
@@ -97,9 +104,16 @@ class BackendSettings(BaseSettings):
         default=None,
         description=(
             "Default max output tokens applied when a request omits max_tokens. "
-            "Currently consumed by the gemini backend (reasoning models spend "
+            "Consumed by the gemini and anthropic backends (reasoning models spend "
             "output budget on thinking, so a generous default avoids empty "
-            "responses). None falls back to the backend's built-in default."
+            "responses). None falls back to the backend's built-in default. "
+            "Effective on /v1/chat/completions, /v1/completions, /generate and "
+            "/chat. NOT effective on /v1/messages: the Anthropic-shaped "
+            "converter (api/anthropic_compat.py) always sets max_tokens from "
+            "its own module constant, so the backend never sees the key "
+            "missing and this setting cannot apply. That predates this "
+            "setting and is tracked as a separate follow-up; do not read the "
+            "line above as covering /v1/messages until it is fixed."
         ),
     )
     paid_key_acknowledged: bool = Field(
@@ -135,6 +149,49 @@ class BackendSettings(BaseSettings):
             "configured'. Skipping does NOT disable the backend."
         ),
     )
+    error_passthrough: bool = Field(
+        default=False,
+        description=(
+            "When true, upstream 4xx/5xx answers are forwarded to the caller "
+            "with the upstream status and body preserved, and automatic retry "
+            "on rate-limit / connection / timeout is disabled for this "
+            "backend. Off by default so existing tiers keep the 502-on-error "
+            "behaviour. Turn it on for a tier where the caller has explicitly "
+            "chosen this upstream (e.g. frontier) and needs to see the actual "
+            "answer — including a safety classifier decline — rather than a "
+            "gateway-flattened error message or a silently retried request. "
+            "Only implemented for type 'anthropic'; setting it on any other "
+            "backend type is rejected at startup rather than accepted and "
+            "dropped (see ERROR_PASSTHROUGH_TYPES)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _reject_unimplemented_error_passthrough(self) -> "BackendSettings":
+        """Fail loud when ``error_passthrough`` is set on a type that ignores it.
+
+        ``error_passthrough`` lives on ``BackendSettings``, i.e. every backend
+        type accepts the key — but the factory only forwards it to the
+        anthropic backend. Measured on every type: a config saying ``true``
+        produced a backend whose ``error_passthrough`` was ``False``, with no
+        exception and no warning.
+
+        That is the same defect this branch's sibling PR deleted from the
+        fallback machinery: an operator writes a setting, the gateway accepts
+        it, and the promised behaviour never happens. It is refused here for
+        the same reason it was refused there — a config that lies is worse
+        than a config that will not load.
+        """
+        if self.error_passthrough and self.type not in ERROR_PASSTHROUGH_TYPES:
+            supported = ", ".join(sorted(ERROR_PASSTHROUGH_TYPES))
+            raise ValueError(
+                f"error_passthrough is not implemented for backend type "
+                f"'{self.type}' (supported: {supported}). This backend would "
+                f"accept the setting and ignore it, so it is refused instead. "
+                f"Remove the key from this backend, or point the tier that "
+                f"needs verbatim upstream errors at a '{supported}' backend."
+            )
+        return self
 
     def get_model_names(self) -> list[str]:
         """Get list of model names for backward compatibility."""
@@ -234,15 +291,6 @@ class RetrySettings(BaseSettings):
     )
 
 
-class FallbackSettings(BaseSettings):
-    """Fallback settings."""
-
-    enabled: bool = Field(default=True, description="Enable fallback to alternative backends")
-    on_rate_limit: bool = Field(
-        default=True, description="Allow fallback on rate limit (429) errors"
-    )
-
-
 class LoggingSettings(BaseSettings):
     """Logging settings."""
 
@@ -268,7 +316,6 @@ class Settings(BaseSettings):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
-    fallback: FallbackSettings = Field(default_factory=FallbackSettings)
 
 
 def load_yaml_config(config_path: Path | None = None) -> dict:
@@ -298,6 +345,90 @@ def load_yaml_config(config_path: Path | None = None) -> dict:
         return yaml.safe_load(f) or {}
 
 
+def _apply_frontier_model_override(
+    routing_settings: RoutingSettings, frontier_model: str
+) -> None:
+    """Apply ``LEXORA_FRONTIER_MODEL`` to every surface that must agree, or refuse to start.
+
+    Two places have to say the same thing about the frontier tier:
+
+      1. ``routing.tiers.frontier.model`` — what the router resolves at
+         request time and sends upstream (drives cost tracker keying via
+         D-6a).
+      2. ``models[0].name`` on the backend that tier points at — what the
+         ModelRegistry / ``/v1/models`` / ``/v1/models/capabilities``
+         advertise as the frontier tier's concrete model.
+
+    Site 2 is located through ``tiers["frontier"].backend``, never through a
+    literal backend name. The tier name ``frontier`` *is* a literal on
+    purpose — callers send ``model: "frontier"``, so it is public API — but
+    the backend name behind it is an internal label the YAML picks freely
+    (``TierSettings.backend`` is a required free-form string). Reading that
+    name as a literal made the two updates independent, and PR #11's gate
+    measured what it costs: with the tier pointed at a backend named
+    ``anthropic_paid``, the tier resolved to Opus 5 while capabilities kept
+    advertising Fable 5 — and with an unused backend still named
+    ``frontier`` present, the override landed on that one instead,
+    advertising an ID no tier could reach.
+
+    **Both or refuse.** The earlier contract said "both or neither", but
+    neither is the wrong half here: setting this variable is an operator
+    saying "bill me for this model". Applying none of it bills them for the
+    YAML default under the name of the model they asked for — the exact loss
+    of provenance the frontier tier exists to prevent. So a config where the
+    override cannot reach both sites does not start, on the same judgement
+    and for the same reason as
+    ``BackendSettings._reject_unimplemented_error_passthrough``: a config
+    that lies is worse than a config that will not load.
+
+    Raises:
+        ValueError: if the frontier tier, its backend, or that backend's
+            model list cannot be resolved. Only ever raised when
+            ``LEXORA_FRONTIER_MODEL`` is set — an unset variable leaves every
+            config loading exactly as before.
+    """
+    tier = routing_settings.tiers.get("frontier")
+    if tier is None:
+        known = ", ".join(sorted(routing_settings.tiers)) or "(none)"
+        raise ValueError(
+            f"LEXORA_FRONTIER_MODEL is set to '{frontier_model}' but this "
+            f"config has no 'frontier' tier to apply it to "
+            f"(routing.tiers defines: {known}). Applying it anyway could only "
+            f"rewrite a backend that no tier resolves to, so startup is "
+            f"refused rather than accepting the variable and ignoring it. Add "
+            f"a 'frontier' tier under routing.tiers, or unset "
+            f"LEXORA_FRONTIER_MODEL."
+        )
+
+    backend = routing_settings.backends.get(tier.backend)
+    if backend is None:
+        known = ", ".join(sorted(routing_settings.backends)) or "(none)"
+        raise ValueError(
+            f"LEXORA_FRONTIER_MODEL is set to '{frontier_model}' but "
+            f"routing.tiers.frontier.backend names '{tier.backend}', which is "
+            f"not defined in routing.backends (defined: {known}). The tier "
+            f"would resolve to '{frontier_model}' while "
+            f"/v1/models/capabilities kept advertising the YAML default, so "
+            f"startup is refused rather than shipping that disagreement. Fix "
+            f"routing.tiers.frontier.backend, or unset LEXORA_FRONTIER_MODEL."
+        )
+
+    if not backend.models:
+        raise ValueError(
+            f"LEXORA_FRONTIER_MODEL is set to '{frontier_model}' but backend "
+            f"'{tier.backend}' (named by routing.tiers.frontier.backend) has "
+            f"an empty 'models' list, so there is no advertised model ID to "
+            f"swap. The tier would resolve to '{frontier_model}' while "
+            f"/v1/models advertised nothing for it, so startup is refused. "
+            f"Give routing.backends.{tier.backend}.models at least one entry, "
+            f"or unset LEXORA_FRONTIER_MODEL."
+        )
+
+    tier.model = frontier_model
+    # Preserve capability / description metadata; only swap the ID.
+    backend.models[0].name = frontier_model
+
+
 def create_settings(config_path: Path | None = None) -> Settings:
     """Create settings from YAML config and environment variables.
 
@@ -319,7 +450,6 @@ def create_settings(config_path: Path | None = None) -> Settings:
     retry_config = yaml_config.get("retry", {})
     logging_config = yaml_config.get("logging", {})
     routing_config = yaml_config.get("routing", {})
-    fallback_config = yaml_config.get("fallback", {})
 
     # Parse backends if provided
     routing_settings_kwargs: dict = {}
@@ -346,6 +476,40 @@ def create_settings(config_path: Path | None = None) -> Settings:
         if classifier_config:
             routing_settings_kwargs["classifier"] = ClassifierSettings(**classifier_config)
 
+    routing_settings = (
+        RoutingSettings(**routing_settings_kwargs)
+        if routing_settings_kwargs
+        else RoutingSettings()
+    )
+
+    # Frontier model env override (T-frontier-tier D-2).
+    #
+    # A verbatim `LEXORA_ROUTING__TIERS__FRONTIER__MODEL` is NOT respected
+    # because `create_settings` builds `RoutingSettings(...)` above and
+    # passes it as a kwarg to `Settings(...)`; pydantic-settings gives init
+    # kwargs precedence over env, so a nested-delimiter env variable is
+    # silently ignored (measured 2026-08-31). Rather than restructure the
+    # YAML-first loader, expose the one variable the operator actually
+    # wants — `LEXORA_FRONTIER_MODEL` — and apply it to both places that
+    # need to agree:
+    #
+    #   1. `routing.tiers.frontier.model` — what the router resolves at
+    #      request time (drives cost tracker keying via D-6a).
+    #   2. `models[0].name` on the backend `routing.tiers.frontier.backend`
+    #      names — what the ModelRegistry / `/v1/models` /
+    #      `/v1/models/capabilities` surface as the frontier tier's
+    #      concrete model. The backend is reached through the tier, not by
+    #      the literal name `frontier`: the backend label is the YAML's to
+    #      choose (see `_apply_frontier_model_override`).
+    #
+    # Doing only one produces an observable lie (the tier resolves to Opus
+    # 5 while capabilities keep advertising Fable 5). This does both or
+    # refuses to start — see the helper for why "neither" is not the
+    # fallback.
+    frontier_model_env = os.environ.get("LEXORA_FRONTIER_MODEL")
+    if frontier_model_env:
+        _apply_frontier_model_override(routing_settings, frontier_model_env)
+
     return Settings(
         vllm=VLLMSettings(**vllm_config),
         server=ServerSettings(**server_config),
@@ -353,8 +517,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
         rate_limit=RateLimitSettings(**rate_limit_config),
         retry=RetrySettings(**retry_config),
         logging=LoggingSettings(**logging_config),
-        routing=RoutingSettings(**routing_settings_kwargs) if routing_settings_kwargs else RoutingSettings(),
-        fallback=FallbackSettings(**fallback_config),
+        routing=routing_settings,
     )
 
 

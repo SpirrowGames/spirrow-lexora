@@ -19,7 +19,6 @@ Spirrow-Lexora is a proxy/gateway that sits in front of vLLM inference servers. 
 - Automatic retry with exponential backoff and Retry-After header support
 - Multi-backend routing with automatic model-based routing
 - OpenAI-compatible API backend support (OpenAI, Azure OpenAI, etc.)
-- Fallback functionality (automatic failover to alternative backends)
 - 429 rate limit handling with Retry-After header respect
 - Model capabilities API (list models with their capabilities)
 - Task classification API (LLM-based optimal model recommendation)
@@ -38,7 +37,7 @@ Client → Lexora (Gateway) → vLLM (Inference Engine) → GPU
 ```
                               ┌→ vLLM-1 (model-a, model-b) → GPU
 Client → Lexora (Gateway) ────┼→ vLLM-2 (model-c, model-d) → GPU
-            :8001             └→ OpenAI API (gpt-4, etc.) [fallback]
+            :8001             └→ OpenAI-compatible API (gpt-4, etc.)
 ```
 
 ## Requirements
@@ -91,10 +90,15 @@ Configuration is applied in the following priority order (later takes precedence
 | `LEXORA_RETRY__BASE_DELAY` | Base retry delay (seconds) | `1.0` |
 | `LEXORA_RETRY__RESPECT_RETRY_AFTER` | Respect Retry-After header | `true` |
 | `LEXORA_RETRY__MAX_RETRY_AFTER` | Max Retry-After delay (seconds) | `60.0` |
-| `LEXORA_FALLBACK__ENABLED` | Enable fallback to alternative backends | `true` |
-| `LEXORA_FALLBACK__ON_RATE_LIMIT` | Allow fallback on 429 rate limit | `true` |
+| `LEXORA_FRONTIER_MODEL` | Concrete model ID served by the `frontier` tier (overrides the shipped default; updates both the routing tier and the advertised model of the backend that tier points at, in lockstep — a config where it cannot update both refuses to start) | shipped `frontier` tier default |
 | `LEXORA_LOGGING__LEVEL` | Log level | `INFO` |
 | `LEXORA_LOGGING__FORMAT` | Log format (`console`/`json`) | `console` |
+
+Note: nested-delimiter env variables such as
+`LEXORA_ROUTING__TIERS__FRONTIER__MODEL` are **not** honoured — the loader
+builds `RoutingSettings` as an init kwarg and pydantic-settings gives init
+kwargs precedence over env, so the nested-name override is silently
+ignored. Use the flat `LEXORA_FRONTIER_MODEL` for the frontier tier.
 
 ### Configuration File
 
@@ -123,10 +127,6 @@ retry:
   respect_retry_after: true   # Respect Retry-After header from 429 responses
   max_retry_after: 60.0       # Max Retry-After delay
 
-fallback:
-  enabled: true
-  on_rate_limit: true   # Allow fallback on 429 errors
-
 logging:
   level: "INFO"
   format: "console"     # "json" for production
@@ -134,7 +134,7 @@ logging:
 
 ### Multi-Backend Routing Configuration
 
-You can distribute models across multiple backends (vLLM, OpenAI-compatible APIs) and configure fallbacks:
+You can distribute models across multiple backends (vLLM, OpenAI-compatible APIs):
 
 ```yaml
 routing:
@@ -162,8 +162,6 @@ routing:
         - name: "llama3-70b"
           capabilities: ["reasoning", "general"]
           description: "General-purpose large model"
-      fallback_backends:              # Fallback on failure
-        - "openai_backup"
 
     secondary:
       type: "vllm"
@@ -175,8 +173,6 @@ routing:
           capabilities: ["summarization", "translation", "simple_qa"]
           description: "Fast model for lightweight tasks"
         - "embedding-model"           # Legacy format also supported (capabilities=["general"])
-      fallback_backends:
-        - "openai_backup"
 
     openai_backup:
       type: "openai_compatible"       # OpenAI-compatible API
@@ -196,8 +192,40 @@ routing:
 **Behavior:**
 - Requests are routed to the appropriate backend based on the `model` parameter
 - Unregistered model names are routed to `default_backend`
-- `/v1/models` aggregates models from all backends
+- `/v1/models` aggregates models from all backends and appends the configured tier aliases as `{"type": "tier", "id": "<tier>", "resolved_model": "<concrete-id>"}` entries so callers can see both the concrete model IDs the backend serves and the tier names the router accepts
 - `/health` returns health status of all backends (`healthy`, `degraded`, `unhealthy`)
+
+### Tier Reference (shipped `config/lexora_config.yaml`)
+
+Tiers are named entry points that the router resolves to a concrete `(backend, model)` pair. A caller sends `model: "<tier>"` on any OpenAI-compat request; the router picks the right backend, sends the concrete model upstream, and the cost tracker records both the tier alias and the resolved model separately (so pricing follows the actual upstream, not the alias).
+
+| Tier | Backend | Concrete model | Purpose |
+|------|---------|----------------|---------|
+| `light` | `light` (vLLM, local GPU) | `Qwen3.8-27B` (no-think) | Lightweight tasks (summarisation, translation, simple QA) |
+| `medium` | `heavy` (vLLM, local GPU) | `Qwen3.8-27B` (think, `reasoning_effort=medium`) | Standard tasks with thinking |
+| `heavy` | `deep` (vLLM, local GPU) | `Qwen3.8-27B` (think, `reasoning_effort=xhigh`) | Complex reasoning (marginal cost zero — do not confuse "heavy" with "expensive"; heavy means "runs the biggest local reasoning budget", not "the paid frontier model") |
+| `naysayer` | `gemini` (Google Gemini API, paid) | `gemini-3.1-pro-preview` | Independent-distribution reviewer (data-governance gate: plain `generateContent` only) |
+| `frontier` | `frontier` (Anthropic API, paid) | `claude-fable-5-20260101` (env-configurable via `LEXORA_FRONTIER_MODEL`) | Top-of-line paid model; distinct entry so cost/latency/decline behaviour are chosen deliberately |
+
+### Frontier Tier — Operational Notes
+
+The `frontier` tier exists so a caller expressing "I want the smartest paid model, and I am willing to pay for it" gets a distinct entry point instead of that intent being buried in `heavy`. Its behaviour differs from every other tier on three axes:
+
+- **No silent fallback.** Not because the tier opts out, but because the gateway has no fallback mechanism at all (removed 2026-08-31 — see below). If the upstream fails, the caller gets that failure — the point of picking `frontier` was to know which model produced the result. A config that tries to reintroduce a fallback target fails startup rather than downgrading a request.
+- **No silent retry.** Two mechanisms, and it is worth knowing which does what. A 429 or a safety-classifier decline now leaves a passthrough backend as the upstream's own answer (`BackendUpstreamError`), a class the retry handler was never willing to retry — so those never cost a second call regardless of retry configuration. Separately, the route passes `retryable_exceptions=()` for a passthrough backend, which suppresses retry for the classes that *are* retryable by default (connection / timeout). With `retry.max_retries: 3` the result is one billed call rather than four.
+- **Upstream errors pass through verbatim.** Instead of collapsing every 4xx/5xx into a 502 with a stringified detail, the route forwards the upstream status code and the parsed body as-is. A Fable/Opus classifier decline arrives as HTTP 400 with a structured `{"error": {"type": "refusal", ...}}` body; a `stop_reason: refusal` on a 200 response is mapped to OpenAI `finish_reason: "content_filter"` rather than being rounded off to `"stop"`.
+
+Streaming caveat: for streaming requests the route pre-flights the first chunk from the backend so a refusal / auth failure still surfaces as a proper HTTP status. Once bytes have started flowing the caller can only see SSE-body passthrough — that is a protocol limit, and there is no way for a gateway to change an already-sent 200 into an HTTP 400.
+
+**Swapping the frontier model (Fable 5 → Opus 5):**
+```bash
+export LEXORA_FRONTIER_MODEL=claude-opus-5-20260601
+```
+Both the tier resolution and `/v1/models{,/capabilities}` update together, so the surface never disagrees with what the router sends upstream. The advertised model is found through `routing.tiers.frontier.backend`, so renaming that backend in the YAML does not quietly leave half the override behind; if the variable cannot be applied to both places — no `frontier` tier, a tier naming a backend that does not exist, or that backend having no `models` — the gateway refuses to start and names which of the three it hit. Being billed for Opus 5 under a config still advertising Fable 5 is the failure this trades a startup error for. If you swap to a model ID that is not in `DEFAULT_PRICING`, cost records write `pricing_known=0` and log a `cost_pricing_unknown` warning — the ledger stays honest, but you should add the price entry before relying on `/stats/costs?tier=frontier` for reconciliation.
+
+**Data governance:** Fable 5 has 30-day retention and a safety classifier. Using the frontier tier is an operator affirmation that this policy is acceptable for the traffic you route through it (analogous to `paid_key_acknowledged` on the Gemini backend and `ANTHROPIC_API_KEY` on the Claude backend — the config keeps these as owner decisions rather than hidden defaults). See the `frontier` backend comment in `config/lexora_config.yaml`.
+
+**Rate limiting:** the general per-user rate limit (default 10 rps / burst 20) applies to frontier as it does to every other tier, but there is deliberately no daily cost cap in the initial version. The gateway sits on tailnet and has no authentication in front of it, so a runaway caller can bill the frontier account until it is stopped externally — this is a known limit, not an oversight; a per-tier daily cap is a candidate for a follow-up when a real user needs it.
 
 **Backend Types:**
 | Type | Description |
@@ -205,11 +233,13 @@ routing:
 | `vllm` | vLLM backend (default) |
 | `openai_compatible` | OpenAI-compatible API (OpenAI, Azure OpenAI, etc.) |
 
-**Fallback Functionality:**
-- Specify alternative backends with `fallback_backends`
-- Automatic failover on primary backend failure (connection error, timeout, 503, etc.)
-- Fallback on 429 rate limit is also available (enable with `fallback.on_rate_limit: true`)
-- Multiple fallbacks are tried in order
+**No fallback mechanism (removed 2026-08-31):** a backend failure is returned to the
+caller as an error; requests are never re-routed to a different backend. The
+`FallbackService` that used to be configured here was never wired into the request
+path, so the settings it read (`fallback:`, `fallback_backends:`) promised operators a
+failover that never happened; both the code and the settings were removed rather than
+wired. `BackendSettings` forbids unknown keys, so a `fallback_backends:` left in a
+config file now fails startup loudly instead of being silently ignored.
 
 ## API Endpoints
 
@@ -381,7 +411,7 @@ sudo systemctl enable --now lexora
 | Prometheus Metrics | ✅ | Metrics export |
 | Multi-Backend Routing | ✅ | Automatic model-based routing |
 | OpenAI-Compatible Backend | ✅ | OpenAI, Azure OpenAI, etc. support |
-| Fallback Support | ✅ | Automatic failover on primary failure |
+| Fallback Support | ❌ | Removed 2026-08-31 — was never wired; errors are returned, not re-routed |
 | 429 Rate Limit Handling | ✅ | Retry-After header respect |
 | Model Capabilities API | ✅ | Model list with capability information |
 | Task Classification | ✅ | LLM-based task classification and model recommendation |
@@ -423,7 +453,6 @@ spirrow-lexora/
 │   │   ├── rate_limiter.py  # Token bucket rate limiter
 │   │   ├── retry_handler.py # Exponential backoff retry + Retry-After
 │   │   ├── router.py        # Multi-backend routing
-│   │   ├── fallback.py      # Fallback service
 │   │   ├── metrics.py       # Prometheus metrics
 │   │   ├── stats.py         # Statistics collection
 │   │   ├── model_registry.py    # Model capabilities registry
@@ -441,7 +470,6 @@ spirrow-lexora/
 ## Roadmap
 
 - [x] OpenAI-compatible API backend support
-- [x] Fallback functionality
 - [x] 429 rate limit handling (Retry-After)
 - [x] Model capabilities API
 - [x] Task classification with automatic model recommendation

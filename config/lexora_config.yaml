@@ -32,6 +32,23 @@ routing:
       backend: "gemini"
       model: "gemini-3.1-pro-preview"
       description: "naysayer (別訓練分布・最大独立性、native generateContent gate)"
+    # frontier: heavy とは別に「一番賢い有料モデル」の入口を独立させる
+    # (T-frontier-tier, 2026-08-31)。heavy はローカル vLLM (限界費用ゼロ)、
+    # frontier は Anthropic の課金モデル ∴ 呼び出し側は「コストを払う意思表示」
+    # として frontier を明示指定する。silent retry / silent 502 flattening は
+    # backends.frontier の error_passthrough: true で止めている。silent
+    # fallback は「設定で止める」ものではなくなった — フォールバック機構自体を
+    # 2026-08-31 に撤去したので、どの config でも格下げは起こせない (末尾の記録)。
+    # 初期モデル: Claude Fable 5 (Takahito 判断)。差し替えは
+    # LEXORA_FRONTIER_MODEL で env override 可能 — config.py の
+    # create_settings が読んで tiers.frontier.model と、この tier の
+    # backend: が指す backend の models[0].name の両方を書き換える
+    # (backend 名は literal ではなく tier 経由で引く。名前は YAML の自由)。
+    # 両方に届かない config は起動を拒否する — 片方だけ適用すると
+    # 「指名したモデルの名前で別のモデルに課金される」ため (B-19)。
+    frontier:
+      backend: "frontier"
+      description: "最上位モデル (Anthropic Claude Fable 5 既定、env で差し替え可)"
 
   # タスク分類設定
   classifier:
@@ -53,8 +70,6 @@ routing:
         - name: "Qwen3.8-27B"
           capabilities: ["code", "reasoning", "analysis"]
           description: "複雑なタスク向け (thinking mode)"
-      fallback_backends:
-        - "claude"
 
     light:
       type: "vllm"
@@ -66,7 +81,6 @@ routing:
         - name: "Qwen3.8-27B"
           capabilities: ["summarization", "translation", "simple_qa", "general"]
           description: "軽量タスク向け (non-thinking mode)"
-      fallback_backends: []
 
     # heavy ティア用。2026-08-18 に Anthropic API から移した。
     # 背景: ANTHROPIC_API_KEY 未設定で heavy は 502 のまま死んでいた。CPU + メインメモリ
@@ -88,17 +102,15 @@ routing:
         - name: "Qwen3.8-27B"
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "複雑なタスク向け (thinking mode, reasoning_effort=xhigh)"
-      # fallback は付けない。同じ vLLM を見ている medium が死ぬときは deep も死ぬし、
-      # 鍵の無い claude に落としても 502 が別の 502 になるだけで診断を濁す。
-      fallback_backends: []
 
     # openai_gpt4 backend removed 2026-08-11.
     # OPENAI_API_KEY は設定されておらず、常に 401 = 常に unhealthy だった。
     # その上で GET /health は毎回 api.openai.com を叩いており、遠端が不定期に
     # 停止して 20〜40s ブロックする (素の curl でも再現、time_connect /
     # time_appconnect は常に高速で time_starttransfer だけが伸びる)。
-    # heavy / light の fallback 先でもあったが、キーが無いのでフォールバック
-    # しても 401 になるだけだった。再導入するならキー設定が先。
+    # 当時の heavy / light は fallback_backends にこの backend を挙げていたが、
+    # その機構 (FallbackService) はそもそも配線されておらず動いていなかった
+    # (2026-08-31 に撤去。末尾の記録を参照)。再導入するならキー設定が先。
 
     # Google Gemini API (native generateContent, naysayer 用)
     gemini:
@@ -132,7 +144,6 @@ routing:
         - name: "gemini-3.1-pro-preview"
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "Google Gemini 3.1 Pro Preview (naysayer, native generateContent)"
-      fallback_backends: []
 
     # Claude Code CLI (non-interactive mode)
     claude_code:
@@ -155,8 +166,6 @@ routing:
         "model": "sonnet"  # default CLI model
         "max_turns": "1"  # prevent agentic tool use for simple completions
         # "working_dir": "/home/sgadmin"
-      fallback_backends:
-        - "claude"
 
     # Anthropic Claude API
     claude:
@@ -175,7 +184,70 @@ routing:
         - name: "claude-sonnet-4-20250514"
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "Anthropic Claude Sonnet 4"
-      fallback_backends: []
+
+    # frontier: 「最上位モデル」の入口 (T-frontier-tier, 2026-08-31)。
+    # claude backend とは分ける — 専用 backend にしておけば粒度が backend 単位
+    # で閉じ、新しいノブを発明しなくて済む (default_max_tokens,
+    # error_passthrough, health_check, timeout, 価格の記録単位、全部 backend
+    # 単位)。相乗りさせると claude の設定変更が frontier に波及する。
+    #
+    # 初期モデル: Claude Fable 5 (Takahito 判断)。Fable 5 は 30 日データ保持と
+    # 安全分類器 (decline 発生時は stop_reason: refusal → content_filter に
+    # マップされ、応答自体は upstream の 4xx で透過される)。これはデータ統治上
+    # の性質であり、frontier ティアを使うということはこの規約を受け入れると
+    # いう意思表示。gemini backend の paid_key_acknowledged / claude backend の
+    # ANTHROPIC_API_KEY と同じ、オーナー判断として明示する規律で config に残す。
+    #
+    # LEXORA_FRONTIER_MODEL で env override 可能: create_settings が
+    # tiers.frontier.model と、tiers.frontier.backend が指す backend の
+    # models[0].name の両方を書き換える。この backend を literal 名
+    # "frontier" で引くと、tier を別名の backend に向けた config で
+    # 片方しか更新されない (PR #11 の gate が実測、B-19) ∴ 必ず tier
+    # 経由で引き、両方に届かない config は起動を拒否する。
+    # Opus 5 差し替えは env 変数 1 つで済む。価格は
+    # cost_tracker.py の DEFAULT_PRICING にコード定数として置く運用で、
+    # 未登録モデル ID は pricing_known=0 + cost_pricing_unknown warning
+    # で可視化される (silent 0.00 にはならない、T-frontier-tier D-6c)。
+    #
+    # 要件 3 (サイレントフォールバック禁止) はこの backend の設定ではなく
+    # スキーマの性質で保証される: フォールバック機構は 2026-08-31 に撤去され、
+    # `fallback_backends:` は存在しないキーになった ∴ extra="forbid" により
+    # 書き戻すと起動が落ちる。frontier を選ぶのはコストを払う意思表示であり、
+    # 黙って heavy などに落ちると「何のモデルで出た結果か」が失われる
+    # (T-frontier-tier msg-001 要件 3 / msg-025 R-1)。
+    #
+    # error_passthrough: true で upstream の 4xx / 5xx を透過し、429 / 拒否は
+    # 再試行しない (要件 4)。安全分類器の refusal もそのまま返す。
+    #
+    # default_max_tokens は reasoning モデル (Fable / Opus は thinking が
+    # output 枠を食う) 向けに広く取る。呼び出し側が max_tokens を明示すれば
+    # そちらが優先される。
+    frontier:
+      type: "anthropic"
+      url: "https://api.anthropic.com"
+      api_key_env: "ANTHROPIC_API_KEY"
+      timeout: 300.0
+      connect_timeout: 5.0
+      # 同上 — probe が本物の /v1/messages を発行し、401 を healthy と報告する
+      # ため誤った緑を避ける。ANTHROPIC_API_KEY 未設定でも起動できるが、
+      # 呼ぶと upstream 401 が透過される (壊れ方は可視)。
+      health_check: false
+      default_max_tokens: 8000
+      error_passthrough: true
+      # !!! 初回の課金呼び出し前に、実 Anthropic モデル ID と実 per-MTok
+      # 価格の両方を埋める !!! `claude-fable-5-20260101` は placeholder で、
+      # Anthropic が公開する実 ID とは違う可能性が高い。実 ID を
+      # `name:` に (または env `LEXORA_FRONTIER_MODEL` に) 入れ、同じ ID を
+      # `src/lexora/services/cost_tracker.py` の DEFAULT_PRICING に価格つきで
+      # 追加する。埋めるまでは frontier リクエストが
+      # pricing_known=0 の unpriced 行として台帳に載り、
+      # `cost_pricing_unknown` warning が出る (T-frontier-tier D-6c の
+      # 安全側デグラード)。placeholder が黙って通ることは無いが、
+      # 課金の突合 (要件 6) は price の実値が入るまで意味を持たない。
+      models:
+        - name: "claude-fable-5-20260101"
+          capabilities: ["code", "reasoning", "analysis", "general", "frontier"]
+          description: "Anthropic Claude Fable 5 (frontier ティア既定モデル、30 日保持・分類器あり)"
 
 queue:
   max_size: 1000
@@ -194,9 +266,35 @@ retry:
   respect_retry_after: true
   max_retry_after: 60.0
 
-fallback:
-  enabled: true
-  on_rate_limit: true
+# fallback 機構は 2026-08-31 に撤去した。ここには `fallback: enabled / on_rate_limit`
+# のセクションがあり、各 backend には `fallback_backends:` があった。
+# 撤去した理由: `FallbackService` (src/lexora/services/fallback.py) は 73853e7 で
+# 生まれてから一度も配線されたことが無い (main.py は構築せず routes.py は呼ばない)。
+# ∴ 実行時にフォールバックは一度も走っていないのに、この config は
+# `enabled: true` と `heavy: fallback_backends: ["claude"]` を出荷し続けていた =
+# 運用者への偽の約束だった (upstream の 429 でフォールバックを期待するが、
+# 実際にはルーティングごと失敗する)。
+# 配線ではなく削除を選んだ理由: フォールバックを必要とする要求がどこにも無く、
+# 唯一の落とし先 claude は ANTHROPIC_API_KEY 未設定 ∴ 配線したら「死んだテキスト」が
+# 「本物の 401 格下げ」に化けるだけ。削除は可逆 (コードは git 履歴に残る)。
+# 再導入するなら **実装が先で config は後**。機構より先に config を出荷しない。
+# なお `BackendSettings` は extra="forbid" ∴ `fallback_backends:` が残っている
+# config で起動すると create_settings が ValidationError で落ちる。これを
+# 「fail-loud だから silent には壊れない」と読んではいけない: deploy/lexora.service
+# は Restart=always / RestartSec=5 ∴ 落ちたプロセスは 5 秒ごとに再起動を試みる
+# クラッシュループになり、journal を見ない限り観測される症状は「サービスが応答
+# しない」だけになる。lexora が naysayer backend を提供している場合、その症状は
+# 「独立レビューが返ってこない」として現れる。∴ 更新後の再起動前に検査すること。
+#
+# 検査行 (再起動の前に実行する):
+#   grep -n fallback_backends /opt/lexora/config/lexora_config.yaml /etc/lexora/config.yaml
+#
+# repo 外の config コピーも同じ操作で更新すること。パスは /etc だけではない:
+# config.py の探索順は config/lexora_config.yaml → lexora_config.yaml →
+# /etc/lexora/config.yaml で、先頭 2 つは lexora.service の
+# WorkingDirectory=/opt/lexora からの相対 ∴ README の手順どおりに入れた環境で
+# 実際にロードされるのは /opt/lexora/config/lexora_config.yaml であり、これが
+# /etc/lexora/config.yaml を shadow する。/etc だけを見ると false all-clear が出る。
 
 logging:
   level: "INFO"
