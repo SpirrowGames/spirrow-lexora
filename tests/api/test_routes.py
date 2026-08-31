@@ -773,21 +773,27 @@ class TestChatCompletionsErrorPassthrough(TestAPI):
         assert response.status_code == 400
         assert response.json() == {"error": {"type": "refusal", "message": "declined"}}
 
-    def test_passthrough_disables_retry_on_rate_limit(
-        self, client: TestClient, mock_backend: MagicMock, retry_handler: RetryHandler
+    def test_passthrough_forwards_429_with_retry_after(
+        self, client: TestClient, mock_backend: MagicMock
     ) -> None:
-        """error_passthrough=True short-circuits retry so a 429 costs 1 call, not N.
+        """A rate limit reaches the caller as 429, not as a gateway 502.
 
-        Concretely: with the default retry handler (max_retries=1) a plain
-        BackendRateLimitError would produce 2 backend calls; with
-        passthrough on, the exception is not retried and the first response
-        is what the caller sees.
+        This is the route half of the O-4 fix: a passthrough backend now
+        raises `BackendUpstreamError(status_code=429, retry_after=...)`
+        (pinned at the backend layer in tests/backends/test_anthropic.py),
+        and the route must forward the status, the body, and the wait.
+        A 429 without Retry-After is no more actionable than the 502 it
+        replaces, so the header is part of the assertion, not decoration.
         """
-        from lexora.backends.base import BackendRateLimitError
+        from lexora.backends.base import BackendUpstreamError
 
         mock_backend.error_passthrough = True
-        mock_backend.chat_completions.side_effect = BackendRateLimitError(
-            "rate limited", retry_after=1.0, backend_name="frontier"
+        mock_backend.chat_completions.side_effect = BackendUpstreamError(
+            "API error (429): slow down",
+            status_code=429,
+            body={"type": "error", "error": {"type": "rate_limit_error"}},
+            retry_after=30.0,
+            backend_name="frontier",
         )
 
         response = client.post(
@@ -795,11 +801,83 @@ class TestChatCompletionsErrorPassthrough(TestAPI):
             json={"model": "frontier", "messages": [{"role": "user", "content": "Hi"}]},
         )
 
-        # BackendRateLimitError is a BackendError but not a BackendUpstreamError,
-        # so it falls into the plain 502 path — which is fine, the point is
-        # that only ONE upstream call was made.
+        assert response.status_code == 429
+        assert response.json() == {
+            "type": "error",
+            "error": {"type": "rate_limit_error"},
+        }
+        assert response.headers["Retry-After"] == "30"
+        # Still exactly one upstream call: passthrough disables retry.
+        assert mock_backend.chat_completions.await_count == 1
+
+    def test_passthrough_omits_retry_after_when_upstream_sent_none(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """No invented wait: the header appears only if the upstream sent one."""
+        from lexora.backends.base import BackendUpstreamError
+
+        mock_backend.error_passthrough = True
+        mock_backend.chat_completions.side_effect = BackendUpstreamError(
+            "API error (400): declined",
+            status_code=400,
+            body={"error": {"message": "declined"}},
+            backend_name="frontier",
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "frontier", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+        assert response.status_code == 400
+        assert "Retry-After" not in response.headers
+
+    def test_passthrough_disables_retry_on_a_retryable_error(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """error_passthrough=True short-circuits retry: 1 upstream call, not N.
+
+        `BackendConnectionError` is used deliberately. The earlier version
+        of this test used `BackendRateLimitError`, which a passthrough
+        backend no longer raises at all after the O-4 fix — so it would
+        have proved the retry claim about a state that cannot occur. This
+        exception is genuinely in `RETRYABLE_EXCEPTIONS` and is still
+        reachable under passthrough (it means Lexora never reached the
+        upstream), so the comparison below has content.
+        """
+        from lexora.backends.base import BackendConnectionError
+
+        mock_backend.error_passthrough = True
+        mock_backend.chat_completions.side_effect = BackendConnectionError(
+            "connection refused"
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "frontier", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+
         assert response.status_code == 502
         assert mock_backend.chat_completions.await_count == 1
+
+    def test_non_passthrough_retries_the_same_retryable_error(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """The other half of the comparison: without passthrough it retries."""
+        from lexora.backends.base import BackendConnectionError
+
+        mock_backend.chat_completions.side_effect = BackendConnectionError(
+            "connection refused"
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+        assert response.status_code == 502
+        # max_retries=1 → 2 calls total: initial + one retry.
+        assert mock_backend.chat_completions.await_count == 2
 
     def test_non_passthrough_still_retries_rate_limit(
         self, client: TestClient, mock_backend: MagicMock
@@ -867,14 +945,36 @@ class TestCompletionsErrorPassthrough(TestAPI):
         assert response.status_code == 400
         assert response.json() == {"error": {"type": "refusal", "message": "declined"}}
 
-    def test_passthrough_disables_retry_on_rate_limit(
+    def test_passthrough_forwards_429_with_retry_after(
         self, client: TestClient, mock_backend: MagicMock
     ) -> None:
-        from lexora.backends.base import BackendRateLimitError
+        from lexora.backends.base import BackendUpstreamError
 
         mock_backend.error_passthrough = True
-        mock_backend.completions.side_effect = BackendRateLimitError(
-            "rate limited", retry_after=1.0, backend_name="frontier"
+        mock_backend.completions.side_effect = BackendUpstreamError(
+            "API error (429): slow down",
+            status_code=429,
+            body={"type": "error", "error": {"type": "rate_limit_error"}},
+            retry_after=30.0,
+            backend_name="frontier",
+        )
+        response = client.post(
+            "/v1/completions",
+            json={"model": "frontier", "prompt": "Hi"},
+        )
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == "30"
+        assert mock_backend.completions.await_count == 1
+
+    def test_passthrough_disables_retry_on_a_retryable_error(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """Same substitution as the chat class: a genuinely retryable error."""
+        from lexora.backends.base import BackendConnectionError
+
+        mock_backend.error_passthrough = True
+        mock_backend.completions.side_effect = BackendConnectionError(
+            "connection refused"
         )
         response = client.post(
             "/v1/completions",
@@ -882,6 +982,21 @@ class TestCompletionsErrorPassthrough(TestAPI):
         )
         assert response.status_code == 502
         assert mock_backend.completions.await_count == 1
+
+    def test_non_passthrough_retries_the_same_retryable_error(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        from lexora.backends.base import BackendConnectionError
+
+        mock_backend.completions.side_effect = BackendConnectionError(
+            "connection refused"
+        )
+        response = client.post(
+            "/v1/completions",
+            json={"model": "claude-sonnet-4-20250514", "prompt": "Hi"},
+        )
+        assert response.status_code == 502
+        assert mock_backend.completions.await_count == 2
 
     def test_non_passthrough_still_retries_rate_limit(
         self, client: TestClient, mock_backend: MagicMock

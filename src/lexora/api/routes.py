@@ -1,5 +1,6 @@
 """API routes for Lexora."""
 
+import math
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -53,6 +54,60 @@ from lexora.utils.logging import get_logger
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+
+def _passthrough_headers(e: BackendUpstreamError) -> dict[str, str] | None:
+    """Response headers for a forwarded upstream answer.
+
+    A 429 forwarded without the upstream's ``Retry-After`` is no more
+    useful to the caller than the 502 it replaces -- in both cases they
+    cannot tell when it is safe to try again. Emitted only when the
+    upstream actually sent the header (``retry_after is None`` otherwise),
+    and rounded *up* so the value never advertises an earlier retry than
+    the upstream allowed.
+    """
+    if e.retry_after is None:
+        return None
+    return {"Retry-After": str(max(0, math.ceil(e.retry_after)))}
+
+
+def _fail_preflight(
+    stats_collector: StatsCollector,
+    stats: Any,
+    metrics_collector: MetricsCollector | None,
+    endpoint: str,
+    model: str,
+    start_time: float,
+    error: Exception,
+) -> None:
+    """Close a request that failed in the streaming pre-flight.
+
+    Every early return out of a pre-flight block must pass through here.
+    Two reasons, and the second is the dangerous one:
+
+    1. Without it the request never reaches the stats collector at all, so
+       a caller can hammer a tier with rejected streaming requests and the
+       ledger shows zero (the bug this closes). The non-streaming branch of
+       the same endpoint has always counted its failures; this makes the
+       two branches agree rather than inventing a new policy.
+    2. ``record_request_start`` has already ``inc()``'d the ACTIVE_REQUESTS
+       gauge and only ``record_request_end`` ``dec()``s it. An early return
+       that registers the request but skips this call leaks in-flight
+       count permanently -- strictly worse than not counting at all.
+
+    ``streaming=True``: the caller asked for a stream, so the attempt
+    belongs with the other streaming outcomes even though the response
+    that goes back is JSON.
+    """
+    stats_collector.complete_request(stats, success=False, error=str(error))
+    if metrics_collector:
+        metrics_collector.record_request_end(
+            endpoint=endpoint,
+            model=model,
+            status="error",
+            duration=time.time() - start_time,
+            streaming=True,
+        )
 
 
 def _anthropic_passthrough_body(e: BackendUpstreamError) -> dict[str, Any]:
@@ -210,6 +265,21 @@ async def chat_completions(
 
     # Handle streaming request
     if request.stream:
+        # Register the request BEFORE the pre-flight. A pre-flight that
+        # rejects still consumed an upstream call, so it must appear in the
+        # ledger exactly like the non-streaming branch below; every early
+        # return inside the block closes it via `_fail_preflight`.
+        stats = stats_collector.start_request(
+            endpoint=endpoint,
+            model=request.model,
+            user_id=request.user,
+        )
+        start_time = time.time()
+
+        # Record metrics start
+        if metrics_collector:
+            metrics_collector.record_request_start(endpoint)
+
         # Pre-flight the first chunk for passthrough backends so an upstream
         # refusal / auth failure surfaces as a proper HTTP status code
         # (matching /v1/messages, routes.py in the anthropic-compat path)
@@ -231,28 +301,39 @@ async def chat_completions(
                     model=request.model,
                     upstream_status=e.status_code,
                 )
+                _fail_preflight(
+                    stats_collector,
+                    stats,
+                    metrics_collector,
+                    endpoint,
+                    request.model,
+                    start_time,
+                    e,
+                )
                 content = (
                     e.body if e.body is not None else {"error": {"message": str(e)}}
                 )
-                return JSONResponse(status_code=e.status_code, content=content)
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content=content,
+                    headers=_passthrough_headers(e),
+                )
             except BackendError as e:
                 logger.error(
                     "chat_completion_stream_preflight_error",
                     model=request.model,
                     error=str(e),
                 )
+                _fail_preflight(
+                    stats_collector,
+                    stats,
+                    metrics_collector,
+                    endpoint,
+                    request.model,
+                    start_time,
+                    e,
+                )
                 raise HTTPException(status_code=502, detail=str(e)) from e
-
-        stats = stats_collector.start_request(
-            endpoint=endpoint,
-            model=request.model,
-            user_id=request.user,
-        )
-        start_time = time.time()
-
-        # Record metrics start
-        if metrics_collector:
-            metrics_collector.record_request_start(endpoint)
 
         async def stream_generator() -> AsyncIterator[bytes]:
             try:
@@ -434,7 +515,11 @@ async def chat_completions(
                 upstream_status=e.status_code,
             )
             content = e.body if e.body is not None else {"error": {"message": str(e)}}
-            return JSONResponse(status_code=e.status_code, content=content)
+            return JSONResponse(
+                status_code=e.status_code,
+                content=content,
+                headers=_passthrough_headers(e),
+            )
         logger.error("chat_completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
@@ -511,6 +596,19 @@ async def completions(
 
     # Handle streaming request
     if request.stream:
+        # Registered before the pre-flight for the same reason as
+        # /v1/chat/completions: a rejected pre-flight is still a request.
+        stats = stats_collector.start_request(
+            endpoint=endpoint,
+            model=request.model,
+            user_id=request.user,
+        )
+        start_time = time.time()
+
+        # Record metrics start
+        if metrics_collector:
+            metrics_collector.record_request_start(endpoint)
+
         # D-4′: mirror the /v1/chat/completions streaming pre-flight for
         # passthrough backends so a refusal / auth failure yields the real
         # HTTP status instead of a 200 SSE that closes with an error frame.
@@ -529,28 +627,39 @@ async def completions(
                     model=request.model,
                     upstream_status=e.status_code,
                 )
+                _fail_preflight(
+                    stats_collector,
+                    stats,
+                    metrics_collector,
+                    endpoint,
+                    request.model,
+                    start_time,
+                    e,
+                )
                 content = (
                     e.body if e.body is not None else {"error": {"message": str(e)}}
                 )
-                return JSONResponse(status_code=e.status_code, content=content)
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content=content,
+                    headers=_passthrough_headers(e),
+                )
             except BackendError as e:
                 logger.error(
                     "completion_stream_preflight_error",
                     model=request.model,
                     error=str(e),
                 )
+                _fail_preflight(
+                    stats_collector,
+                    stats,
+                    metrics_collector,
+                    endpoint,
+                    request.model,
+                    start_time,
+                    e,
+                )
                 raise HTTPException(status_code=502, detail=str(e)) from e
-
-        stats = stats_collector.start_request(
-            endpoint=endpoint,
-            model=request.model,
-            user_id=request.user,
-        )
-        start_time = time.time()
-
-        # Record metrics start
-        if metrics_collector:
-            metrics_collector.record_request_start(endpoint)
 
         async def stream_generator() -> AsyncIterator[bytes]:
             try:
@@ -714,7 +823,11 @@ async def completions(
                 upstream_status=e.status_code,
             )
             content = e.body if e.body is not None else {"error": {"message": str(e)}}
-            return JSONResponse(status_code=e.status_code, content=content)
+            return JSONResponse(
+                status_code=e.status_code,
+                content=content,
+                headers=_passthrough_headers(e),
+            )
         logger.error("completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
@@ -1482,12 +1595,33 @@ async def messages(
     # errors surface as proper HTTP status codes before any SSE headers are sent.
     if request.stream:
         openai_request["stream"] = True
+        # Registered before the pre-flight (same rule as the OpenAI-family
+        # endpoints). This pre-flight runs for *every* backend, not just
+        # passthrough ones, so before this change a governance refusal or a
+        # plain BackendError on the streaming path was invisible to stats
+        # and metrics too — not only the passthrough case the gate named.
+        stats = stats_collector.start_request(
+            endpoint=endpoint, model=request.model, user_id=user_id
+        )
+        if metrics_collector:
+            metrics_collector.record_request_start(endpoint)
+        start_time = time.time()
+
         byte_iter = backend.chat_completions_stream(openai_request).__aiter__()
         try:
             first_chunk = await byte_iter.__anext__()
         except StopAsyncIteration:
             first_chunk = None
         except GeminiGovernanceError as e:
+            _fail_preflight(
+                stats_collector,
+                stats,
+                metrics_collector,
+                endpoint,
+                request.model,
+                start_time,
+                e,
+            )
             return JSONResponse(
                 status_code=400,
                 content=anthropic_error_body("invalid_request_error", str(e)),
@@ -1499,6 +1633,15 @@ async def messages(
             # anthropic SDK will parse it natively. For any other body
             # shape carry it inside the endpoint's error envelope so the
             # shape mismatch never becomes data loss.
+            _fail_preflight(
+                stats_collector,
+                stats,
+                metrics_collector,
+                endpoint,
+                request.model,
+                start_time,
+                e,
+            )
             if passthrough:
                 logger.warning(
                     "messages_stream_upstream_passthrough",
@@ -1506,25 +1649,31 @@ async def messages(
                     upstream_status=e.status_code,
                 )
                 content = _anthropic_passthrough_body(e)
-                return JSONResponse(status_code=e.status_code, content=content)
+                return JSONResponse(
+                    status_code=e.status_code,
+                    content=content,
+                    headers=_passthrough_headers(e),
+                )
             logger.error("messages_stream_error", model=request.model, error=str(e))
             return JSONResponse(
                 status_code=502,
                 content=anthropic_error_body("api_error", str(e)),
             )
         except BackendError as e:
+            _fail_preflight(
+                stats_collector,
+                stats,
+                metrics_collector,
+                endpoint,
+                request.model,
+                start_time,
+                e,
+            )
             logger.error("messages_stream_error", model=request.model, error=str(e))
             return JSONResponse(
                 status_code=502,
                 content=anthropic_error_body("api_error", str(e)),
             )
-
-        stats = stats_collector.start_request(
-            endpoint=endpoint, model=request.model, user_id=user_id
-        )
-        if metrics_collector:
-            metrics_collector.record_request_start(endpoint)
-        start_time = time.time()
 
         async def replayed() -> AsyncIterator[bytes]:
             if first_chunk is not None:
@@ -1668,7 +1817,11 @@ async def messages(
                 upstream_status=e.status_code,
             )
             content = _anthropic_passthrough_body(e)
-            return JSONResponse(status_code=e.status_code, content=content)
+            return JSONResponse(
+                status_code=e.status_code,
+                content=content,
+                headers=_passthrough_headers(e),
+            )
         logger.error("messages_error", model=request.model, error=str(e))
         return JSONResponse(
             status_code=502,

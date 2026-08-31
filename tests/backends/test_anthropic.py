@@ -608,3 +608,190 @@ class TestParseRetryAfter:
         response = MagicMock()
         response.headers = {"Retry-After": "invalid"}
         assert AnthropicBackend._parse_retry_after(response) is None
+
+
+# --- T-frontier-tier PR-B fix round: O-4 / O-5 -----------------------------------
+
+
+class _FakeStreamResponse:
+    """Minimal stand-in for the httpx response yielded by `client.stream`."""
+
+    def __init__(
+        self,
+        status_code: int,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aiter_lines(self):  # pragma: no cover - never reached on error paths
+        return
+        yield ""
+
+
+class _FakeStreamCM:
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeStreamResponse:
+        return self._response
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+async def _drain_stream(backend: AnthropicBackend, response: _FakeStreamResponse):
+    """Run chat_completions_stream against a canned error response."""
+    backend._client.stream = MagicMock(return_value=_FakeStreamCM(response))
+    request = {
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 16,
+    }
+    async for _ in backend.chat_completions_stream(request):
+        pass
+
+
+class TestErrorPassthroughStatusPreservation:
+    """O-4: 429 / 503 / 529 must survive as themselves under passthrough.
+
+    The public contract of `error_passthrough` (config.py, base.py,
+    README) promises the upstream's own status and body, rate limits
+    included. Before this round 429 and 503/529 were converted to
+    `BackendRateLimitError` / `BackendUnavailableError` *before* the
+    `>= 400` branch; neither is a `BackendUpstreamError`, so the routes'
+    generic handler flattened them into 502 — the exact shape the feature
+    says it does not emit.
+
+    The fix is deliberately confined to the opted-in backend: the
+    exception classes keep their parents (they are in
+    `RETRYABLE_EXCEPTIONS`, and re-parenting would move every tier's
+    retry semantics — msg-011 D-8 territory). Both halves are pinned
+    here, because "non-passthrough is unchanged" is the load-bearing
+    half.
+    """
+
+    @staticmethod
+    def _response(status: int, retry_after: str | None = None) -> MagicMock:
+        response = MagicMock()
+        response.status_code = status
+        response.headers = {} if retry_after is None else {"Retry-After": retry_after}
+        response.json.return_value = {
+            "type": "error",
+            "error": {"type": "rate_limit_error", "message": "slow down"},
+        }
+        response.text = "slow down"
+        return response
+
+    def test_passthrough_429_becomes_upstream_error_with_retry_after(self):
+        from lexora.backends.base import BackendUpstreamError
+
+        backend = AnthropicBackend(name="frontier", error_passthrough=True)
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            backend._handle_error_response(self._response(429, "30"))
+
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.retry_after == 30.0
+        assert exc_info.value.body["error"]["type"] == "rate_limit_error"
+
+    def test_non_passthrough_429_still_raises_rate_limit_error(self):
+        backend = AnthropicBackend(name="heavy")
+
+        with pytest.raises(BackendRateLimitError) as exc_info:
+            backend._handle_error_response(self._response(429, "30"))
+
+        assert exc_info.value.retry_after == 30.0
+
+    @pytest.mark.parametrize("status", [503, 529])
+    def test_passthrough_unavailable_becomes_upstream_error(self, status: int):
+        from lexora.backends.base import BackendUpstreamError
+
+        backend = AnthropicBackend(name="frontier", error_passthrough=True)
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            backend._handle_error_response(self._response(status))
+
+        assert exc_info.value.status_code == status
+
+    @pytest.mark.parametrize("status", [503, 529])
+    def test_non_passthrough_unavailable_unchanged(self, status: int):
+        backend = AnthropicBackend(name="heavy")
+
+        with pytest.raises(BackendUnavailableError):
+            backend._handle_error_response(self._response(status))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 503, 529])
+    async def test_streaming_passthrough_preserves_status(self, status: int):
+        from lexora.backends.base import BackendUpstreamError
+
+        backend = AnthropicBackend(name="frontier", error_passthrough=True)
+        response = _FakeStreamResponse(
+            status,
+            body=json.dumps({"error": {"message": "nope"}}).encode(),
+            headers={"Retry-After": "12"},
+        )
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            await _drain_stream(backend, response)
+
+        assert exc_info.value.status_code == status
+        assert exc_info.value.retry_after == 12.0
+
+    @pytest.mark.asyncio
+    async def test_streaming_non_passthrough_still_rate_limits(self):
+        backend = AnthropicBackend(name="heavy")
+        response = _FakeStreamResponse(429, headers={"Retry-After": "12"})
+
+        with pytest.raises(BackendRateLimitError):
+            await _drain_stream(backend, response)
+
+
+class TestStreamingErrorBodyDecoding:
+    """O-5: an undecodable error body must not crash the async generator.
+
+    Two call sites shared one defect. The `except` branch called
+    `bytes.decode()` with no `errors=`, and — less obvious — so did the
+    default argument of `body.get("error", {}).get("message", ...)`, which
+    Python evaluates eagerly even when the key is present. A UTF-16 body
+    reaches that second site precisely because `json.loads` *succeeds* on
+    it (RFC 4627 encoding auto-detection) while `bytes.decode()` does not.
+
+    Nothing catches `UnicodeDecodeError` around the generator, so either
+    site turned a forwardable upstream answer into a hard 500.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalid_utf8_error_body_yields_upstream_error(self):
+        from lexora.backends.base import BackendUpstreamError
+
+        backend = AnthropicBackend(name="frontier", error_passthrough=True)
+        response = _FakeStreamResponse(
+            500, body=b"\xff\xfe\x00binary WAF payload\x80\x81"
+        )
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            await _drain_stream(backend, response)
+
+        assert exc_info.value.status_code == 500
+
+    @pytest.mark.asyncio
+    async def test_utf16_json_error_body_yields_upstream_error(self):
+        """The site the gate missed: valid JSON that plain `.decode()` rejects."""
+        from lexora.backends.base import BackendUpstreamError
+
+        backend = AnthropicBackend(name="frontier", error_passthrough=True)
+        payload = json.dumps({"error": {"message": "declined"}}).encode("utf-16")
+        response = _FakeStreamResponse(400, body=payload)
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            await _drain_stream(backend, response)
+
+        assert exc_info.value.status_code == 400
+        assert "declined" in str(exc_info.value)
