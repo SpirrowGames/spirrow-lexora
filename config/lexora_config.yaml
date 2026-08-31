@@ -207,11 +207,10 @@ routing:
     #
     # LEXORA_FRONTIER_MODEL で env override 可能: create_settings が
     # tiers.frontier.model と backends.frontier.models[0].name の両方を
-    # 書き換える。Opus 5 差し替えは env 変数 1 つで済む。ただし価格 (Fable 5
-    # / Opus 5) は DEFAULT_PRICING にコード定数として置いてあるので、環境で
-    # モデル ID を差し替える時は cost_tracker.py の DEFAULT_PRICING も同時に
-    # 確認 — 未登録なら pricing_known=0 で warning が出る (silent 0.00 では
-    # なくなる、T-frontier-tier D-6c)。
+    # 書き換える。Opus 5 差し替えは env 変数 1 つで済む。価格は
+    # cost_tracker.py の DEFAULT_PRICING にコード定数として置く運用で、
+    # 未登録モデル ID は pricing_known=0 + cost_pricing_unknown warning
+    # で可視化される (silent 0.00 にはならない、T-frontier-tier D-6c)。
     #
     # fallback_backends: [] は「機構が復活しても格下げしない」宣言。frontier
     # を選ぶのはコストを払う意思表示であり、黙って heavy などに落ちると
@@ -235,6 +234,16 @@ routing:
       health_check: false
       default_max_tokens: 8000
       error_passthrough: true
+      # !!! 初回の課金呼び出し前に、実 Anthropic モデル ID と実 per-MTok
+      # 価格の両方を埋める !!! `claude-fable-5-20260101` は placeholder で、
+      # Anthropic が公開する実 ID とは違う可能性が高い。実 ID を
+      # `name:` に (または env `LEXORA_FRONTIER_MODEL` に) 入れ、同じ ID を
+      # `src/lexora/services/cost_tracker.py` の DEFAULT_PRICING に価格つきで
+      # 追加する。埋めるまでは frontier リクエストが
+      # pricing_known=0 の unpriced 行として台帳に載り、
+      # `cost_pricing_unknown` warning が出る (T-frontier-tier D-6c の
+      # 安全側デグラード)。placeholder が黙って通ることは無いが、
+      # 課金の突合 (要件 6) は price の実値が入るまで意味を持たない。
       models:
         - name: "claude-fable-5-20260101"
           capabilities: ["code", "reasoning", "analysis", "general", "frontier"]

@@ -158,29 +158,109 @@ class TestFrontierModelEnvOverride:
             asyncio.run(router.close())
 
 
-class TestFrontierPricing:
-    """T-frontier-tier D-6a: frontier candidate models are in DEFAULT_PRICING.
+class TestFrontierPricingHonestUnpriced:
+    """T-frontier-tier F-1 (msg-016): placeholder IDs must land unpriced.
 
-    Without an entry, ``pricing_known=0`` and cost records 0.00 with a
-    warning. That is safe (see D-6c: unpriced is distinguishable from
-    free), but it defeats the point of requirement 6 (frontier costs
-    must be visible for reconciliation against the vendor bill) — so
-    the shipped defaults for Fable 5 and Opus 5 are pinned here.
+    Original design tried to seed both Fable 5 and Opus 5 in
+    DEFAULT_PRICING so requirement 6 (reconcilable frontier costs)
+    would work at the shipped defaults. Bohr's spec review
+    (msg-016 F-1) — endorsed by Einstein (msg-018) — observed that
+    the price *and* the ID are both placeholders, so any entry
+    keyed to them writes a confident-wrong cost to the ledger,
+    which is the exact failure class D-6c was built to prevent
+    re-entering through the constant instead of the lookup.
+
+    The correct honest state until Anthropic's published IDs and
+    per-MTok figures are known: no Fable 5 / Opus 5 entries in
+    DEFAULT_PRICING; frontier requests degrade safely to
+    ``pricing_known=0`` and log ``cost_pricing_unknown``. These
+    tests pin the honest path so a future edit re-adding an
+    invented price is caught immediately.
     """
 
-    def test_default_frontier_model_priced(self) -> None:
+    def test_default_frontier_model_is_unpriced_until_verified(self) -> None:
+        """Placeholder IDs stay OUT of DEFAULT_PRICING until real numbers land."""
         from lexora.services.cost_tracker import DEFAULT_PRICING
 
         settings = create_settings(REPO_CONFIG)
         default_model = settings.routing.backends["frontier"].models[0].name
-        assert default_model in DEFAULT_PRICING, (
-            f"frontier default model {default_model!r} must have a price "
-            "entry so records are not silently zeroed (D-6c warning is a "
-            "safety net, not a substitute for correct data)."
+        assert default_model not in DEFAULT_PRICING, (
+            f"frontier default model {default_model!r} appears in "
+            "DEFAULT_PRICING; if you have added it, the price must be "
+            "from Anthropic's published pricing page with a citation "
+            "date in the constant's comment (msg-016 F-1). If the ID "
+            "is still a placeholder, remove the pricing entry — a "
+            "confident-wrong ledger row is worse than an unpriced one."
         )
 
-    def test_opus_5_priced_for_env_swap(self) -> None:
-        """Opus 5 is the other candidate; env swap must not land unpriced."""
+    def test_opus_5_placeholder_is_unpriced(self) -> None:
+        """The Opus 5 placeholder ID must not carry an invented price either."""
         from lexora.services.cost_tracker import DEFAULT_PRICING
 
-        assert "claude-opus-5-20260601" in DEFAULT_PRICING
+        assert "claude-opus-5-20260601" not in DEFAULT_PRICING, (
+            "Placeholder ID with placeholder price violates F-1 — "
+            "when the real Opus 5 ID and price are known, add both "
+            "together (never one without the other)."
+        )
+
+    def test_unpriced_frontier_records_pricing_known_zero(
+        self, tmp_path
+    ) -> None:
+        """End-to-end honest-path check: recording a frontier request against
+        the shipped default model yields ``pricing_known=0`` and the model
+        surfaces in ``unpriced_models``. If someone re-adds a fabricated
+        price entry this test flips (which is exactly what F-1 forbids)."""
+        from lexora.services.cost_tracker import CostTracker
+
+        settings = create_settings(REPO_CONFIG)
+        default_model = settings.routing.backends["frontier"].models[0].name
+
+        tracker = CostTracker(db_path=tmp_path / "costs.db")
+        tracker.record(
+            model=default_model,
+            endpoint="/v1/chat/completions",
+            tokens_input=100,
+            tokens_output=50,
+            tier="frontier",
+        )
+        rows = tracker.get_recent(limit=1)
+        assert rows[0]["pricing_known"] == 0
+        assert rows[0]["cost_usd"] == 0.0
+
+        report = tracker.get_costs(period="all")
+        assert default_model in report["unpriced_models"]
+        assert report["summary"]["unpriced_requests"] == 1
+
+
+class TestFrontierTierBackendModelAgreement:
+    """T-frontier-tier D-2 residual hazard (msg-016 (c) 2nd para): the
+    router derives ``_tier_to_model["frontier"]`` from
+    ``backends.frontier.models[0].name`` when ``tiers.frontier.model`` is
+    unset. The env hook writes both, so env-driven swaps cannot diverge.
+    A future YAML edit that sets ``tiers.frontier.model`` without
+    updating the backend entry (or vice versa) *would* reintroduce
+    the D-2 observability lie. This one-line invariant catches it.
+    """
+
+    def test_resolved_frontier_matches_backend_first_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("LEXORA_FRONTIER_MODEL", raising=False)
+        settings = create_settings(REPO_CONFIG)
+        backend_model = settings.routing.backends["frontier"].models[0].name
+        router = BackendRouter(
+            routing_settings=settings.routing,
+            vllm_settings=settings.vllm,
+        )
+        try:
+            assert router.resolve_model("frontier") == backend_model, (
+                "tiers.frontier.model and backends.frontier.models[0].name "
+                "have diverged. `/v1/models` advertises the backend's "
+                "first model, but the router will send the tier's model "
+                "upstream — the same observability lie D-2 was written "
+                "to prevent."
+            )
+        finally:
+            import asyncio
+
+            asyncio.run(router.close())

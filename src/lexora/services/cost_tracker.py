@@ -33,15 +33,17 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
     # Anthropic — Claude 4 series (Sonnet / Opus, per anthropic.com/pricing)
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-opus-4-20250514": {"input": 15.0, "output": 75.0},
-    # Anthropic — Claude 5 series (frontier tier candidates, T-frontier-tier).
-    # Prices are placeholders taken from the public pricing pages at the
-    # date noted here; the frontier tier defaults to Fable 5 but Opus 5
-    # is also seeded so an `LEXORA_FRONTIER_MODEL` swap does not silently
-    # land in the unpriced bucket. Update these entries alongside the
-    # vendor's next price change — recorded rows keep their historical
-    # cost, so a mid-life price change never rewrites the past.
-    "claude-fable-5-20260101": {"input": 5.0, "output": 25.0},
-    "claude-opus-5-20260601": {"input": 15.0, "output": 75.0},
+    # NOTE: Claude 5 series (Fable / Opus, the frontier tier candidates)
+    # are deliberately absent. This module refuses to invent prices for
+    # placeholder model IDs — an invented price keyed to an invented ID
+    # is written to the ledger as authoritative (D-6c's `pricing_known=1`
+    # path), which is the exact class of silent-wrong-billing that D-6c
+    # was built to prevent, re-entering through the constant instead of
+    # the lookup. When Anthropic publishes the real IDs and per-MTok
+    # prices, add them here **together** with a citation date; until
+    # then, frontier requests correctly land in the `pricing_known=0`
+    # bucket with a `cost_pricing_unknown` warning (see the config
+    # comment on `backends.frontier.models[0]`).
     # Claude Code (uses Anthropic pricing internally)
     "claude-code-sonnet": {"input": 3.0, "output": 15.0},
     "claude-code-opus": {"input": 15.0, "output": 75.0},
