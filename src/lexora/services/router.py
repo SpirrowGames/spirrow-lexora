@@ -279,6 +279,32 @@ class BackendRouter:
         an env override (e.g. ``LEXORA_FRONTIER_MODEL``) is observable here
         rather than needing a separate probe.
 
+        Every entry -- tier aliases included -- carries the four fields the
+        OpenAI Model object declares: ``id`` / ``object`` / ``created`` /
+        ``owned_by``. Omitting them does not raise in ``openai-python`` (it
+        builds responses through a non-validating path), which is worse than
+        a crash: the attributes come back as ``None`` on fields declared
+        ``int`` / ``str`` and blow up later and elsewhere, in
+        ``datetime.fromtimestamp(m.created)`` or a group-by on ``owned_by``.
+        Strictly-validating clients (``Model.model_validate``, typed Go/TS
+        clients, a schema-checking proxy) do reject the entry outright.
+
+        The two values for a tier alias:
+
+        * ``owned_by: "lexora"`` is a fact, not a placeholder. A tier alias is
+          defined by this gateway, not by the upstream vendor that serves the
+          resolved model.
+        * ``created: 0`` is a sentinel meaning "no creation time exists". A
+          tier alias is a config entry, not a published artifact. Mirroring
+          the resolved model's ``created`` was considered and rejected: it
+          would assert "this alias was created when that model was", which is
+          false, and a fabricated-but-plausible timestamp is worse than an
+          obvious epoch sentinel.
+
+        The additive keys (``type`` / ``backend`` / ``resolved_model``) are
+        kept: extra fields do not fail OpenAI-client validation, only missing
+        declared ones do.
+
         Returns:
             Combined models list in OpenAI format.
         """
@@ -307,6 +333,11 @@ class BackendRouter:
                 {
                     "id": tier_name,
                     "object": "model",
+                    # See the docstring: `owned_by` is a fact, `created: 0` is
+                    # a sentinel, and neither is mirrored from the resolved
+                    # model.
+                    "created": 0,
+                    "owned_by": "lexora",
                     "type": "tier",
                     "backend": backend_name,
                     "resolved_model": self._tier_to_model.get(tier_name),

@@ -148,6 +148,42 @@ class TestRequestConversion:
         result = backend._to_anthropic_request(request)
         assert result["max_tokens"] == 100
 
+    def test_explicit_none_max_tokens_falls_back_to_default(self):
+        """A present-but-None max_tokens must reach the configured default.
+
+        ``request.get("max_tokens", default)`` finds the key and returns None,
+        skipping the default and handing Anthropic a non-int it rejects. No
+        HTTP route can deliver this None today (the OpenAI-shaped routes
+        serialise with exclude_none), but backends are also called with a
+        plain dict from inside the process, where nothing strips it.
+        """
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": None,
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 8000
+
+    def test_explicit_zero_max_tokens_is_not_replaced_by_default(self):
+        """Regression detector for an `or`-shaped fix of the None case.
+
+        ``request.get("max_tokens") or self.default_max_tokens`` also swallows
+        an explicit 0, silently substituting the configured default for a
+        limit the caller stated -- a successful request the caller did not
+        ask for. 0 is invalid upstream and must stay 0 so it is rejected
+        loudly. Missing and invalid are different things.
+        """
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 0,
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 0
+
     def test_optional_params_passed(self, backend):
         request = {
             "model": "claude-sonnet-4-20250514",
