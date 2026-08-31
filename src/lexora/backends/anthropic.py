@@ -165,8 +165,23 @@ class AnthropicBackend(Backend):
 
         anthropic_req["messages"] = non_system_messages
 
-        # max_tokens is required by Anthropic
-        anthropic_req["max_tokens"] = request.get("max_tokens", self.default_max_tokens)
+        # max_tokens is required by Anthropic. Branch on `is None` rather than
+        # `request.get("max_tokens", self.default_max_tokens)`: a key that is
+        # present but explicitly None finds the key, returns None, and skips
+        # the default entirely -- Anthropic then rejects a non-int max_tokens.
+        # Today no HTTP entrypoint can deliver that None (the OpenAI-shaped
+        # routes serialise with exclude_none, /generate and /chat require an
+        # int), so this is boundary defence, not a live 400: backends are also
+        # called with a plain dict from inside the process (see
+        # services/task_classifier.py), where nothing strips the None.
+        # `or` is NOT the fix: it also swallows an explicit 0, silently
+        # substituting the configured default for a limit the caller stated.
+        # Missing and invalid must stay distinguishable -- 0 is passed through
+        # so upstream can reject it loudly.
+        max_tokens = request.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = self.default_max_tokens
+        anthropic_req["max_tokens"] = max_tokens
 
         # Pass through supported parameters
         if "temperature" in request:

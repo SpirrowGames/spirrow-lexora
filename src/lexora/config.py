@@ -97,7 +97,14 @@ class BackendSettings(BaseSettings):
             "Default max output tokens applied when a request omits max_tokens. "
             "Consumed by the gemini and anthropic backends (reasoning models spend "
             "output budget on thinking, so a generous default avoids empty "
-            "responses). None falls back to the backend's built-in default."
+            "responses). None falls back to the backend's built-in default. "
+            "Effective on /v1/chat/completions, /v1/completions, /generate and "
+            "/chat. NOT effective on /v1/messages: the Anthropic-shaped "
+            "converter (api/anthropic_compat.py) always sets max_tokens from "
+            "its own module constant, so the backend never sees the key "
+            "missing and this setting cannot apply. That predates this "
+            "setting and is tracked as a separate follow-up; do not read the "
+            "line above as covering /v1/messages until it is fixed."
         ),
     )
     paid_key_acknowledged: bool = Field(

@@ -271,9 +271,23 @@ retry:
 # 唯一の落とし先 claude は ANTHROPIC_API_KEY 未設定 ∴ 配線したら「死んだテキスト」が
 # 「本物の 401 格下げ」に化けるだけ。削除は可逆 (コードは git 履歴に残る)。
 # 再導入するなら **実装が先で config は後**。機構より先に config を出荷しない。
-# なお `BackendSettings` は extra="forbid" ∴ `fallback_backends:` を書き戻すと
-# 起動時に fail-loud で落ちる (silent には壊れない)。
-# repo 外の config コピー (/etc/lexora/config.yaml 等) も同じ操作で更新すること。
+# なお `BackendSettings` は extra="forbid" ∴ `fallback_backends:` が残っている
+# config で起動すると create_settings が ValidationError で落ちる。これを
+# 「fail-loud だから silent には壊れない」と読んではいけない: deploy/lexora.service
+# は Restart=always / RestartSec=5 ∴ 落ちたプロセスは 5 秒ごとに再起動を試みる
+# クラッシュループになり、journal を見ない限り観測される症状は「サービスが応答
+# しない」だけになる。lexora が naysayer backend を提供している場合、その症状は
+# 「独立レビューが返ってこない」として現れる。∴ 更新後の再起動前に検査すること。
+#
+# 検査行 (再起動の前に実行する):
+#   grep -n fallback_backends /opt/lexora/config/lexora_config.yaml /etc/lexora/config.yaml
+#
+# repo 外の config コピーも同じ操作で更新すること。パスは /etc だけではない:
+# config.py の探索順は config/lexora_config.yaml → lexora_config.yaml →
+# /etc/lexora/config.yaml で、先頭 2 つは lexora.service の
+# WorkingDirectory=/opt/lexora からの相対 ∴ README の手順どおりに入れた環境で
+# 実際にロードされるのは /opt/lexora/config/lexora_config.yaml であり、これが
+# /etc/lexora/config.yaml を shadow する。/etc だけを見ると false all-clear が出る。
 
 logging:
   level: "INFO"
