@@ -32,6 +32,19 @@ routing:
       backend: "gemini"
       model: "gemini-3.1-pro-preview"
       description: "naysayer (別訓練分布・最大独立性、native generateContent gate)"
+    # frontier: heavy とは別に「一番賢い有料モデル」の入口を独立させる
+    # (T-frontier-tier, 2026-08-31)。heavy はローカル vLLM (限界費用ゼロ)、
+    # frontier は Anthropic の課金モデル ∴ 呼び出し側は「コストを払う意思表示」
+    # として frontier を明示指定する。silent fallback / silent retry / silent
+    # 502 flattening は backends.frontier 側で全部止めている
+    # (fallback_backends: [], error_passthrough: true)。
+    # 初期モデル: Claude Fable 5 (Takahito 判断)。差し替えは
+    # LEXORA_FRONTIER_MODEL で env override 可能 — config.py の
+    # create_settings が読んで tiers.frontier.model と
+    # backends.frontier.models[0].name の両方を書き換える。
+    frontier:
+      backend: "frontier"
+      description: "最上位モデル (Anthropic Claude Fable 5 既定、env で差し替え可)"
 
   # タスク分類設定
   classifier:
@@ -175,6 +188,57 @@ routing:
         - name: "claude-sonnet-4-20250514"
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "Anthropic Claude Sonnet 4"
+      fallback_backends: []
+
+    # frontier: 「最上位モデル」の入口 (T-frontier-tier, 2026-08-31)。
+    # claude backend とは分ける — claude は heavy / claude_code の fallback
+    # 候補として名前が載っており、frontier をそこに相乗りさせると、
+    # FallbackService が将来配線された時に frontier が他ティアのフォールバック
+    # 先になってしまう。専用 backend にしておけば粒度が backend 単位で閉じ、
+    # 新しいノブを発明しなくて済む (default_max_tokens, error_passthrough,
+    # health_check, timeout, 価格の記録単位、全部 backend 単位)。
+    #
+    # 初期モデル: Claude Fable 5 (Takahito 判断)。Fable 5 は 30 日データ保持と
+    # 安全分類器 (decline 発生時は stop_reason: refusal → content_filter に
+    # マップされ、応答自体は upstream の 4xx で透過される)。これはデータ統治上
+    # の性質であり、frontier ティアを使うということはこの規約を受け入れると
+    # いう意思表示。gemini backend の paid_key_acknowledged / claude backend の
+    # ANTHROPIC_API_KEY と同じ、オーナー判断として明示する規律で config に残す。
+    #
+    # LEXORA_FRONTIER_MODEL で env override 可能: create_settings が
+    # tiers.frontier.model と backends.frontier.models[0].name の両方を
+    # 書き換える。Opus 5 差し替えは env 変数 1 つで済む。ただし価格 (Fable 5
+    # / Opus 5) は DEFAULT_PRICING にコード定数として置いてあるので、環境で
+    # モデル ID を差し替える時は cost_tracker.py の DEFAULT_PRICING も同時に
+    # 確認 — 未登録なら pricing_known=0 で warning が出る (silent 0.00 では
+    # なくなる、T-frontier-tier D-6c)。
+    #
+    # fallback_backends: [] は「機構が復活しても格下げしない」宣言。frontier
+    # を選ぶのはコストを払う意思表示であり、黙って heavy などに落ちると
+    # 「何のモデルで出た結果か」が失われる (T-frontier-tier msg-001 要件 3)。
+    #
+    # error_passthrough: true で upstream の 4xx / 5xx を透過し、429 / 拒否は
+    # 再試行しない (要件 4)。安全分類器の refusal もそのまま返す。
+    #
+    # default_max_tokens は reasoning モデル (Fable / Opus は thinking が
+    # output 枠を食う) 向けに広く取る。呼び出し側が max_tokens を明示すれば
+    # そちらが優先される。
+    frontier:
+      type: "anthropic"
+      url: "https://api.anthropic.com"
+      api_key_env: "ANTHROPIC_API_KEY"
+      timeout: 300.0
+      connect_timeout: 5.0
+      # 同上 — probe が本物の /v1/messages を発行し、401 を healthy と報告する
+      # ため誤った緑を避ける。ANTHROPIC_API_KEY 未設定でも起動できるが、
+      # 呼ぶと upstream 401 が透過される (壊れ方は可視)。
+      health_check: false
+      default_max_tokens: 8000
+      error_passthrough: true
+      models:
+        - name: "claude-fable-5-20260101"
+          capabilities: ["code", "reasoning", "analysis", "general", "frontier"]
+          description: "Anthropic Claude Fable 5 (frontier ティア既定モデル、30 日保持・分類器あり)"
       fallback_backends: []
 
 queue:

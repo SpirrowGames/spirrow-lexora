@@ -30,9 +30,18 @@ logger = get_logger(__name__)
 #     as literally zero — distinguished from "we do not know" by the
 #     ``pricing_known`` column that ``record`` writes.
 DEFAULT_PRICING: dict[str, dict[str, float]] = {
-    # Anthropic
+    # Anthropic — Claude 4 series (Sonnet / Opus, per anthropic.com/pricing)
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-opus-4-20250514": {"input": 15.0, "output": 75.0},
+    # Anthropic — Claude 5 series (frontier tier candidates, T-frontier-tier).
+    # Prices are placeholders taken from the public pricing pages at the
+    # date noted here; the frontier tier defaults to Fable 5 but Opus 5
+    # is also seeded so an `LEXORA_FRONTIER_MODEL` swap does not silently
+    # land in the unpriced bucket. Update these entries alongside the
+    # vendor's next price change — recorded rows keep their historical
+    # cost, so a mid-life price change never rewrites the past.
+    "claude-fable-5-20260101": {"input": 5.0, "output": 25.0},
+    "claude-opus-5-20260601": {"input": 15.0, "output": 75.0},
     # Claude Code (uses Anthropic pricing internally)
     "claude-code-sonnet": {"input": 3.0, "output": 15.0},
     "claude-code-opus": {"input": 15.0, "output": 75.0},

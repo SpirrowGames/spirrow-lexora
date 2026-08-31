@@ -1,5 +1,6 @@
 """Configuration management for Lexora using Pydantic Settings."""
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -359,6 +360,42 @@ def create_settings(config_path: Path | None = None) -> Settings:
         if classifier_config:
             routing_settings_kwargs["classifier"] = ClassifierSettings(**classifier_config)
 
+    routing_settings = (
+        RoutingSettings(**routing_settings_kwargs)
+        if routing_settings_kwargs
+        else RoutingSettings()
+    )
+
+    # Frontier model env override (T-frontier-tier D-2).
+    #
+    # A verbatim `LEXORA_ROUTING__TIERS__FRONTIER__MODEL` is NOT respected
+    # because `create_settings` builds `RoutingSettings(...)` above and
+    # passes it as a kwarg to `Settings(...)`; pydantic-settings gives init
+    # kwargs precedence over env, so a nested-delimiter env variable is
+    # silently ignored (measured 2026-08-31). Rather than restructure the
+    # YAML-first loader, expose the one variable the operator actually
+    # wants — `LEXORA_FRONTIER_MODEL` — and apply it to both places that
+    # need to agree:
+    #
+    #   1. `routing.tiers.frontier.model` — what the router resolves at
+    #      request time (drives cost tracker keying via D-6a).
+    #   2. `routing.backends.frontier.models[0].name` — what the
+    #      ModelRegistry / `/v1/models` / `/v1/models/capabilities`
+    #      surface as the frontier tier's concrete model.
+    #
+    # Doing only one produces an observable lie (the tier resolves to Opus
+    # 5 while capabilities keep advertising Fable 5). This function does
+    # both or neither.
+    frontier_model_env = os.environ.get("LEXORA_FRONTIER_MODEL")
+    if frontier_model_env:
+        frontier_tier = routing_settings.tiers.get("frontier")
+        frontier_backend = routing_settings.backends.get("frontier")
+        if frontier_tier is not None:
+            frontier_tier.model = frontier_model_env
+        if frontier_backend is not None and frontier_backend.models:
+            # Preserve capability / description metadata; only swap the ID.
+            frontier_backend.models[0].name = frontier_model_env
+
     return Settings(
         vllm=VLLMSettings(**vllm_config),
         server=ServerSettings(**server_config),
@@ -366,7 +403,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
         rate_limit=RateLimitSettings(**rate_limit_config),
         retry=RetrySettings(**retry_config),
         logging=LoggingSettings(**logging_config),
-        routing=RoutingSettings(**routing_settings_kwargs) if routing_settings_kwargs else RoutingSettings(),
+        routing=routing_settings,
         fallback=FallbackSettings(**fallback_config),
     )
 
