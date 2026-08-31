@@ -192,6 +192,11 @@ class TestMessagesEndpoint:
     def mock_backend(self) -> MagicMock:
         backend = MagicMock()
         backend.chat_completions = AsyncMock()
+        # Default off — MagicMock auto-creates truthy attributes on demand,
+        # so leaving this unset makes routes.py treat every mock backend
+        # as an error_passthrough backend (skipping retry + forwarding
+        # upstream statuses). Individual tests flip it to True as needed.
+        backend.error_passthrough = False
         return backend
 
     @pytest.fixture
@@ -363,6 +368,134 @@ class TestMessagesEndpoint:
         )
         assert resp.status_code == 400
         assert resp.json()["error"]["type"] == "invalid_request_error"
+
+    def test_upstream_error_default_returns_anthropic_502(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """T-frontier-tier D-4′: without passthrough, upstream 4xx still collapses
+        to 502 with the Anthropic error envelope (behaviour unchanged for
+        naysayer/claude/etc.)."""
+        from lexora.backends.base import BackendUpstreamError
+
+        mock_backend.chat_completions.side_effect = BackendUpstreamError(
+            "API error (400): declined",
+            status_code=400,
+            body={"type": "error", "error": {"type": "refusal", "message": "declined"}},
+            backend_name="claude",
+        )
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "naysayer",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "x"}],
+            },
+        )
+        # Non-passthrough backend → collapsed to 502 as before.
+        assert resp.status_code == 502
+        assert resp.json()["error"]["type"] == "api_error"
+
+    def test_upstream_error_passthrough_forwards_anthropic_body_verbatim(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """T-frontier-tier D-4′: passthrough backends whose upstream body is
+        already Anthropic-shaped forward it unchanged, so the SDK parses it
+        natively — a Fable/Opus classifier decline reaches the caller with
+        the same shape it would have from api.anthropic.com."""
+        from lexora.backends.base import BackendUpstreamError
+
+        mock_backend.error_passthrough = True
+        body = {"type": "error", "error": {"type": "refusal", "message": "declined"}}
+        mock_backend.chat_completions.side_effect = BackendUpstreamError(
+            "API error (400): declined",
+            status_code=400,
+            body=body,
+            backend_name="frontier",
+        )
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "frontier",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "x"}],
+            },
+        )
+        assert resp.status_code == 400
+        assert resp.json() == body
+
+    def test_upstream_error_passthrough_wraps_non_anthropic_body(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """T-frontier-tier D-4′: a passthrough backend whose upstream body is
+        NOT Anthropic-shaped (a plaintext error page, an OpenAI-shape body
+        from a future non-anthropic passthrough backend) still gets its
+        status preserved, and the raw body is carried inside the endpoint's
+        envelope rather than dropped."""
+        from lexora.backends.base import BackendUpstreamError
+
+        mock_backend.error_passthrough = True
+        mock_backend.chat_completions.side_effect = BackendUpstreamError(
+            "API error (500): boom",
+            status_code=500,
+            body="upstream 500 page",
+            backend_name="frontier",
+        )
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "frontier",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "x"}],
+            },
+        )
+        assert resp.status_code == 500
+        body = resp.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "api_error"
+        assert body["error"]["upstream"] == "upstream 500 page"
+
+    def test_passthrough_disables_retry_on_messages(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """T-frontier-tier D-4′: /v1/messages retry policy respects
+        error_passthrough — one billed call, not four, on a 429."""
+        from lexora.backends.base import BackendRateLimitError
+
+        mock_backend.error_passthrough = True
+        mock_backend.chat_completions.side_effect = BackendRateLimitError(
+            "rate limited", retry_after=1.0, backend_name="frontier"
+        )
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "frontier",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "x"}],
+            },
+        )
+        assert resp.status_code == 502  # not passthrough-shaped; but call count matters
+        assert mock_backend.chat_completions.await_count == 1
+
+    def test_non_passthrough_messages_still_retries(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """Baseline: default /v1/messages still retries rate-limits."""
+        from lexora.backends.base import BackendRateLimitError
+
+        mock_backend.chat_completions.side_effect = BackendRateLimitError(
+            "rate limited", retry_after=0.001, backend_name="claude"
+        )
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "naysayer",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": "x"}],
+            },
+        )
+        assert resp.status_code == 502
+        # RetryHandler in the fixture uses max_retries=1 → 2 calls total.
+        assert mock_backend.chat_completions.await_count == 2
 
     def test_rate_limit_returns_anthropic_429(
         self, mock_backend: MagicMock, mock_backend_router: MagicMock
