@@ -524,13 +524,35 @@ class GeminiBackend(Backend):
                     )
                 if response.status_code >= 400:
                     error_body = await response.aread()
+                    # Same defect and same fix as the anthropic streaming
+                    # error path: decode once, with replacement. Both call
+                    # sites here could raise UnicodeDecodeError -- the eager
+                    # `.get(..., default)` inside the `try` (Python evaluates
+                    # the default even when the key exists) and the bare
+                    # `.decode()` in the `except`, which is not itself
+                    # guarded and so escaped this async generator.
+                    #
+                    # This backend serves the loop's own independent
+                    # naysayer; a crash class fixed for one distribution is
+                    # fixed for both. The non-streaming twin above uses
+                    # `httpx.Response.text` (replacement decode already) and
+                    # is deliberately untouched.
+                    error_text = (
+                        error_body.decode(errors="replace") if error_body else ""
+                    )
                     try:
                         error_json = json.loads(error_body)
-                        error_message = error_json.get("error", {}).get(
-                            "message", error_body.decode()
-                        )
                     except Exception:
-                        error_message = error_body.decode()
+                        error_json = None
+                    if isinstance(error_json, dict):
+                        error_obj = error_json.get("error")
+                        error_message = (
+                            error_obj.get("message", error_text)
+                            if isinstance(error_obj, dict)
+                            else error_text
+                        )
+                    else:
+                        error_message = error_text
                     raise BackendError(
                         f"API error ({response.status_code}): {error_message}"
                     )

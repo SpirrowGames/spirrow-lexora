@@ -6,8 +6,17 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BeforeValidator, Field
+from pydantic import BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Backend types whose implementation actually honours ``error_passthrough``.
+#: This is a wiring fact, not a policy: ``backends/factory.py`` passes the
+#: flag to ``AnthropicBackend`` only, and only the anthropic backend raises
+#: ``BackendUpstreamError`` (gemini / vllm / openai_compatible raise plain
+#: ``BackendError``, which the routes flatten to 502 by design). Extending
+#: passthrough to a second backend means implementing it there and adding
+#: the type here — in that order.
+ERROR_PASSTHROUGH_TYPES: frozenset[str] = frozenset({"anthropic"})
 
 
 class ModelInfo(BaseSettings):
@@ -150,9 +159,39 @@ class BackendSettings(BaseSettings):
             "behaviour. Turn it on for a tier where the caller has explicitly "
             "chosen this upstream (e.g. frontier) and needs to see the actual "
             "answer — including a safety classifier decline — rather than a "
-            "gateway-flattened error message or a silently retried request."
+            "gateway-flattened error message or a silently retried request. "
+            "Only implemented for type 'anthropic'; setting it on any other "
+            "backend type is rejected at startup rather than accepted and "
+            "dropped (see ERROR_PASSTHROUGH_TYPES)."
         ),
     )
+
+    @model_validator(mode="after")
+    def _reject_unimplemented_error_passthrough(self) -> "BackendSettings":
+        """Fail loud when ``error_passthrough`` is set on a type that ignores it.
+
+        ``error_passthrough`` lives on ``BackendSettings``, i.e. every backend
+        type accepts the key — but the factory only forwards it to the
+        anthropic backend. Measured on every type: a config saying ``true``
+        produced a backend whose ``error_passthrough`` was ``False``, with no
+        exception and no warning.
+
+        That is the same defect this branch's sibling PR deleted from the
+        fallback machinery: an operator writes a setting, the gateway accepts
+        it, and the promised behaviour never happens. It is refused here for
+        the same reason it was refused there — a config that lies is worse
+        than a config that will not load.
+        """
+        if self.error_passthrough and self.type not in ERROR_PASSTHROUGH_TYPES:
+            supported = ", ".join(sorted(ERROR_PASSTHROUGH_TYPES))
+            raise ValueError(
+                f"error_passthrough is not implemented for backend type "
+                f"'{self.type}' (supported: {supported}). This backend would "
+                f"accept the setting and ignore it, so it is refused instead. "
+                f"Remove the key from this backend, or point the tier that "
+                f"needs verbatim upstream errors at a '{supported}' backend."
+            )
+        return self
 
     def get_model_names(self) -> list[str]:
         """Get list of model names for backward compatibility."""

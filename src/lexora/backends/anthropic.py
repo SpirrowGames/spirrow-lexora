@@ -264,22 +264,49 @@ class AnthropicBackend(Backend):
             response: HTTP response.
 
         Raises:
-            BackendRateLimitError: On 429 status.
-            BackendUnavailableError: On 529 (overloaded) or 503 status.
-            BackendUpstreamError: On other error statuses (4xx/5xx). Carries
-                the upstream status code and parsed body so callers that
-                opted into ``error_passthrough`` can forward them verbatim.
+            BackendRateLimitError: On 429 status -- only when
+                ``error_passthrough`` is off (see below).
+            BackendUnavailableError: On 529 (overloaded) or 503 status --
+                only when ``error_passthrough`` is off (see below).
+            BackendUpstreamError: On every other error status (4xx/5xx), and
+                on 429 / 503 / 529 when ``error_passthrough`` is on. Carries
+                the upstream status code, parsed body and Retry-After so
+                callers that opted in can forward them verbatim.
         """
-        if response.status_code == 429:
-            retry_after = self._parse_retry_after(response)
-            raise BackendRateLimitError(
-                "Rate limit exceeded (429)",
-                retry_after=retry_after,
-                backend_name=self.name,
-            )
+        # 429 / 503 / 529 are answers *from* the upstream, so under
+        # `error_passthrough` they must reach the caller with their own
+        # status. Converting them into this gateway's retry vocabulary is
+        # what produced the 502 the feature promises not to emit:
+        # `BackendRateLimitError` is a plain `BackendError`, so the route's
+        # generic handler flattened it.
+        #
+        # (a) Why not make BackendRateLimitError / BackendUnavailableError
+        #     subclasses of BackendUpstreamError instead: those two names are
+        #     in `retry_handler.RETRYABLE_EXCEPTIONS`, and `routes.py` orders
+        #     `except BackendUpstreamError` before `except BackendError`, so
+        #     re-parenting them changes isinstance semantics for the retry /
+        #     rate-limit path of *every* tier. That is the area msg-011 D-8
+        #     deliberately deferred ("rate limiting is not in the first
+        #     version"); one gate objection is not a reason to reopen it.
+        # (b) Non-passthrough backends are byte-for-byte unchanged: the
+        #     branch below is skipped only when `error_passthrough` is True,
+        #     which the factory can only set on this backend type.
+        # (c) This is the implementation of the sentence already written in
+        #     `base.py` BackendUpstreamError: "Everything besides the
+        #     passthrough path continues to see this as a plain
+        #     BackendError, so existing tiers keep the 502-on-error
+        #     behaviour."
+        if not self.error_passthrough:
+            if response.status_code == 429:
+                retry_after = self._parse_retry_after(response)
+                raise BackendRateLimitError(
+                    "Rate limit exceeded (429)",
+                    retry_after=retry_after,
+                    backend_name=self.name,
+                )
 
-        if response.status_code in (503, 529):
-            raise BackendUnavailableError("Backend is temporarily unavailable")
+            if response.status_code in (503, 529):
+                raise BackendUnavailableError("Backend is temporarily unavailable")
 
         if response.status_code >= 400:
             body: object | None
@@ -299,6 +326,7 @@ class AnthropicBackend(Backend):
                 f"API error ({response.status_code}): {error_message}",
                 status_code=response.status_code,
                 body=body,
+                retry_after=self._parse_retry_after(response),
                 backend_name=self.name,
             )
 
@@ -371,38 +399,65 @@ class AnthropicBackend(Backend):
             async with self._client.stream(
                 "POST", "/v1/messages", json=anthropic_req
             ) as response:
-                if response.status_code == 429:
-                    retry_after = self._parse_retry_after(response)
-                    raise BackendRateLimitError(
-                        "Rate limit exceeded (429)",
-                        retry_after=retry_after,
-                        backend_name=self.name,
-                    )
+                # Same passthrough rule as `_handle_error_response`; see the
+                # comment there for why the exception hierarchy is left alone.
+                if not self.error_passthrough:
+                    if response.status_code == 429:
+                        retry_after = self._parse_retry_after(response)
+                        raise BackendRateLimitError(
+                            "Rate limit exceeded (429)",
+                            retry_after=retry_after,
+                            backend_name=self.name,
+                        )
 
-                if response.status_code in (503, 529):
-                    raise BackendUnavailableError(
-                        "Backend is temporarily unavailable"
-                    )
+                    if response.status_code in (503, 529):
+                        raise BackendUnavailableError(
+                            "Backend is temporarily unavailable"
+                        )
 
                 if response.status_code >= 400:
                     error_body = await response.aread()
+                    # Decode exactly once, with replacement. Two separate
+                    # sites used to call `.decode()` with no `errors=`:
+                    # a WAF / proxy error page that is not valid UTF-8 raised
+                    # UnicodeDecodeError *inside* the `except Exception`
+                    # below, escaping this async generator entirely (nothing
+                    # outside catches UnicodeDecodeError) and turning a
+                    # forwardable upstream answer into a hard 500. The second
+                    # site was the `.get(..., default)` on the success path:
+                    # Python evaluates that default eagerly, so it ran even
+                    # when "message" was present -- and a UTF-16 body parses
+                    # fine through `json.loads` (RFC 4627 auto-detection)
+                    # while `bytes.decode()` on it fails.
+                    #
+                    # The non-streaming twin is NOT broken and is left alone:
+                    # `httpx.Response.text` already decodes with replacement.
+                    # Do not "fix" it -- doing so would tell the next reader
+                    # it had the same defect.
+                    error_text = (
+                        error_body.decode(errors="replace") if error_body else ""
+                    )
                     body: object | None
                     try:
                         body = json.loads(error_body)
                     except Exception:
-                        body = error_body.decode() if error_body else None
+                        body = error_text or None
                     if isinstance(body, dict):
-                        error_message = body.get("error", {}).get(
-                            "message", error_body.decode()
+                        error_obj = body.get("error")
+                        error_message = (
+                            error_obj.get("message", error_text)
+                            if isinstance(error_obj, dict)
+                            else error_text
                         )
                     elif isinstance(body, str):
                         error_message = body
                     else:
-                        error_message = ""
+                        error_message = error_text
                     raise BackendUpstreamError(
                         f"API error ({response.status_code}): {error_message}",
                         status_code=response.status_code,
                         body=body,
+                        retry_after=self._parse_retry_after(response),
                         backend_name=self.name,
                     )
 
