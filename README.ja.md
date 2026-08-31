@@ -19,7 +19,6 @@ Spirrow-Lexoraは、vLLM推論サーバーの前段に配置するプロキシ/�
 - 自動リトライ（Exponential Backoff + Retry-Afterヘッダー対応）
 - マルチバックエンドルーティング（モデルベースの自動ルーティング）
 - OpenAI互換APIバックエンド対応（OpenAI、Azure OpenAI等）
-- フォールバック機能（代替バックエンドへの自動切替）
 - 429レート制限対応（Retry-Afterヘッダー尊重）
 - モデル能力情報API（モデル一覧と各モデルのcapabilities取得）
 - タスク分類API（LLMによる最適モデル推奨）
@@ -38,7 +37,7 @@ Client → Lexora (Gateway) → vLLM (推論エンジン) → GPU
 ```
                               ┌→ vLLM-1 (model-a, model-b) → GPU
 Client → Lexora (Gateway) ────┼→ vLLM-2 (model-c, model-d) → GPU
-            :8001             └→ OpenAI API (gpt-4等) [フォールバック]
+            :8001             └→ OpenAI互換API (gpt-4等)
 ```
 
 ## 必要条件
@@ -91,8 +90,6 @@ python -m lexora.main
 | `LEXORA_RETRY__BASE_DELAY` | リトライ基本遅延（秒） | `1.0` |
 | `LEXORA_RETRY__RESPECT_RETRY_AFTER` | Retry-Afterヘッダーを尊重 | `true` |
 | `LEXORA_RETRY__MAX_RETRY_AFTER` | Retry-After最大遅延（秒） | `60.0` |
-| `LEXORA_FALLBACK__ENABLED` | 代替バックエンドへのフォールバックを有効化 | `true` |
-| `LEXORA_FALLBACK__ON_RATE_LIMIT` | 429レート制限時のフォールバックを許可 | `true` |
 | `LEXORA_LOGGING__LEVEL` | ログレベル | `INFO` |
 | `LEXORA_LOGGING__FORMAT` | ログフォーマット（`console`/`json`） | `console` |
 
@@ -123,10 +120,6 @@ retry:
   respect_retry_after: true   # 429レスポンスのRetry-Afterヘッダーを尊重
   max_retry_after: 60.0       # Retry-After最大遅延
 
-fallback:
-  enabled: true
-  on_rate_limit: true   # 429エラー時のフォールバックを許可
-
 logging:
   level: "INFO"
   format: "console"     # 本番環境では"json"
@@ -134,7 +127,7 @@ logging:
 
 ### マルチバックエンドルーティング設定
 
-複数のバックエンド（vLLM、OpenAI互換API）にモデルを分散配置し、フォールバックを設定できます：
+複数のバックエンド（vLLM、OpenAI互換API）にモデルを分散配置できます：
 
 ```yaml
 routing:
@@ -162,8 +155,6 @@ routing:
         - name: "llama3-70b"
           capabilities: ["reasoning", "general"]
           description: "汎用大規模モデル"
-      fallback_backends:              # 失敗時のフォールバック
-        - "openai_backup"
 
     secondary:
       type: "vllm"
@@ -175,8 +166,6 @@ routing:
           capabilities: ["summarization", "translation", "simple_qa"]
           description: "軽量タスク向け高速モデル"
         - "embedding-model"           # 従来形式もサポート（capabilities=["general"]）
-      fallback_backends:
-        - "openai_backup"
 
     openai_backup:
       type: "openai_compatible"       # OpenAI互換API
@@ -205,11 +194,13 @@ routing:
 | `vllm` | vLLMバックエンド（デフォルト） |
 | `openai_compatible` | OpenAI互換API（OpenAI、Azure OpenAI等） |
 
-**フォールバック機能:**
-- `fallback_backends`で代替バックエンドを指定
-- プライマリバックエンド失敗時（接続エラー、タイムアウト、503等）に自動切替
-- 429レート制限時もフォールバック可能（`fallback.on_rate_limit: true`で有効）
-- 複数のフォールバックを順番に試行
+**フォールバック機構は無い（2026-08-31 撤去）:** バックエンドの失敗は呼び出し側に
+エラーとして返り、別のバックエンドへ振り替えられることは無い。ここで設定していた
+`FallbackService` はリクエスト経路に一度も配線されておらず、それが読んでいた設定
+（`fallback:` / `fallback_backends:`）は運用者に「起きない自動切替」を約束していた
+∴ 配線ではなくコードと設定の両方を削除した。`BackendSettings` は未知キーを拒否する
+ので、config に `fallback_backends:` が残っていると黙って無視されるのではなく
+**起動時に落ちる**。
 
 ## APIエンドポイント
 
@@ -381,7 +372,7 @@ sudo systemctl enable --now lexora
 | Prometheusメトリクス | ✅ | メトリクスエクスポート |
 | マルチバックエンドルーティング | ✅ | モデルベースの自動ルーティング |
 | OpenAI互換バックエンド | ✅ | OpenAI、Azure OpenAI等のAPI対応 |
-| フォールバック対応 | ✅ | プライマリ失敗時の自動切替 |
+| フォールバック対応 | ❌ | 2026-08-31 撤去（未配線だった）。失敗は振り替えずエラーを返す |
 | 429レート制限対応 | ✅ | Retry-Afterヘッダー尊重 |
 | モデルcapabilities API | ✅ | モデル一覧と能力情報の取得 |
 | タスク分類 | ✅ | LLMによるタスク分類・モデル推奨 |
@@ -423,7 +414,6 @@ spirrow-lexora/
 │   │   ├── rate_limiter.py  # Token Bucketレートリミッター
 │   │   ├── retry_handler.py # Exponential Backoffリトライ + Retry-After
 │   │   ├── router.py        # マルチバックエンドルーティング
-│   │   ├── fallback.py      # フォールバックサービス
 │   │   ├── metrics.py       # Prometheusメトリクス
 │   │   ├── stats.py         # 統計収集
 │   │   ├── model_registry.py    # モデルcapabilitiesレジストリ
@@ -441,7 +431,6 @@ spirrow-lexora/
 ## ロードマップ
 
 - [x] OpenAI互換APIバックエンド対応
-- [x] フォールバック機能
 - [x] 429レート制限対応（Retry-After）
 - [x] モデルcapabilities API
 - [x] タスク分類による自動モデル推奨

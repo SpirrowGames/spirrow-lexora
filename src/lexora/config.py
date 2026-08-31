@@ -73,9 +73,6 @@ class BackendSettings(BaseSettings):
         default_factory=dict,
         description="Model name mapping (requested_name -> actual_name)",
     )
-    fallback_backends: list[str] = Field(
-        default_factory=list, description="List of fallback backend names"
-    )
     thinking_mode: Literal["think", "no_think"] | None = Field(
         default=None,
         description=(
@@ -97,9 +94,16 @@ class BackendSettings(BaseSettings):
         default=None,
         description=(
             "Default max output tokens applied when a request omits max_tokens. "
-            "Currently consumed by the gemini backend (reasoning models spend "
+            "Consumed by the gemini and anthropic backends (reasoning models spend "
             "output budget on thinking, so a generous default avoids empty "
-            "responses). None falls back to the backend's built-in default."
+            "responses). None falls back to the backend's built-in default. "
+            "Effective on /v1/chat/completions, /v1/completions, /generate and "
+            "/chat. NOT effective on /v1/messages: the Anthropic-shaped "
+            "converter (api/anthropic_compat.py) always sets max_tokens from "
+            "its own module constant, so the backend never sees the key "
+            "missing and this setting cannot apply. That predates this "
+            "setting and is tracked as a separate follow-up; do not read the "
+            "line above as covering /v1/messages until it is fixed."
         ),
     )
     paid_key_acknowledged: bool = Field(
@@ -234,15 +238,6 @@ class RetrySettings(BaseSettings):
     )
 
 
-class FallbackSettings(BaseSettings):
-    """Fallback settings."""
-
-    enabled: bool = Field(default=True, description="Enable fallback to alternative backends")
-    on_rate_limit: bool = Field(
-        default=True, description="Allow fallback on rate limit (429) errors"
-    )
-
-
 class LoggingSettings(BaseSettings):
     """Logging settings."""
 
@@ -268,7 +263,6 @@ class Settings(BaseSettings):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
-    fallback: FallbackSettings = Field(default_factory=FallbackSettings)
 
 
 def load_yaml_config(config_path: Path | None = None) -> dict:
@@ -319,7 +313,6 @@ def create_settings(config_path: Path | None = None) -> Settings:
     retry_config = yaml_config.get("retry", {})
     logging_config = yaml_config.get("logging", {})
     routing_config = yaml_config.get("routing", {})
-    fallback_config = yaml_config.get("fallback", {})
 
     # Parse backends if provided
     routing_settings_kwargs: dict = {}
@@ -354,7 +347,6 @@ def create_settings(config_path: Path | None = None) -> Settings:
         retry=RetrySettings(**retry_config),
         logging=LoggingSettings(**logging_config),
         routing=RoutingSettings(**routing_settings_kwargs) if routing_settings_kwargs else RoutingSettings(),
-        fallback=FallbackSettings(**fallback_config),
     )
 
 

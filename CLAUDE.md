@@ -149,8 +149,10 @@ backend が緑に見えていた。
 **`openai_gpt4` backend は 2026-08-11 に削除した。** `OPENAI_API_KEY` が無く常に 401 =
 常に unhealthy でありながら、遠端 (`api.openai.com`) が不定期に停止して `/health` を
 **20〜40s ブロック**していた (素の curl でも再現。`time_connect` / `time_appconnect` は常に高速で
-`time_starttransfer` だけが伸びる ∴ こちら側の問題ではない)。`heavy` / `light` の fallback 先でも
-あったが、キーが無いのでフォールバックしても 401 になるだけだった。再導入するならキー設定が先。
+`time_starttransfer` だけが伸びる ∴ こちら側の問題ではない)。当時の `heavy` / `light` は
+`fallback_backends` にこの backend を挙げていたが、その機構 (`FallbackService`) はそもそも
+配線されておらず動いていなかった (**2026-08-31 に機構ごと撤去**。`config/lexora_config.yaml`
+末尾の記録を参照)。再導入するならキー設定が先。
 
 結果: `/health` は 2.5s (最大 40s) → **0.056s、スパイクなし** (20 回連続で計測)。
 

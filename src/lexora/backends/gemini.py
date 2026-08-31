@@ -328,9 +328,14 @@ class GeminiBackend(Backend):
                 "parts": [{"text": "\n\n".join(system_parts)}]
             }
 
-        generation_config: dict[str, Any] = {
-            "maxOutputTokens": request.get("max_tokens", self.default_max_tokens)
-        }
+        # Same explicit-None branch as AnthropicBackend._to_anthropic_request;
+        # see the reasoning there. Kept in step deliberately: this backend
+        # serves the loop's own independent naysayer, so fixing only the
+        # anthropic side would leave the reviewer on the unfixed path.
+        max_tokens = request.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = self.default_max_tokens
+        generation_config: dict[str, Any] = {"maxOutputTokens": max_tokens}
         if "temperature" in request:
             generation_config["temperature"] = request["temperature"]
         if "top_p" in request:

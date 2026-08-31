@@ -114,6 +114,76 @@ class TestRequestConversion:
         result = backend._to_anthropic_request(request)
         assert result["max_tokens"] == DEFAULT_MAX_TOKENS
 
+    def test_default_max_tokens_configurable(self):
+        """T-frontier-tier D-7: BackendSettings.default_max_tokens is honoured.
+
+        A frontier tier that reserves a larger output budget (e.g. reasoning
+        models where thinking eats into the completion budget) needs to raise
+        this ceiling without touching the module constant.
+        """
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 8000
+
+    def test_default_max_tokens_none_falls_back(self):
+        backend = AnthropicBackend(default_max_tokens=None)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == DEFAULT_MAX_TOKENS
+
+    def test_explicit_max_tokens_wins_over_default(self):
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 100,
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 100
+
+    def test_explicit_none_max_tokens_falls_back_to_default(self):
+        """A present-but-None max_tokens must reach the configured default.
+
+        ``request.get("max_tokens", default)`` finds the key and returns None,
+        skipping the default and handing Anthropic a non-int it rejects. No
+        HTTP route can deliver this None today (the OpenAI-shaped routes
+        serialise with exclude_none), but backends are also called with a
+        plain dict from inside the process, where nothing strips it.
+        """
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": None,
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 8000
+
+    def test_explicit_zero_max_tokens_is_not_replaced_by_default(self):
+        """Regression detector for an `or`-shaped fix of the None case.
+
+        ``request.get("max_tokens") or self.default_max_tokens`` also swallows
+        an explicit 0, silently substituting the configured default for a
+        limit the caller stated -- a successful request the caller did not
+        ask for. 0 is invalid upstream and must stay 0 so it is rejected
+        loudly. Missing and invalid are different things.
+        """
+        backend = AnthropicBackend(default_max_tokens=8000)
+        request = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 0,
+        }
+        result = backend._to_anthropic_request(request)
+        assert result["max_tokens"] == 0
+
     def test_optional_params_passed(self, backend):
         request = {
             "model": "claude-sonnet-4-20250514",
@@ -233,6 +303,40 @@ class TestResponseConversion:
         }
         result = backend._to_openai_response(anthropic_resp, "claude-sonnet-4-20250514")
         assert result["choices"][0]["message"]["content"] == ""
+
+    def test_refusal_stop_reason_maps_to_content_filter(self, backend):
+        """T-frontier-tier D-4-4: safety classifier refusal is visible.
+
+        Previously the `refusal` stop_reason (emitted by the Anthropic
+        safety classifier on Fable/Opus 5-class models) fell through the
+        map to `stop`, making a decline indistinguishable from an ordinary
+        completion. The frontier tier spec requires the classifier's signal
+        to survive translation.
+        """
+        anthropic_resp = {
+            "id": "msg_refuse",
+            "content": [{"type": "text", "text": "I can't help with that."}],
+            "stop_reason": "refusal",
+            "usage": {"input_tokens": 10, "output_tokens": 6},
+        }
+        result = backend._to_openai_response(anthropic_resp, "claude-sonnet-4-20250514")
+        assert result["choices"][0]["finish_reason"] == "content_filter"
+
+    def test_unknown_stop_reason_still_produces_valid_shape(self, backend, caplog):
+        """Unmapped stop_reason coerces to `stop` and logs the raw value.
+
+        The OpenAI response shape stays valid, but the raw upstream signal
+        is recorded so a future new refusal / safety code is not silently
+        rounded off.
+        """
+        anthropic_resp = {
+            "id": "msg_novel",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "some_future_reason",
+            "usage": {"input_tokens": 5, "output_tokens": 3},
+        }
+        result = backend._to_openai_response(anthropic_resp, "claude-sonnet-4-20250514")
+        assert result["choices"][0]["finish_reason"] == "stop"
 
 
 class TestErrorHandling:

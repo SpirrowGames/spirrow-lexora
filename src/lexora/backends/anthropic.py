@@ -44,11 +44,16 @@ _UNSUPPORTED_PARAMS = {
     "functions",
 }
 
-# stop_reason mapping: Anthropic → OpenAI
+# stop_reason mapping: Anthropic → OpenAI. `refusal` is emitted by the
+# Anthropic safety classifier (e.g. Fable / Claude 5-class models) and must
+# be visible in the OpenAI-shaped response — collapsing it to "stop" would
+# make a decline indistinguishable from an ordinary completion, which is
+# exactly the shape of silent failure the frontier tier spec forbids.
 _STOP_REASON_MAP = {
     "end_turn": "stop",
     "stop_sequence": "stop",
     "max_tokens": "length",
+    "refusal": "content_filter",
 }
 
 
@@ -75,11 +80,19 @@ class AnthropicBackend(Backend):
         connect_timeout: float = 5.0,
         model_mapping: dict[str, str] | None = None,
         name: str | None = None,
+        default_max_tokens: int | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model_mapping = model_mapping or {}
         self.name = name
+        # None means "use the module default". BackendSettings carries this
+        # per-backend so a tier that needs a larger reservation (e.g. a
+        # reasoning frontier model that spends output budget on thinking) can
+        # set it without touching every other Anthropic backend.
+        self.default_max_tokens = (
+            default_max_tokens if default_max_tokens is not None else DEFAULT_MAX_TOKENS
+        )
 
         headers: dict[str, str] = {
             "Content-Type": "application/json",
@@ -149,8 +162,23 @@ class AnthropicBackend(Backend):
 
         anthropic_req["messages"] = non_system_messages
 
-        # max_tokens is required by Anthropic
-        anthropic_req["max_tokens"] = request.get("max_tokens", DEFAULT_MAX_TOKENS)
+        # max_tokens is required by Anthropic. Branch on `is None` rather than
+        # `request.get("max_tokens", self.default_max_tokens)`: a key that is
+        # present but explicitly None finds the key, returns None, and skips
+        # the default entirely -- Anthropic then rejects a non-int max_tokens.
+        # Today no HTTP entrypoint can deliver that None (the OpenAI-shaped
+        # routes serialise with exclude_none, /generate and /chat require an
+        # int), so this is boundary defence, not a live 400: backends are also
+        # called with a plain dict from inside the process (see
+        # services/task_classifier.py), where nothing strips the None.
+        # `or` is NOT the fix: it also swallows an explicit 0, silently
+        # substituting the configured default for a limit the caller stated.
+        # Missing and invalid must stay distinguishable -- 0 is passed through
+        # so upstream can reject it loudly.
+        max_tokens = request.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = self.default_max_tokens
+        anthropic_req["max_tokens"] = max_tokens
 
         # Pass through supported parameters
         if "temperature" in request:
@@ -184,8 +212,19 @@ class AnthropicBackend(Backend):
 
         content = "".join(content_parts)
 
-        # Map stop_reason
+        # Map stop_reason. Anything not in the map is still coerced to "stop"
+        # so the OpenAI shape stays valid, but the raw value is logged so a
+        # future upstream signal (a new refusal / safety code) is not silently
+        # rounded off — the rounding was recorded, and that record is what
+        # says "we do not know what this means yet".
         stop_reason = anthropic_resp.get("stop_reason", "end_turn")
+        if stop_reason not in _STOP_REASON_MAP:
+            logger.warning(
+                "anthropic_stop_reason_unmapped",
+                upstream_stop_reason=stop_reason,
+                backend=self.name,
+                model=model,
+            )
         finish_reason = _STOP_REASON_MAP.get(stop_reason, "stop")
 
         # Map usage
@@ -401,6 +440,13 @@ class AnthropicBackend(Backend):
                     elif event_type == "message_delta":
                         delta = event_data.get("delta", {})
                         stop_reason = delta.get("stop_reason", "end_turn")
+                        if stop_reason not in _STOP_REASON_MAP:
+                            logger.warning(
+                                "anthropic_stream_stop_reason_unmapped",
+                                upstream_stop_reason=stop_reason,
+                                backend=self.name,
+                                model=model,
+                            )
                         finish_reason = _STOP_REASON_MAP.get(stop_reason, "stop")
                         openai_chunk = {
                             "id": chunk_id,

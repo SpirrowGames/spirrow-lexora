@@ -218,6 +218,25 @@ class TestRequestConversion:
         result = backend._to_gemini_request(request)
         assert result["generationConfig"]["maxOutputTokens"] == 42
 
+    def test_explicit_none_max_tokens_falls_back_to_default(self):
+        """Same boundary as AnthropicBackend: present-but-None hits the default.
+
+        Kept in step with the anthropic backend on purpose -- this backend
+        serves the loop's own independent naysayer, so fixing only one side
+        would leave the reviewer on the unfixed path.
+        """
+        backend = GeminiBackend(name="test", default_max_tokens=8000)
+        request = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": None}
+        result = backend._to_gemini_request(request)
+        assert result["generationConfig"]["maxOutputTokens"] == 8000
+
+    def test_explicit_zero_max_tokens_is_not_replaced_by_default(self):
+        """Regression detector for an `or`-shaped fix; 0 must survive."""
+        backend = GeminiBackend(name="test", default_max_tokens=8000)
+        request = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 0}
+        result = backend._to_gemini_request(request)
+        assert result["generationConfig"]["maxOutputTokens"] == 0
+
     def test_none_default_falls_back_to_module_constant(self):
         backend = GeminiBackend(name="test", default_max_tokens=None)
         assert backend.default_max_tokens == DEFAULT_MAX_OUTPUT_TOKENS

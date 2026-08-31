@@ -140,6 +140,7 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             connect_timeout=settings.connect_timeout,
             model_mapping=settings.model_mapping,
             name=name,
+            default_max_tokens=settings.default_max_tokens,
         )
     elif settings.type == "claude_code":
         # Extract extra config from model_mapping (factory convention)
