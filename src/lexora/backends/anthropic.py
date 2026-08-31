@@ -315,8 +315,28 @@ class AnthropicBackend(Backend):
             except Exception:
                 body = response.text or None
             if isinstance(body, dict):
-                error_message = body.get("error", {}).get(
-                    "message", response.text
+                # `isinstance(body, dict)` guards the *outer* payload only.
+                # The `error` member is not guaranteed to be an object --
+                # `{"error": "Too Many Requests"}` and `{"error": [...]}` both
+                # arrive here -- and `.get("message")` on a str / list raises
+                # `AttributeError`. This `.get` chain sits outside the `try`
+                # above (narrowed to `response.json()` so `body` can be carried
+                # to the passthrough call sites), so nothing absorbs it: it
+                # escapes the backend and the route and the caller receives a
+                # 500 carrying this gateway's own type error instead of the
+                # upstream's answer.
+                #
+                # Same guard, same default, same shape as the streaming twin
+                # ~130 lines below. One file must not hold two answers to one
+                # question -- and the default stays `response.text` (the whole
+                # body) because that is the message `develop` produced before
+                # the `try` was narrowed. Restoring it is the point; improving
+                # on it would split the two paths again.
+                error_obj = body.get("error")
+                error_message = (
+                    error_obj.get("message", response.text)
+                    if isinstance(error_obj, dict)
+                    else response.text
                 )
             elif isinstance(body, str):
                 error_message = body
