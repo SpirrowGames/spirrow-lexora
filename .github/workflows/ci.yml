@@ -1,0 +1,40 @@
+name: CI
+
+# Trigger design (T-lexora-gate-and-ci D-6):
+#   - pull_request: no branches/paths/paths-ignore filters and no job-level
+#     if:. A PR-gate that skips this job leaves the checks rollup empty; the
+#     naysayer PR-review then short-circuits to UNKNOWN -> COMMENT and the PR
+#     can never be approved. The gate must always run.
+#   - push on main/develop: post-merge signal so those branches carry a green
+#     check independent of the PR that landed them.
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+# Least privilege: this job only reads the checked-out tree.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # Local runtime is ~21s; 15 minutes is generous headroom and, more
+    # importantly, prevents a hung job from leaving checks pending forever
+    # (which would stall the PR-gate the same way a missing job would).
+    timeout-minutes: 15
+    env:
+      # Pin the interpreter here, not via a repo-level .python-version file,
+      # so the implementer's local `uv run` keeps using the host interpreter
+      # that the 380-passed baseline was measured against. CI tests the
+      # declared floor (requires-python = ">=3.11"); local tests whatever the
+      # implementer runs on. Divergence is accepted because CI is authoritative
+      # (A-1) and CI is the stricter side.
+      UV_PYTHON: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      # Single source of truth: the gate script. Do not inline test commands
+      # here -- that would create a second SOT and defeat the point of the
+      # gate file.
+      - run: bash .mindwire-gate
