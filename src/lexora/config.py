@@ -73,9 +73,6 @@ class BackendSettings(BaseSettings):
         default_factory=dict,
         description="Model name mapping (requested_name -> actual_name)",
     )
-    fallback_backends: list[str] = Field(
-        default_factory=list, description="List of fallback backend names"
-    )
     thinking_mode: Literal["think", "no_think"] | None = Field(
         default=None,
         description=(
@@ -247,15 +244,6 @@ class RetrySettings(BaseSettings):
     )
 
 
-class FallbackSettings(BaseSettings):
-    """Fallback settings."""
-
-    enabled: bool = Field(default=True, description="Enable fallback to alternative backends")
-    on_rate_limit: bool = Field(
-        default=True, description="Allow fallback on rate limit (429) errors"
-    )
-
-
 class LoggingSettings(BaseSettings):
     """Logging settings."""
 
@@ -281,7 +269,6 @@ class Settings(BaseSettings):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
-    fallback: FallbackSettings = Field(default_factory=FallbackSettings)
 
 
 def load_yaml_config(config_path: Path | None = None) -> dict:
@@ -332,7 +319,6 @@ def create_settings(config_path: Path | None = None) -> Settings:
     retry_config = yaml_config.get("retry", {})
     logging_config = yaml_config.get("logging", {})
     routing_config = yaml_config.get("routing", {})
-    fallback_config = yaml_config.get("fallback", {})
 
     # Parse backends if provided
     routing_settings_kwargs: dict = {}
@@ -367,7 +353,6 @@ def create_settings(config_path: Path | None = None) -> Settings:
         retry=RetrySettings(**retry_config),
         logging=LoggingSettings(**logging_config),
         routing=RoutingSettings(**routing_settings_kwargs) if routing_settings_kwargs else RoutingSettings(),
-        fallback=FallbackSettings(**fallback_config),
     )
 
 

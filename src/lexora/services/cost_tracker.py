@@ -135,6 +135,17 @@ class CostTracker:
     ) -> tuple[float, bool]:
         """Calculate cost for a request.
 
+        .. note::
+
+            **Signature change (2026-08-31, T-frontier-tier D-6c).** This
+            method now returns ``tuple[float, bool]`` instead of ``float``;
+            the second element is ``pricing_known``. The change is required
+            for D-6c to distinguish "no vendor charge" (local vLLM at 0.0)
+            from "we do not have a price for this model" (silent 0.0 was
+            the pre-fix failure mode). Every in-tree caller was updated in
+            the same commit; grep for ``calculate_cost`` before rebasing
+            any external consumer.
+
         Args:
             model: Resolved (concrete) model name — never a tier alias.
             tokens_input: Number of input tokens.
