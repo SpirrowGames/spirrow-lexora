@@ -78,12 +78,22 @@ def _fail_preflight(
     endpoint: str,
     model: str,
     start_time: float,
-    error: Exception,
+    error: BaseException,
 ) -> None:
     """Close a request that failed in the streaming pre-flight.
 
-    Every early return out of a pre-flight block must pass through here.
-    Two reasons, and the second is the dangerous one:
+    **Every exit from a pre-flight block except "the first chunk was
+    grabbed" must pass through here** — not merely every early *return*.
+    An exception that leaves the handler is such an exit, and it is the
+    one the earlier wording missed: the block used to enumerate the
+    exception classes it closed the ledger for, and an enumeration says
+    nothing about the classes not in it. The last `except` clause of each
+    pre-flight is therefore `BaseException` (`asyncio.CancelledError` is
+    not an `Exception`), which closes the ledger and re-raises, so the
+    invariant is carried by the structure of the `try` rather than by a
+    list of types that has to be kept complete.
+
+    Two reasons it must be closed, and the second is the dangerous one:
 
     1. Without it the request never reaches the stats collector at all, so
        a caller can hammer a tier with rejected streaming requests and the
@@ -91,9 +101,9 @@ def _fail_preflight(
        the same endpoint has always counted its failures; this makes the
        two branches agree rather than inventing a new policy.
     2. ``record_request_start`` has already ``inc()``'d the ACTIVE_REQUESTS
-       gauge and only ``record_request_end`` ``dec()``s it. An early return
-       that registers the request but skips this call leaks in-flight
-       count permanently -- strictly worse than not counting at all.
+       gauge and only ``record_request_end`` ``dec()``s it. An exit that
+       registers the request but skips this call leaks in-flight count
+       permanently -- strictly worse than not counting at all.
 
     ``streaming=True``: the caller asked for a stream, so the attempt
     belongs with the other streaming outcomes even though the response
@@ -128,6 +138,52 @@ def _anthropic_passthrough_body(e: BackendUpstreamError) -> dict[str, Any]:
         "type": "error",
         "error": {
             "type": "api_error",
+            "message": str(e),
+        },
+    }
+    if body is not None:
+        envelope["error"]["upstream"] = body
+    return envelope
+
+
+def _openai_passthrough_body(e: BackendUpstreamError) -> dict[str, Any]:
+    """Shape a `BackendUpstreamError` body for OpenAI-family passthrough.
+
+    The OpenAI-family counterpart of `_anthropic_passthrough_body`, and it
+    exists for the same reason: **the endpoint's error envelope must stay a
+    JSON object.** Handing a non-dict body straight to `JSONResponse`
+    serialises it *as* JSON — a plaintext upstream page comes back as the
+    JSON string `"<html>...</html>"` under `content-type: application/json`,
+    which is a different response shape than every other error this endpoint
+    can return. `/v1/messages` has been wrapping that case since D-4′; the
+    OpenAI-family endpoints were the half of that decision that got missed.
+
+    A non-JSON body is reachable, not hypothetical: `anthropic.py` sets
+    ``body = response.text or None`` when ``response.json()`` fails, and
+    ``body = error_text or None`` on the streaming path, and `base.py`
+    documents the field as "raw text (str) when the body was not JSON".
+
+    The predicate is **"is it a dict"**, not "is it a str": a JSON body may
+    decode to a list or a number, and those serialise into a non-object
+    envelope exactly like a string does.
+
+    - dict -> forwarded verbatim, byte-for-byte as today. A passthrough
+      backend's own error object already carries the ``error.message`` an
+      OpenAI-family client reads, so wrapping it would be the data loss.
+    - anything else (str / list / number) -> wrapped, with the original
+      body preserved under ``error.upstream`` rather than dropped (D-4′:
+      a shape mismatch must never become data loss).
+    - ``None`` -> the same envelope without ``error.upstream``. This is the
+      one deliberate shape change: the previous ``{"error": {"message":
+      ...}}`` gains a ``type``, so all four call sites emit one envelope
+      instead of two near-identical ones. No test pinned the old shape.
+    """
+    body = e.body
+    if isinstance(body, dict):
+        return body
+    envelope: dict[str, Any] = {
+        "error": {
+            "type": "upstream_error",
             "message": str(e),
         },
     }
@@ -310,9 +366,7 @@ async def chat_completions(
                     start_time,
                     e,
                 )
-                content = (
-                    e.body if e.body is not None else {"error": {"message": str(e)}}
-                )
+                content = _openai_passthrough_body(e)
                 return JSONResponse(
                     status_code=e.status_code,
                     content=content,
@@ -334,6 +388,33 @@ async def chat_completions(
                     e,
                 )
                 raise HTTPException(status_code=502, detail=str(e)) from e
+            # ★ Last clause on purpose. The three above enumerate exception
+            # *classes*; this one carries the invariant itself, so a class
+            # nobody listed (a bare `RuntimeError` out of `_map_model` /
+            # `_to_anthropic_request` / `_to_gemini_request`, an httpx error
+            # it does not wrap, or `asyncio.CancelledError` — which is not an
+            # `Exception`) still closes the ledger instead of leaking
+            # ACTIVE_REQUESTS. `StopAsyncIteration` is an `Exception`, so the
+            # clause above it still wins. `raise` re-raises the original:
+            # a cancellation is not turned into an HTTP answer, and an
+            # `HTTPException` raised inside a sibling `except` clause does not
+            # re-enter this `try`, so the ledger is never closed twice.
+            except BaseException as e:
+                logger.error(
+                    "chat_completion_stream_preflight_unhandled",
+                    model=request.model,
+                    error=str(e),
+                )
+                _fail_preflight(
+                    stats_collector,
+                    stats,
+                    metrics_collector,
+                    endpoint,
+                    request.model,
+                    start_time,
+                    e,
+                )
+                raise
 
         async def stream_generator() -> AsyncIterator[bytes]:
             try:
@@ -514,7 +595,7 @@ async def chat_completions(
                 model=request.model,
                 upstream_status=e.status_code,
             )
-            content = e.body if e.body is not None else {"error": {"message": str(e)}}
+            content = _openai_passthrough_body(e)
             return JSONResponse(
                 status_code=e.status_code,
                 content=content,
@@ -636,9 +717,7 @@ async def completions(
                     start_time,
                     e,
                 )
-                content = (
-                    e.body if e.body is not None else {"error": {"message": str(e)}}
-                )
+                content = _openai_passthrough_body(e)
                 return JSONResponse(
                     status_code=e.status_code,
                     content=content,
@@ -660,6 +739,33 @@ async def completions(
                     e,
                 )
                 raise HTTPException(status_code=502, detail=str(e)) from e
+            # ★ Last clause on purpose. The three above enumerate exception
+            # *classes*; this one carries the invariant itself, so a class
+            # nobody listed (a bare `RuntimeError` out of `_map_model` /
+            # `_to_anthropic_request` / `_to_gemini_request`, an httpx error
+            # it does not wrap, or `asyncio.CancelledError` — which is not an
+            # `Exception`) still closes the ledger instead of leaking
+            # ACTIVE_REQUESTS. `StopAsyncIteration` is an `Exception`, so the
+            # clause above it still wins. `raise` re-raises the original:
+            # a cancellation is not turned into an HTTP answer, and an
+            # `HTTPException` raised inside a sibling `except` clause does not
+            # re-enter this `try`, so the ledger is never closed twice.
+            except BaseException as e:
+                logger.error(
+                    "completion_stream_preflight_unhandled",
+                    model=request.model,
+                    error=str(e),
+                )
+                _fail_preflight(
+                    stats_collector,
+                    stats,
+                    metrics_collector,
+                    endpoint,
+                    request.model,
+                    start_time,
+                    e,
+                )
+                raise
 
         async def stream_generator() -> AsyncIterator[bytes]:
             try:
@@ -822,7 +928,7 @@ async def completions(
                 model=request.model,
                 upstream_status=e.status_code,
             )
-            content = e.body if e.body is not None else {"error": {"message": str(e)}}
+            content = _openai_passthrough_body(e)
             return JSONResponse(
                 status_code=e.status_code,
                 content=content,
@@ -1674,6 +1780,34 @@ async def messages(
                 status_code=502,
                 content=anthropic_error_body("api_error", str(e)),
             )
+
+        # ★ Last clause on purpose. The three above enumerate exception
+        # *classes*; this one carries the invariant itself, so a class
+        # nobody listed (a bare `RuntimeError` out of `_map_model` /
+        # `_to_anthropic_request` / `_to_gemini_request`, an httpx error
+        # it does not wrap, or `asyncio.CancelledError` — which is not an
+        # `Exception`) still closes the ledger instead of leaking
+        # ACTIVE_REQUESTS. `StopAsyncIteration` is an `Exception`, so the
+        # clause above it still wins. `raise` re-raises the original:
+        # a cancellation is not turned into an HTTP answer, and an
+        # `HTTPException` raised inside a sibling `except` clause does not
+        # re-enter this `try`, so the ledger is never closed twice.
+        except BaseException as e:
+            logger.error(
+                "messages_stream_preflight_unhandled",
+                model=request.model,
+                error=str(e),
+            )
+            _fail_preflight(
+                stats_collector,
+                stats,
+                metrics_collector,
+                endpoint,
+                request.model,
+                start_time,
+                e,
+            )
+            raise
 
         async def replayed() -> AsyncIterator[bytes]:
             if first_chunk is not None:

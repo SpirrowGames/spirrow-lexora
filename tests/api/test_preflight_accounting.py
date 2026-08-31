@@ -21,6 +21,8 @@ metrics へ登録する。PR-B が新設した passthrough の pre-flight は
 ここにしか無い。
 """
 
+import asyncio
+import concurrent.futures
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
@@ -62,8 +64,13 @@ def _active_requests(endpoint: str) -> float:
     return 0.0 if value is None else value
 
 
-def _raising_stream(exc: Exception):
-    """A backend stream whose first `__anext__` raises."""
+def _raising_stream(exc: BaseException):
+    """A backend stream whose first `__anext__` raises.
+
+    `BaseException`, not `Exception`: `asyncio.CancelledError` is the
+    class the pre-flight must survive and it is deliberately outside the
+    `Exception` hierarchy.
+    """
 
     def factory(_request: dict) -> AsyncIterator[bytes]:
         async def gen() -> AsyncIterator[bytes]:
@@ -230,3 +237,87 @@ class TestStreamingPreflightIsCounted:
         assert stats["total_requests"] == 1
         assert stats["failed_requests"] == 1
         assert _active_requests("/v1/messages") == before
+
+
+PREFLIGHT_ENDPOINTS = [
+    ("/v1/chat/completions", "chat_completions_stream", CHAT_BODY),
+    ("/v1/completions", "completions_stream", COMPLETIONS_BODY),
+    ("/v1/messages", "chat_completions_stream", MESSAGES_BODY),
+]
+
+
+class TestPreflightUnlistedExceptionDoesNotLeak:
+    """O-6: 列挙されていない例外で抜けても台帳は閉じること。
+
+    上の TestStreamingPreflightIsCounted は pre-flight が **列挙した**
+    例外クラス (`BackendUpstreamError` / `BackendError` /
+    `GeminiGovernanceError`) について早期 return が `_fail_preflight` を
+    通ることを見張る。それは実装の変異は捕まえるが、**列挙の漏れ**は
+    捕まえない — `except` 節の列挙は、そこに書かれていない例外について
+    何も言わないからである。
+
+    リクエストは pre-flight より **前** に登録されるので、列挙外の例外が
+    route handler ごと抜けると `_fail_preflight` にも下流の
+    `stream_generator` にも入らず、ACTIVE_REQUESTS が恒久的にリークする。
+    しかも `total_requests` は 0 のまま — 拒否された呼び出しが台帳から
+    消えるという、このファイルが閉じたはずの穴が別の入口で開く。
+
+    列挙外の例外は仮定ではなく実在する: `_map_model` /
+    `_to_anthropic_request` / `_to_gemini_request` /
+    `_enforce_governance_gate` はどれも backend 側の `try` の外にあり、
+    async generator なので最初の `__anext__()` で走る。httpx も
+    `ConnectError` / `TimeoutException` / `HTTPError` しか包まないので、
+    閉じた client の再利用が投げる `RuntimeError` は素通りする。
+
+    `asyncio.CancelledError` を並べて測るのは、それが `Exception` ですら
+    ない = `except Exception` を足す修正では塞がらないことを固定するため。
+    ただし本テストが実証するのは「列挙外の例外一般」であって、
+    「クライアント切断が CancelledError を送出する」ことではない
+    (その因果はこのリポジトリでは未検証)。
+    """
+
+    @pytest.mark.parametrize(("endpoint", "stream_attr", "body"), PREFLIGHT_ENDPOINTS)
+    @pytest.mark.parametrize(
+        ("exc_factory", "escapes_as"),
+        [
+            (lambda: RuntimeError("boom"), RuntimeError),
+            # `asyncio.CancelledError` reaches the caller as
+            # `concurrent.futures.CancelledError`: TestClient drives the app
+            # through a blocking portal, and a cancelled portal future
+            # re-raises the *futures* class (measured: the two are distinct
+            # classes on this interpreter, and the futures one is even an
+            # `Exception` while the asyncio one is not). That translation is
+            # the harness's, not lexora's — what this test pins is that the
+            # exception is re-raised at all rather than swallowed into an
+            # HTTP answer, so either class satisfies it.
+            (
+                lambda: asyncio.CancelledError(),
+                (asyncio.CancelledError, concurrent.futures.CancelledError),
+            ),
+        ],
+        ids=["runtime-error", "cancelled-error"],
+    )
+    def test_unlisted_exception_closes_the_ledger(
+        self,
+        client: TestClient,
+        mock_backend: MagicMock,
+        stats_collector: StatsCollector,
+        endpoint: str,
+        stream_attr: str,
+        body: dict,
+        exc_factory,
+        escapes_as: type[BaseException] | tuple[type[BaseException], ...],
+    ) -> None:
+        setattr(mock_backend, stream_attr, _raising_stream(exc_factory()))
+        before = _active_requests(endpoint)
+
+        # (c) the exception is re-raised, not swallowed into an HTTP answer.
+        with pytest.raises(escapes_as):
+            client.post(endpoint, json=body)
+
+        # (b) a rejected call is still a call.
+        stats = stats_collector.get_stats()
+        assert stats["total_requests"] == 1
+        assert stats["failed_requests"] == 1
+        # (a) ★ the leak detector.
+        assert _active_requests(endpoint) == before
