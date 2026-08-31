@@ -41,8 +41,11 @@ routing:
     # 2026-08-31 に撤去したので、どの config でも格下げは起こせない (末尾の記録)。
     # 初期モデル: Claude Fable 5 (Takahito 判断)。差し替えは
     # LEXORA_FRONTIER_MODEL で env override 可能 — config.py の
-    # create_settings が読んで tiers.frontier.model と
-    # backends.frontier.models[0].name の両方を書き換える。
+    # create_settings が読んで tiers.frontier.model と、この tier の
+    # backend: が指す backend の models[0].name の両方を書き換える
+    # (backend 名は literal ではなく tier 経由で引く。名前は YAML の自由)。
+    # 両方に届かない config は起動を拒否する — 片方だけ適用すると
+    # 「指名したモデルの名前で別のモデルに課金される」ため (B-19)。
     frontier:
       backend: "frontier"
       description: "最上位モデル (Anthropic Claude Fable 5 既定、env で差し替え可)"
@@ -196,8 +199,12 @@ routing:
     # ANTHROPIC_API_KEY と同じ、オーナー判断として明示する規律で config に残す。
     #
     # LEXORA_FRONTIER_MODEL で env override 可能: create_settings が
-    # tiers.frontier.model と backends.frontier.models[0].name の両方を
-    # 書き換える。Opus 5 差し替えは env 変数 1 つで済む。価格は
+    # tiers.frontier.model と、tiers.frontier.backend が指す backend の
+    # models[0].name の両方を書き換える。この backend を literal 名
+    # "frontier" で引くと、tier を別名の backend に向けた config で
+    # 片方しか更新されない (PR #11 の gate が実測、B-19) ∴ 必ず tier
+    # 経由で引き、両方に届かない config は起動を拒否する。
+    # Opus 5 差し替えは env 変数 1 つで済む。価格は
     # cost_tracker.py の DEFAULT_PRICING にコード定数として置く運用で、
     # 未登録モデル ID は pricing_known=0 + cost_pricing_unknown warning
     # で可視化される (silent 0.00 にはならない、T-frontier-tier D-6c)。

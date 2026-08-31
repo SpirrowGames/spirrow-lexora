@@ -15,9 +15,14 @@ added 2026-08-31 when the fallback machinery was removed — see
    (measured 2026-08-31, root cause is init-kwarg > env precedence in
    pydantic-settings). This test file pins the single-variable hook
    that ``create_settings`` implements as the replacement and verifies
-   both write sites (tier model + backend model[0].name) are updated
-   in lockstep so the frontier tier's advertised capability never
-   disagrees with what the router actually sends upstream.
+   both write sites -- the tier's model and `models[0].name` on the
+   backend `tiers.frontier.backend` names -- are updated in lockstep,
+   so the frontier tier's advertised capability never disagrees with
+   what the router actually sends upstream. The second site is reached
+   through the tier, not by the literal backend name `frontier`; a
+   config where it cannot be reached refuses to start rather than
+   applying half the override (B-19, added 2026-09-01 after PR #11's
+   gate measured the half-applied case).
 """
 
 import importlib
@@ -26,7 +31,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from lexora.config import create_settings, load_yaml_config
+from lexora.config import Settings, create_settings, load_yaml_config
+from lexora.services.model_registry import ModelRegistry
 from lexora.services.router import BackendRouter
 from lexora.config import RoutingSettings, VLLMSettings
 
@@ -312,3 +318,296 @@ class TestFrontierTierBackendModelAgreement:
             import asyncio
 
             asyncio.run(router.close())
+
+
+# --- B-19: the frontier surface invariant, exercised across config shapes ---
+#
+# PR #11's gate found that the LEXORA_FRONTIER_MODEL hook reached its second
+# write site by the literal backend name "frontier" instead of through
+# tiers["frontier"].backend, so a YAML naming that backend anything else got
+# the tier updated and the advertised model left behind. The tests below are
+# written as one invariant applied to several config shapes rather than as a
+# list of cases, so the next config topology that breaks the invariant is
+# caught without anyone having thought to enumerate it.
+
+_HEAVY_BACKEND = """\
+    heavy:
+      type: "vllm"
+      url: "http://localhost:8000"
+      models:
+        - name: "Qwen3.8-27B"
+"""
+
+_PAID_BACKEND = """\
+    anthropic_paid:
+      type: "anthropic"
+      url: "https://api.anthropic.com"
+      error_passthrough: true
+      models:
+        - name: "claude-fable-5-20260101"
+          capabilities: ["code", "reasoning", "frontier"]
+          description: "Anthropic Claude Fable 5"
+"""
+
+_DECOY_BACKEND = """\
+    frontier:
+      type: "anthropic"
+      url: "https://api.anthropic.com"
+      error_passthrough: true
+      models:
+        - name: "claude-fable-5-20260101"
+          capabilities: ["code", "reasoning", "frontier"]
+          description: "unused - no tier points here"
+"""
+
+_FRONTIER_TIER_ON_PAID = """\
+    frontier:
+      backend: "anthropic_paid"
+"""
+
+
+def _routing_config(backends: str, tiers: str) -> str:
+    return (
+        "routing:\n"
+        "  enabled: true\n"
+        '  default_backend: "heavy"\n'
+        "  backends:\n"
+        f"{backends}"
+        "  tiers:\n"
+        f"{tiers}"
+    )
+
+
+def _write_config(tmp_path: Path, body: str) -> Path:
+    config_file = tmp_path / "lexora_config.yaml"
+    config_file.write_text(body, encoding="utf-8")
+    return config_file
+
+
+def assert_frontier_surface_agrees(settings: Settings) -> None:
+    """The frontier invariant, in one place.
+
+    What the router sends upstream for the ``frontier`` tier must be exactly
+    what ``/v1/models`` and ``/v1/models/capabilities`` advertise for it. The
+    advertised ID is ``models[0].name`` on the backend the tier points at --
+    found through ``tiers["frontier"].backend``, the same way the router finds
+    it, and deliberately not by the literal name ``frontier``: reading a
+    literal there is the defect this asserts against.
+    """
+    tier = settings.routing.tiers["frontier"]
+    advertised = settings.routing.backends[tier.backend].models[0].name
+    router = BackendRouter(
+        routing_settings=settings.routing,
+        vllm_settings=settings.vllm,
+    )
+    try:
+        assert router.get_backend_name_for_model("frontier") == tier.backend
+        assert router.resolve_model("frontier") == advertised, (
+            f"the frontier tier resolves to "
+            f"{router.resolve_model('frontier')!r} but backend "
+            f"{tier.backend!r} advertises {advertised!r}. The router would "
+            f"bill one model while /v1/models/capabilities named another -- "
+            f"the D-2 observability lie."
+        )
+    finally:
+        import asyncio
+
+        asyncio.run(router.close())
+
+
+class TestFrontierOverrideFollowsTheTierNotTheBackendName:
+    """``LEXORA_FRONTIER_MODEL`` must reach whichever backend the tier names.
+
+    ``TierSettings.backend`` is a free-form string the YAML chooses; only the
+    *tier* name ``frontier`` is public API (callers send ``model:
+    "frontier"``). The shipped config happens to name the backend ``frontier``
+    as well, which is exactly why the shipped-config tests above cannot see
+    this class of break.
+    """
+
+    OVERRIDE = "claude-opus-5-20260601"
+
+    def test_shipped_config_surface_agrees(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        settings = create_settings(REPO_CONFIG)
+        assert_frontier_surface_agrees(settings)
+        assert settings.routing.tiers["frontier"].model == self.OVERRIDE
+
+    def test_renamed_backend_surface_agrees(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The tier points at a backend that is NOT named ``frontier``.
+
+        Measured at e0fe315 (pre-fix): the tier resolved to Opus 5 while the
+        backend kept advertising Fable 5, and the override ID appeared on no
+        backend at all.
+        """
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        config_file = _write_config(
+            tmp_path,
+            _routing_config(
+                _HEAVY_BACKEND + _PAID_BACKEND, _FRONTIER_TIER_ON_PAID
+            ),
+        )
+        settings = create_settings(config_file)
+        assert_frontier_surface_agrees(settings)
+        assert (
+            settings.routing.backends["anthropic_paid"].models[0].name
+            == self.OVERRIDE
+        )
+
+    def test_renamed_backend_keeps_model_metadata(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Only the ID is swapped; capabilities / description survive.
+
+        The name assert is what makes this a detector rather than a
+        tautology: at e0fe315 the metadata survived only because nothing was
+        written to this backend at all.
+        """
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        config_file = _write_config(
+            tmp_path,
+            _routing_config(
+                _HEAVY_BACKEND + _PAID_BACKEND, _FRONTIER_TIER_ON_PAID
+            ),
+        )
+        settings = create_settings(config_file)
+        model = settings.routing.backends["anthropic_paid"].models[0]
+        assert model.name == self.OVERRIDE
+        assert model.capabilities == ["code", "reasoning", "frontier"]
+        assert model.description == "Anthropic Claude Fable 5"
+
+    def test_decoy_backend_named_frontier_is_not_rewritten(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A backend named ``frontier`` that no tier points at must be untouched.
+
+        Measured at e0fe315 (pre-fix) this was worse than a skipped update:
+        the override landed on the unused backend, so
+        ``/v1/models/capabilities`` advertised Opus 5 on a backend no request
+        could reach while the tier's real backend still advertised Fable 5.
+        """
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        config_file = _write_config(
+            tmp_path,
+            _routing_config(
+                _HEAVY_BACKEND + _PAID_BACKEND + _DECOY_BACKEND,
+                _FRONTIER_TIER_ON_PAID,
+            ),
+        )
+        settings = create_settings(config_file)
+        assert_frontier_surface_agrees(settings)
+        assert (
+            settings.routing.backends["frontier"].models[0].name
+            == "claude-fable-5-20260101"
+        )
+        registry = ModelRegistry(routing_settings=settings.routing)
+        unreachable = [
+            entry
+            for entry in registry.get_all_models()
+            if entry.id == self.OVERRIDE and entry.backend != "anthropic_paid"
+        ]
+        assert unreachable == [], (
+            "the override was advertised on a backend no tier resolves to: "
+            f"{unreachable}"
+        )
+
+
+class TestFrontierOverrideRefusesRatherThanApplyingHalf:
+    """B-19: "both or refuse", not "both or neither".
+
+    Setting ``LEXORA_FRONTIER_MODEL`` is an operator saying "bill me for this
+    model". Applying none of it silently bills them for the YAML default under
+    the name of the model they asked for, so a config the override cannot be
+    applied to in full does not start -- the same judgement as
+    ``BackendSettings._reject_unimplemented_error_passthrough`` ("a config that
+    lies is worse than a config that will not load").
+
+    ``match=`` is not decoration in these tests: pydantic's ``ValidationError``
+    subclasses ``ValueError``, so a bare ``pytest.raises(ValueError)`` would
+    pass just as happily if the config had failed to load for some entirely
+    unrelated reason.
+    """
+
+    OVERRIDE = "claude-opus-5-20260601"
+
+    UNRESOLVABLE_BACKEND = _routing_config(
+        _HEAVY_BACKEND,
+        '    frontier:\n      backend: "no_such_backend"\n',
+    )
+    EMPTY_MODELS = _routing_config(
+        _HEAVY_BACKEND
+        + "    anthropic_paid:\n"
+        '      type: "anthropic"\n'
+        '      url: "https://api.anthropic.com"\n'
+        "      models: []\n",
+        _FRONTIER_TIER_ON_PAID,
+    )
+    NO_FRONTIER_TIER = _routing_config(
+        _HEAVY_BACKEND + _DECOY_BACKEND,
+        '    heavy:\n      backend: "heavy"\n',
+    )
+
+    def test_refuses_when_tier_backend_does_not_exist(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        config_file = _write_config(tmp_path, self.UNRESOLVABLE_BACKEND)
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"names 'no_such_backend', which is not defined in "
+                r"routing\.backends"
+            ),
+        ):
+            create_settings(config_file)
+
+    def test_refuses_when_tier_backend_has_no_models(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        config_file = _write_config(tmp_path, self.EMPTY_MODELS)
+        with pytest.raises(ValueError, match=r"has an empty 'models' list"):
+            create_settings(config_file)
+
+    def test_refuses_when_there_is_no_frontier_tier(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        config_file = _write_config(tmp_path, self.NO_FRONTIER_TIER)
+        with pytest.raises(ValueError, match=r"has no 'frontier' tier"):
+            create_settings(config_file)
+
+    def test_refusal_message_names_the_variable_and_the_fix(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The operator reads this in a crash loop, not in a code review."""
+        monkeypatch.setenv("LEXORA_FRONTIER_MODEL", self.OVERRIDE)
+        config_file = _write_config(tmp_path, self.UNRESOLVABLE_BACKEND)
+        with pytest.raises(ValueError) as excinfo:
+            create_settings(config_file)
+        message = str(excinfo.value)
+        assert "LEXORA_FRONTIER_MODEL" in message
+        assert self.OVERRIDE in message
+        assert "routing.tiers.frontier.backend" in message
+
+    @pytest.mark.parametrize(
+        "body",
+        [UNRESOLVABLE_BACKEND, EMPTY_MODELS, NO_FRONTIER_TIER],
+        ids=["unresolvable_backend", "empty_models", "no_frontier_tier"],
+    )
+    def test_without_the_env_var_none_of_these_configs_are_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: str
+    ) -> None:
+        """The refusal is scoped to the env-override path and nothing else.
+
+        Without this, the next reader of the check is invited to promote it
+        into a whole-config validator and start refusing tier topologies that
+        have nothing to do with ``LEXORA_FRONTIER_MODEL``.
+        """
+        monkeypatch.delenv("LEXORA_FRONTIER_MODEL", raising=False)
+        config_file = _write_config(tmp_path, body)
+        create_settings(config_file)

@@ -90,7 +90,7 @@ Configuration is applied in the following priority order (later takes precedence
 | `LEXORA_RETRY__BASE_DELAY` | Base retry delay (seconds) | `1.0` |
 | `LEXORA_RETRY__RESPECT_RETRY_AFTER` | Respect Retry-After header | `true` |
 | `LEXORA_RETRY__MAX_RETRY_AFTER` | Max Retry-After delay (seconds) | `60.0` |
-| `LEXORA_FRONTIER_MODEL` | Concrete model ID served by the `frontier` tier (overrides the shipped default; updates both the routing tier and the backend's advertised model in lockstep) | shipped `frontier` tier default |
+| `LEXORA_FRONTIER_MODEL` | Concrete model ID served by the `frontier` tier (overrides the shipped default; updates both the routing tier and the advertised model of the backend that tier points at, in lockstep — a config where it cannot update both refuses to start) | shipped `frontier` tier default |
 | `LEXORA_LOGGING__LEVEL` | Log level | `INFO` |
 | `LEXORA_LOGGING__FORMAT` | Log format (`console`/`json`) | `console` |
 
@@ -221,7 +221,7 @@ Streaming caveat: for streaming requests the route pre-flights the first chunk f
 ```bash
 export LEXORA_FRONTIER_MODEL=claude-opus-5-20260601
 ```
-Both the tier resolution and `/v1/models{,/capabilities}` update together, so the surface never disagrees with what the router sends upstream. If you swap to a model ID that is not in `DEFAULT_PRICING`, cost records write `pricing_known=0` and log a `cost_pricing_unknown` warning — the ledger stays honest, but you should add the price entry before relying on `/stats/costs?tier=frontier` for reconciliation.
+Both the tier resolution and `/v1/models{,/capabilities}` update together, so the surface never disagrees with what the router sends upstream. The advertised model is found through `routing.tiers.frontier.backend`, so renaming that backend in the YAML does not quietly leave half the override behind; if the variable cannot be applied to both places — no `frontier` tier, a tier naming a backend that does not exist, or that backend having no `models` — the gateway refuses to start and names which of the three it hit. Being billed for Opus 5 under a config still advertising Fable 5 is the failure this trades a startup error for. If you swap to a model ID that is not in `DEFAULT_PRICING`, cost records write `pricing_known=0` and log a `cost_pricing_unknown` warning — the ledger stays honest, but you should add the price entry before relying on `/stats/costs?tier=frontier` for reconciliation.
 
 **Data governance:** Fable 5 has 30-day retention and a safety classifier. Using the frontier tier is an operator affirmation that this policy is acceptable for the traffic you route through it (analogous to `paid_key_acknowledged` on the Gemini backend and `ANTHROPIC_API_KEY` on the Claude backend — the config keeps these as owner decisions rather than hidden defaults). See the `frontier` backend comment in `config/lexora_config.yaml`.
 
