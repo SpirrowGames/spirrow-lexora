@@ -15,6 +15,7 @@ from lexora.backends.base import (
     BackendRateLimitError,
     BackendTimeoutError,
     BackendUnavailableError,
+    BackendUpstreamError,
 )
 from lexora.utils.logging import get_logger
 
@@ -81,6 +82,7 @@ class AnthropicBackend(Backend):
         model_mapping: dict[str, str] | None = None,
         name: str | None = None,
         default_max_tokens: int | None = None,
+        error_passthrough: bool = False,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -93,6 +95,7 @@ class AnthropicBackend(Backend):
         self.default_max_tokens = (
             default_max_tokens if default_max_tokens is not None else DEFAULT_MAX_TOKENS
         )
+        self.error_passthrough = error_passthrough
 
         headers: dict[str, str] = {
             "Content-Type": "application/json",
@@ -248,7 +251,9 @@ class AnthropicBackend(Backend):
         Raises:
             BackendRateLimitError: On 429 status.
             BackendUnavailableError: On 529 (overloaded) or 503 status.
-            BackendError: On other error statuses.
+            BackendUpstreamError: On other error statuses (4xx/5xx). Carries
+                the upstream status code and parsed body so callers that
+                opted into ``error_passthrough`` can forward them verbatim.
         """
         if response.status_code == 429:
             retry_after = self._parse_retry_after(response)
@@ -262,15 +267,24 @@ class AnthropicBackend(Backend):
             raise BackendUnavailableError("Backend is temporarily unavailable")
 
         if response.status_code >= 400:
+            body: object | None
             try:
-                error_body = response.json()
-                error_message = error_body.get("error", {}).get(
+                body = response.json()
+            except Exception:
+                body = response.text or None
+            if isinstance(body, dict):
+                error_message = body.get("error", {}).get(
                     "message", response.text
                 )
-            except Exception:
+            elif isinstance(body, str):
+                error_message = body
+            else:
                 error_message = response.text
-            raise BackendError(
-                f"API error ({response.status_code}): {error_message}"
+            raise BackendUpstreamError(
+                f"API error ({response.status_code}): {error_message}",
+                status_code=response.status_code,
+                body=body,
+                backend_name=self.name,
             )
 
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -357,15 +371,24 @@ class AnthropicBackend(Backend):
 
                 if response.status_code >= 400:
                     error_body = await response.aread()
+                    body: object | None
                     try:
-                        error_json = json.loads(error_body)
-                        error_message = error_json.get("error", {}).get(
+                        body = json.loads(error_body)
+                    except Exception:
+                        body = error_body.decode() if error_body else None
+                    if isinstance(body, dict):
+                        error_message = body.get("error", {}).get(
                             "message", error_body.decode()
                         )
-                    except Exception:
-                        error_message = error_body.decode()
-                    raise BackendError(
-                        f"API error ({response.status_code}): {error_message}"
+                    elif isinstance(body, str):
+                        error_message = body
+                    else:
+                        error_message = ""
+                    raise BackendUpstreamError(
+                        f"API error ({response.status_code}): {error_message}",
+                        status_code=response.status_code,
+                        body=body,
+                        backend_name=self.name,
                     )
 
                 chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"

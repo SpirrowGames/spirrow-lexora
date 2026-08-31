@@ -36,6 +36,10 @@ class TestAPI:
         backend.list_models = AsyncMock()
         backend.health_check = AsyncMock()
         backend.close = AsyncMock()
+        # Default to off — MagicMock auto-creates attributes as Mock objects
+        # (which are truthy), so leaving this unset would make every mock
+        # backend look like an error_passthrough backend to the routes.
+        backend.error_passthrough = False
         return backend
 
     @pytest.fixture
@@ -713,3 +717,106 @@ class TestStreamingChatCompletions(TestAPI):
             },
         )
         assert response.status_code == 429
+
+
+class TestChatCompletionsErrorPassthrough(TestAPI):
+    """T-frontier-tier PR-B: error_passthrough behaviour.
+
+    Two axes are pinned:
+
+    - Default off: existing tiers still see 502 with a stringified detail
+      when the upstream returns 4xx/5xx (behaviour unchanged, so no other
+      tier's response shape is disturbed by the frontier feature).
+    - Opt-in on: upstream status and body are forwarded verbatim, and the
+      retry handler is bypassed so a 429 / decline does not accrue extra
+      billed calls.
+    """
+
+    def test_upstream_error_default_backend_returns_502(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """error_passthrough=False (the default) preserves 502 shape."""
+        from lexora.backends.base import BackendUpstreamError
+
+        # Default MagicMock has no `error_passthrough`, so getattr(...) is False.
+        mock_backend.chat_completions.side_effect = BackendUpstreamError(
+            "API error (400): bad",
+            status_code=400,
+            body={"error": {"message": "bad"}},
+            backend_name="claude",
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        assert response.status_code == 502
+
+    def test_upstream_error_passthrough_forwards_status_and_body(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """error_passthrough=True forwards the upstream 400 verbatim."""
+        from lexora.backends.base import BackendUpstreamError
+
+        mock_backend.error_passthrough = True
+        mock_backend.chat_completions.side_effect = BackendUpstreamError(
+            "API error (400): declined",
+            status_code=400,
+            body={"error": {"type": "refusal", "message": "declined"}},
+            backend_name="frontier",
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "frontier", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        assert response.status_code == 400
+        assert response.json() == {"error": {"type": "refusal", "message": "declined"}}
+
+    def test_passthrough_disables_retry_on_rate_limit(
+        self, client: TestClient, mock_backend: MagicMock, retry_handler: RetryHandler
+    ) -> None:
+        """error_passthrough=True short-circuits retry so a 429 costs 1 call, not N.
+
+        Concretely: with the default retry handler (max_retries=1) a plain
+        BackendRateLimitError would produce 2 backend calls; with
+        passthrough on, the exception is not retried and the first response
+        is what the caller sees.
+        """
+        from lexora.backends.base import BackendRateLimitError
+
+        mock_backend.error_passthrough = True
+        mock_backend.chat_completions.side_effect = BackendRateLimitError(
+            "rate limited", retry_after=1.0, backend_name="frontier"
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "frontier", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+        # BackendRateLimitError is a BackendError but not a BackendUpstreamError,
+        # so it falls into the plain 502 path — which is fine, the point is
+        # that only ONE upstream call was made.
+        assert response.status_code == 502
+        assert mock_backend.chat_completions.await_count == 1
+
+    def test_non_passthrough_still_retries_rate_limit(
+        self, client: TestClient, mock_backend: MagicMock
+    ) -> None:
+        """Default backends still retry rate-limit errors (behaviour unchanged)."""
+        from lexora.backends.base import BackendRateLimitError
+
+        # error_passthrough absent → getattr returns False → retryable_exceptions=None
+        # → default RETRYABLE_EXCEPTIONS include BackendRateLimitError.
+        mock_backend.chat_completions.side_effect = BackendRateLimitError(
+            "rate limited", retry_after=0.001, backend_name="claude"
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+        assert response.status_code == 502
+        # max_retries=1 → 2 calls total: initial + one retry.
+        assert mock_backend.chat_completions.await_count == 2

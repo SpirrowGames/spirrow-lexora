@@ -33,7 +33,7 @@ from lexora.api.models import (
     ModelCapabilityInfo,
     StatsResponse,
 )
-from lexora.backends.base import BackendError
+from lexora.backends.base import BackendError, BackendUpstreamError
 from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
 from lexora.services.metrics import MetricsCollector
@@ -184,6 +184,39 @@ async def chat_completions(
 
     # Handle streaming request
     if request.stream:
+        # Pre-flight the first chunk for passthrough backends so an upstream
+        # refusal / auth failure surfaces as a proper HTTP status code
+        # (matching /v1/messages, routes.py in the anthropic-compat path)
+        # instead of a 200 SSE that closes with an error frame. Once bytes
+        # have flowed, only SSE-body passthrough is possible — this is a
+        # protocol limit, and the frontier docs note it.
+        first_chunk: bytes | None = None
+        byte_iter = None
+        passthrough = getattr(backend, "error_passthrough", False)
+        if passthrough:
+            byte_iter = backend.chat_completions_stream(request_dict).__aiter__()
+            try:
+                first_chunk = await byte_iter.__anext__()
+            except StopAsyncIteration:
+                first_chunk = None
+            except BackendUpstreamError as e:
+                logger.warning(
+                    "chat_completion_stream_upstream_passthrough",
+                    model=request.model,
+                    upstream_status=e.status_code,
+                )
+                content = (
+                    e.body if e.body is not None else {"error": {"message": str(e)}}
+                )
+                return JSONResponse(status_code=e.status_code, content=content)
+            except BackendError as e:
+                logger.error(
+                    "chat_completion_stream_preflight_error",
+                    model=request.model,
+                    error=str(e),
+                )
+                raise HTTPException(status_code=502, detail=str(e)) from e
+
         stats = stats_collector.start_request(
             endpoint=endpoint,
             model=request.model,
@@ -197,8 +230,14 @@ async def chat_completions(
 
         async def stream_generator() -> AsyncIterator[bytes]:
             try:
-                async for chunk in backend.chat_completions_stream(request_dict):
-                    yield chunk
+                if passthrough and byte_iter is not None:
+                    if first_chunk is not None:
+                        yield first_chunk
+                    async for chunk in byte_iter:
+                        yield chunk
+                else:
+                    async for chunk in backend.chat_completions_stream(request_dict):
+                        yield chunk
 
                 # Mark as successful on stream completion
                 duration = time.time() - start_time
@@ -285,7 +324,18 @@ async def chat_completions(
         async def do_request() -> dict[str, Any]:
             return await backend.chat_completions(request_dict)
 
-        response, retries = await retry_handler.execute(do_request)
+        # `error_passthrough` backends (e.g. frontier) must not have their
+        # rate-limit / decline retried into extra billed calls: passing an
+        # empty tuple to `retryable_exceptions` disables retry without any
+        # new machinery — the existing handler simply catches nothing.
+        retryable = (
+            ()
+            if getattr(backend, "error_passthrough", False)
+            else None
+        )
+        response, retries = await retry_handler.execute(
+            do_request, retryable_exceptions=retryable
+        )
 
         # Extract token counts from response if available
         usage = response.get("usage", {})
@@ -338,6 +388,29 @@ async def chat_completions(
 
         return response
 
+    except BackendUpstreamError as e:
+        duration = time.time() - start_time
+        stats_collector.complete_request(stats, success=False, error=str(e))
+        if metrics_collector:
+            metrics_collector.record_request_end(
+                endpoint=endpoint,
+                model=request.model,
+                status="error",
+                duration=duration,
+            )
+        # Passthrough: forward the upstream status and body verbatim.
+        # Non-passthrough backends (existing behaviour) still get 502 with a
+        # stringified detail so the pre-frontier response shape is unchanged.
+        if getattr(backend, "error_passthrough", False):
+            logger.warning(
+                "chat_completion_upstream_passthrough",
+                model=request.model,
+                upstream_status=e.status_code,
+            )
+            content = e.body if e.body is not None else {"error": {"message": str(e)}}
+            return JSONResponse(status_code=e.status_code, content=content)
+        logger.error("chat_completion_error", model=request.model, error=str(e))
+        raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
         duration = time.time() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))

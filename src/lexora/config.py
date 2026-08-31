@@ -135,6 +135,19 @@ class BackendSettings(BaseSettings):
             "configured'. Skipping does NOT disable the backend."
         ),
     )
+    error_passthrough: bool = Field(
+        default=False,
+        description=(
+            "When true, upstream 4xx/5xx answers are forwarded to the caller "
+            "with the upstream status and body preserved, and automatic retry "
+            "on rate-limit / connection / timeout is disabled for this "
+            "backend. Off by default so existing tiers keep the 502-on-error "
+            "behaviour. Turn it on for a tier where the caller has explicitly "
+            "chosen this upstream (e.g. frontier) and needs to see the actual "
+            "answer — including a safety classifier decline — rather than a "
+            "gateway-flattened error message or a silently retried request."
+        ),
+    )
 
     def get_model_names(self) -> list[str]:
         """Get list of model names for backward compatibility."""

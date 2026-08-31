@@ -348,6 +348,38 @@ class TestErrorHandling:
 
         assert "Invalid request" in str(exc_info.value)
 
+    def test_400_raises_upstream_error_with_body_and_status(self, backend):
+        """T-frontier-tier D-4: upstream 4xx carries status + parsed body."""
+        from lexora.backends.base import BackendUpstreamError
+
+        response = MagicMock()
+        response.status_code = 400
+        response.headers = {}
+        response.json.return_value = {"error": {"type": "refusal", "message": "declined"}}
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            backend._handle_error_response(response)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.body == {"error": {"type": "refusal", "message": "declined"}}
+        assert exc_info.value.backend_name == "test"
+
+    def test_upstream_error_falls_back_to_text_body(self, backend):
+        """A non-JSON error body is preserved as a string, not dropped."""
+        from lexora.backends.base import BackendUpstreamError
+
+        response = MagicMock()
+        response.status_code = 500
+        response.headers = {}
+        response.json.side_effect = ValueError("not JSON")
+        response.text = "internal server error page"
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            backend._handle_error_response(response)
+
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.body == "internal server error page"
+
     def test_200_no_error(self, backend):
         response = MagicMock()
         response.status_code = 200
