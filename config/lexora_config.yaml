@@ -66,8 +66,6 @@ routing:
         - name: "Qwen3.8-27B"
           capabilities: ["code", "reasoning", "analysis"]
           description: "複雑なタスク向け (thinking mode)"
-      fallback_backends:
-        - "claude"
 
     light:
       type: "vllm"
@@ -79,7 +77,6 @@ routing:
         - name: "Qwen3.8-27B"
           capabilities: ["summarization", "translation", "simple_qa", "general"]
           description: "軽量タスク向け (non-thinking mode)"
-      fallback_backends: []
 
     # heavy ティア用。2026-08-18 に Anthropic API から移した。
     # 背景: ANTHROPIC_API_KEY 未設定で heavy は 502 のまま死んでいた。CPU + メインメモリ
@@ -101,17 +98,15 @@ routing:
         - name: "Qwen3.8-27B"
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "複雑なタスク向け (thinking mode, reasoning_effort=xhigh)"
-      # fallback は付けない。同じ vLLM を見ている medium が死ぬときは deep も死ぬし、
-      # 鍵の無い claude に落としても 502 が別の 502 になるだけで診断を濁す。
-      fallback_backends: []
 
     # openai_gpt4 backend removed 2026-08-11.
     # OPENAI_API_KEY は設定されておらず、常に 401 = 常に unhealthy だった。
     # その上で GET /health は毎回 api.openai.com を叩いており、遠端が不定期に
     # 停止して 20〜40s ブロックする (素の curl でも再現、time_connect /
     # time_appconnect は常に高速で time_starttransfer だけが伸びる)。
-    # heavy / light の fallback 先でもあったが、キーが無いのでフォールバック
-    # しても 401 になるだけだった。再導入するならキー設定が先。
+    # 当時の heavy / light は fallback_backends にこの backend を挙げていたが、
+    # その機構 (FallbackService) はそもそも配線されておらず動いていなかった
+    # (2026-08-31 に撤去。末尾の記録を参照)。再導入するならキー設定が先。
 
     # Google Gemini API (native generateContent, naysayer 用)
     gemini:
@@ -145,7 +140,6 @@ routing:
         - name: "gemini-3.1-pro-preview"
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "Google Gemini 3.1 Pro Preview (naysayer, native generateContent)"
-      fallback_backends: []
 
     # Claude Code CLI (non-interactive mode)
     claude_code:
@@ -168,8 +162,6 @@ routing:
         "model": "sonnet"  # default CLI model
         "max_turns": "1"  # prevent agentic tool use for simple completions
         # "working_dir": "/home/sgadmin"
-      fallback_backends:
-        - "claude"
 
     # Anthropic Claude API
     claude:
@@ -188,7 +180,6 @@ routing:
         - name: "claude-sonnet-4-20250514"
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "Anthropic Claude Sonnet 4"
-      fallback_backends: []
 
     # frontier: 「最上位モデル」の入口 (T-frontier-tier, 2026-08-31)。
     # claude backend とは分ける — claude は heavy / claude_code の fallback
@@ -267,18 +258,21 @@ retry:
   respect_retry_after: true
   max_retry_after: 60.0
 
-# fallback: このセクションと各 backend の fallback_backends は
-# `FallbackService` (src/lexora/services/fallback.py) に読ませる意図で
-# 書かれているが、2026-08-31 時点でこのサービスは main.py から構築されて
-# おらず、routes.py はどこからも呼んでいない。∴ 実行時にはフォールバック
-# は一度も走らない — `heavy: fallback_backends: ["claude"]` は「効いている
-# opt-in」ではなく、機構が復活した時のための宣言。逆に空リスト
-# (deep / gemini / claude) も「効いている opt-out」ではなく、機構が復活
-# した時に落ちないという宣言。frontier を追加するときも同じ規律で書く。
-# 配線するか削除するかは follow-up 予定 (owner: Bohr)。
-fallback:
-  enabled: true
-  on_rate_limit: true
+# fallback 機構は 2026-08-31 に撤去した。ここには `fallback: enabled / on_rate_limit`
+# のセクションがあり、各 backend には `fallback_backends:` があった。
+# 撤去した理由: `FallbackService` (src/lexora/services/fallback.py) は 73853e7 で
+# 生まれてから一度も配線されたことが無い (main.py は構築せず routes.py は呼ばない)。
+# ∴ 実行時にフォールバックは一度も走っていないのに、この config は
+# `enabled: true` と `heavy: fallback_backends: ["claude"]` を出荷し続けていた =
+# 運用者への偽の約束だった (upstream の 429 でフォールバックを期待するが、
+# 実際にはルーティングごと失敗する)。
+# 配線ではなく削除を選んだ理由: フォールバックを必要とする要求がどこにも無く、
+# 唯一の落とし先 claude は ANTHROPIC_API_KEY 未設定 ∴ 配線したら「死んだテキスト」が
+# 「本物の 401 格下げ」に化けるだけ。削除は可逆 (コードは git 履歴に残る)。
+# 再導入するなら **実装が先で config は後**。機構より先に config を出荷しない。
+# なお `BackendSettings` は extra="forbid" ∴ `fallback_backends:` を書き戻すと
+# 起動時に fail-loud で落ちる (silent には壊れない)。
+# repo 外の config コピー (/etc/lexora/config.yaml 等) も同じ操作で更新すること。
 
 logging:
   level: "INFO"

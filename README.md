@@ -19,7 +19,6 @@ Spirrow-Lexora is a proxy/gateway that sits in front of vLLM inference servers. 
 - Automatic retry with exponential backoff and Retry-After header support
 - Multi-backend routing with automatic model-based routing
 - OpenAI-compatible API backend support (OpenAI, Azure OpenAI, etc.)
-- Fallback functionality (automatic failover to alternative backends)
 - 429 rate limit handling with Retry-After header respect
 - Model capabilities API (list models with their capabilities)
 - Task classification API (LLM-based optimal model recommendation)
@@ -38,7 +37,7 @@ Client → Lexora (Gateway) → vLLM (Inference Engine) → GPU
 ```
                               ┌→ vLLM-1 (model-a, model-b) → GPU
 Client → Lexora (Gateway) ────┼→ vLLM-2 (model-c, model-d) → GPU
-            :8001             └→ OpenAI API (gpt-4, etc.) [fallback]
+            :8001             └→ OpenAI-compatible API (gpt-4, etc.)
 ```
 
 ## Requirements
@@ -91,8 +90,6 @@ Configuration is applied in the following priority order (later takes precedence
 | `LEXORA_RETRY__BASE_DELAY` | Base retry delay (seconds) | `1.0` |
 | `LEXORA_RETRY__RESPECT_RETRY_AFTER` | Respect Retry-After header | `true` |
 | `LEXORA_RETRY__MAX_RETRY_AFTER` | Max Retry-After delay (seconds) | `60.0` |
-| `LEXORA_FALLBACK__ENABLED` | Enable fallback to alternative backends | `true` |
-| `LEXORA_FALLBACK__ON_RATE_LIMIT` | Allow fallback on 429 rate limit | `true` |
 | `LEXORA_FRONTIER_MODEL` | Concrete model ID served by the `frontier` tier (overrides the shipped default; updates both the routing tier and the backend's advertised model in lockstep) | shipped `frontier` tier default |
 | `LEXORA_LOGGING__LEVEL` | Log level | `INFO` |
 | `LEXORA_LOGGING__FORMAT` | Log format (`console`/`json`) | `console` |
@@ -130,10 +127,6 @@ retry:
   respect_retry_after: true   # Respect Retry-After header from 429 responses
   max_retry_after: 60.0       # Max Retry-After delay
 
-fallback:
-  enabled: true
-  on_rate_limit: true   # Allow fallback on 429 errors
-
 logging:
   level: "INFO"
   format: "console"     # "json" for production
@@ -141,7 +134,7 @@ logging:
 
 ### Multi-Backend Routing Configuration
 
-You can distribute models across multiple backends (vLLM, OpenAI-compatible APIs) and configure fallbacks:
+You can distribute models across multiple backends (vLLM, OpenAI-compatible APIs):
 
 ```yaml
 routing:
@@ -169,8 +162,6 @@ routing:
         - name: "llama3-70b"
           capabilities: ["reasoning", "general"]
           description: "General-purpose large model"
-      fallback_backends:              # Fallback on failure
-        - "openai_backup"
 
     secondary:
       type: "vllm"
@@ -182,8 +173,6 @@ routing:
           capabilities: ["summarization", "translation", "simple_qa"]
           description: "Fast model for lightweight tasks"
         - "embedding-model"           # Legacy format also supported (capabilities=["general"])
-      fallback_backends:
-        - "openai_backup"
 
     openai_backup:
       type: "openai_compatible"       # OpenAI-compatible API
@@ -244,11 +233,13 @@ Both the tier resolution and `/v1/models{,/capabilities}` update together, so th
 | `vllm` | vLLM backend (default) |
 | `openai_compatible` | OpenAI-compatible API (OpenAI, Azure OpenAI, etc.) |
 
-**Fallback Functionality:**
-- Specify alternative backends with `fallback_backends`
-- Automatic failover on primary backend failure (connection error, timeout, 503, etc.)
-- Fallback on 429 rate limit is also available (enable with `fallback.on_rate_limit: true`)
-- Multiple fallbacks are tried in order
+**No fallback mechanism (removed 2026-08-31):** a backend failure is returned to the
+caller as an error; requests are never re-routed to a different backend. The
+`FallbackService` that used to be configured here was never wired into the request
+path, so the settings it read (`fallback:`, `fallback_backends:`) promised operators a
+failover that never happened; both the code and the settings were removed rather than
+wired. `BackendSettings` forbids unknown keys, so a `fallback_backends:` left in a
+config file now fails startup loudly instead of being silently ignored.
 
 ## API Endpoints
 
@@ -420,7 +411,7 @@ sudo systemctl enable --now lexora
 | Prometheus Metrics | ✅ | Metrics export |
 | Multi-Backend Routing | ✅ | Automatic model-based routing |
 | OpenAI-Compatible Backend | ✅ | OpenAI, Azure OpenAI, etc. support |
-| Fallback Support | ✅ | Automatic failover on primary failure |
+| Fallback Support | ❌ | Removed 2026-08-31 — was never wired; errors are returned, not re-routed |
 | 429 Rate Limit Handling | ✅ | Retry-After header respect |
 | Model Capabilities API | ✅ | Model list with capability information |
 | Task Classification | ✅ | LLM-based task classification and model recommendation |
@@ -462,7 +453,6 @@ spirrow-lexora/
 │   │   ├── rate_limiter.py  # Token bucket rate limiter
 │   │   ├── retry_handler.py # Exponential backoff retry + Retry-After
 │   │   ├── router.py        # Multi-backend routing
-│   │   ├── fallback.py      # Fallback service
 │   │   ├── metrics.py       # Prometheus metrics
 │   │   ├── stats.py         # Statistics collection
 │   │   ├── model_registry.py    # Model capabilities registry
@@ -480,7 +470,6 @@ spirrow-lexora/
 ## Roadmap
 
 - [x] OpenAI-compatible API backend support
-- [x] Fallback functionality
 - [x] 429 rate limit handling (Retry-After)
 - [x] Model capabilities API
 - [x] Task classification with automatic model recommendation
