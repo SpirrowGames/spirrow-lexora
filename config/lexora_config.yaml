@@ -35,9 +35,10 @@ routing:
     # frontier: heavy とは別に「一番賢い有料モデル」の入口を独立させる
     # (T-frontier-tier, 2026-08-31)。heavy はローカル vLLM (限界費用ゼロ)、
     # frontier は Anthropic の課金モデル ∴ 呼び出し側は「コストを払う意思表示」
-    # として frontier を明示指定する。silent fallback / silent retry / silent
-    # 502 flattening は backends.frontier 側で全部止めている
-    # (fallback_backends: [], error_passthrough: true)。
+    # として frontier を明示指定する。silent retry / silent 502 flattening は
+    # backends.frontier の error_passthrough: true で止めている。silent
+    # fallback は「設定で止める」ものではなくなった — フォールバック機構自体を
+    # 2026-08-31 に撤去したので、どの config でも格下げは起こせない (末尾の記録)。
     # 初期モデル: Claude Fable 5 (Takahito 判断)。差し替えは
     # LEXORA_FRONTIER_MODEL で env override 可能 — config.py の
     # create_settings が読んで tiers.frontier.model と
@@ -182,12 +183,10 @@ routing:
           description: "Anthropic Claude Sonnet 4"
 
     # frontier: 「最上位モデル」の入口 (T-frontier-tier, 2026-08-31)。
-    # claude backend とは分ける — claude は heavy / claude_code の fallback
-    # 候補として名前が載っており、frontier をそこに相乗りさせると、
-    # FallbackService が将来配線された時に frontier が他ティアのフォールバック
-    # 先になってしまう。専用 backend にしておけば粒度が backend 単位で閉じ、
-    # 新しいノブを発明しなくて済む (default_max_tokens, error_passthrough,
-    # health_check, timeout, 価格の記録単位、全部 backend 単位)。
+    # claude backend とは分ける — 専用 backend にしておけば粒度が backend 単位
+    # で閉じ、新しいノブを発明しなくて済む (default_max_tokens,
+    # error_passthrough, health_check, timeout, 価格の記録単位、全部 backend
+    # 単位)。相乗りさせると claude の設定変更が frontier に波及する。
     #
     # 初期モデル: Claude Fable 5 (Takahito 判断)。Fable 5 は 30 日データ保持と
     # 安全分類器 (decline 発生時は stop_reason: refusal → content_filter に
@@ -203,9 +202,12 @@ routing:
     # 未登録モデル ID は pricing_known=0 + cost_pricing_unknown warning
     # で可視化される (silent 0.00 にはならない、T-frontier-tier D-6c)。
     #
-    # fallback_backends: [] は「機構が復活しても格下げしない」宣言。frontier
-    # を選ぶのはコストを払う意思表示であり、黙って heavy などに落ちると
-    # 「何のモデルで出た結果か」が失われる (T-frontier-tier msg-001 要件 3)。
+    # 要件 3 (サイレントフォールバック禁止) はこの backend の設定ではなく
+    # スキーマの性質で保証される: フォールバック機構は 2026-08-31 に撤去され、
+    # `fallback_backends:` は存在しないキーになった ∴ extra="forbid" により
+    # 書き戻すと起動が落ちる。frontier を選ぶのはコストを払う意思表示であり、
+    # 黙って heavy などに落ちると「何のモデルで出た結果か」が失われる
+    # (T-frontier-tier msg-001 要件 3 / msg-025 R-1)。
     #
     # error_passthrough: true で upstream の 4xx / 5xx を透過し、429 / 拒否は
     # 再試行しない (要件 4)。安全分類器の refusal もそのまま返す。
@@ -239,7 +241,6 @@ routing:
         - name: "claude-fable-5-20260101"
           capabilities: ["code", "reasoning", "analysis", "general", "frontier"]
           description: "Anthropic Claude Fable 5 (frontier ティア既定モデル、30 日保持・分類器あり)"
-      fallback_backends: []
 
 queue:
   max_size: 1000

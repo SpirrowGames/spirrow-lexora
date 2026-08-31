@@ -1,6 +1,8 @@
 """Regression tests for the frontier tier addition.
 
-Two independent guarantees, each isolated to a small test:
+Three independent guarantees, each isolated to a small test (the third was
+added 2026-08-31 when the fallback machinery was removed — see
+``TestFrontierCannotBeSilentlyDowngraded``):
 
 1. ``naysayer`` routing invariance (msg-003 §6 permanent constraint):
    adding a frontier tier and its backend must not change the naysayer
@@ -18,9 +20,11 @@ Two independent guarantees, each isolated to a small test:
    disagrees with what the router actually sends upstream.
 """
 
+import importlib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from lexora.config import create_settings, load_yaml_config
 from lexora.services.router import BackendRouter
@@ -80,11 +84,6 @@ class TestFrontierTierConfig:
         settings = create_settings(REPO_CONFIG)
         assert settings.routing.backends["frontier"].type == "anthropic"
 
-    def test_frontier_fallback_backends_is_empty(self) -> None:
-        """No silent fallback (msg-011 D-3 + msg-001 requirement 3)."""
-        settings = create_settings(REPO_CONFIG)
-        assert settings.routing.backends["frontier"].fallback_backends == []
-
     def test_frontier_error_passthrough_is_true(self) -> None:
         """Upstream 4xx/5xx and safety-classifier declines pass verbatim (D-4)."""
         settings = create_settings(REPO_CONFIG)
@@ -96,19 +95,68 @@ class TestFrontierTierConfig:
         assert settings.routing.backends["frontier"].default_max_tokens is not None
         assert settings.routing.backends["frontier"].default_max_tokens >= 1500
 
-    def test_frontier_backend_not_used_as_fallback_by_other_tiers(self) -> None:
-        """Nobody else lists ``frontier`` in their fallback list.
 
-        Guards D-1: the frontier tier gets its own backend precisely so
-        the FallbackService (if ever wired) does not silently reroute
-        traffic into the paid tier.
+class TestFrontierCannotBeSilentlyDowngraded:
+    """要件 3 の構造テスト — 「宣言」ではなく「機構が無い」ことで保証する。
+
+    以前ここには 2 本のテストがあった: `frontier` の `fallback_backends` が
+    空リストであること、および他のどの backend も `frontier` をフォールバック
+    先に挙げていないこと。どちらも「設定がそうなっている」の確認であり、設定を
+    書き換えれば破れた。
+
+    2026-08-31 にフォールバック機構そのものを撤去した (T-frontier-tier msg-025
+    R-1。PR #9 の独立 gate が「未配線の機構の config を出荷するのは運用者への
+    偽の約束だ」として止めた結果)。∴ 保証は設定値からスキーマの性質へ移った —
+    フォールバック先を書く場所が存在しない。空リストの宣言より強い。
+
+    共通の不変条件テストは `tests/test_config_no_fallback.py`。ここは frontier
+    の視点から「格下げされうる経路が無い」ことだけを固定する。
+    """
+
+    def test_fallback_service_module_does_not_exist(self) -> None:
+        """`FallbackService` は撤去済み ∴ import 自体が失敗すること。"""
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("lexora.services.fallback")
+
+    def test_router_exposes_no_fallback_surface(self) -> None:
+        """router にフォールバックを引く API が無いこと。
+
+        あれば「誰かが将来呼ぶ」経路が残る = frontier が黙って格下げされうる。
         """
-        settings = create_settings(REPO_CONFIG)
-        for backend_name, backend_cfg in settings.routing.backends.items():
-            assert "frontier" not in backend_cfg.fallback_backends, (
-                f"backend {backend_name!r} lists 'frontier' as a fallback — "
-                "the paid tier must not be reachable via silent fallback."
-            )
+        assert not hasattr(BackendRouter, "get_fallback_backends")
+        assert not hasattr(BackendRouter, "fallback_map")
+
+    def test_frontier_config_with_fallback_backends_fails_to_load(
+        self, tmp_path: Path
+    ) -> None:
+        """frontier にフォールバックを書き戻した config は起動できないこと。
+
+        `BackendSettings` は extra="forbid" ∴ 削除済みキーは黙って無視される
+        のではなく ValidationError になる。壊れ方が fail-loud であることが
+        「どんな config でも格下げできない」の実体。
+        """
+        config_file = tmp_path / "lexora_config.yaml"
+        config_file.write_text(
+            """
+routing:
+  enabled: true
+  default_backend: "frontier"
+  backends:
+    frontier:
+      type: "anthropic"
+      url: "https://api.anthropic.com"
+      models:
+        - name: "some-frontier-model"
+      fallback_backends:
+        - "heavy"
+  tiers:
+    frontier:
+      backend: "frontier"
+""",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValidationError):
+            create_settings(config_file)
 
 
 class TestFrontierModelEnvOverride:

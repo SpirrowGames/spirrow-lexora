@@ -211,7 +211,7 @@ Tiers are named entry points that the router resolves to a concrete `(backend, m
 
 The `frontier` tier exists so a caller expressing "I want the smartest paid model, and I am willing to pay for it" gets a distinct entry point instead of that intent being buried in `heavy`. Its behaviour differs from every other tier on three axes:
 
-- **No silent fallback.** `backends.frontier.fallback_backends` is empty, and every other backend's fallback list is checked so nobody lists `frontier` either. If the upstream fails, the caller gets that failure — the point of picking `frontier` was to know which model produced the result.
+- **No silent fallback.** Not because the tier opts out, but because the gateway has no fallback mechanism at all (removed 2026-08-31 — see below). If the upstream fails, the caller gets that failure — the point of picking `frontier` was to know which model produced the result. A config that tries to reintroduce a fallback target fails startup rather than downgrading a request.
 - **No silent retry.** The route notices `error_passthrough: true` on the backend and passes `retryable_exceptions=()` to the retry handler, so a 429 or a safety-classifier decline costs one billed call, not four.
 - **Upstream errors pass through verbatim.** Instead of collapsing every 4xx/5xx into a 502 with a stringified detail, the route forwards the upstream status code and the parsed body as-is. A Fable/Opus classifier decline arrives as HTTP 400 with a structured `{"error": {"type": "refusal", ...}}` body; a `stop_reason: refusal` on a 200 response is mapped to OpenAI `finish_reason: "content_filter"` rather than being rounded off to `"stop"`.
 
