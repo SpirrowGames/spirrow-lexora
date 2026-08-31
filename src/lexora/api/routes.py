@@ -486,6 +486,41 @@ async def chat_completions(
                     model=request.model,
                 )
                 raise
+            # ★ Last clause on purpose, and the mirror of the pre-flight's.
+            # `asyncio.CancelledError` is a `BaseException`, so a client that
+            # hangs up *after* bytes have flowed lands here and nowhere else:
+            # starlette cancels the body pump, the cancellation is thrown into
+            # this generator at its `yield`, and the clause above -- which
+            # enumerates `Exception` -- never sees it. Without this the ledger
+            # keeps the request in-flight forever (`_fail_preflight` states the
+            # invariant; this is the other half of it) and never counts it at
+            # all. `logger.error`, not `logger.exception`: a disconnect is not a
+            # crash and a full traceback per hang-up is noise. `error_type` is
+            # required because `str(CancelledError())` is `""`.
+            # The classification is deliberately left alone -- `success=False`,
+            # same level -- so this agrees with `_fail_preflight`, which closes
+            # the same exception class the same way. Whether a disconnect is a
+            # *failure* is a separate question and not settled here.
+            except BaseException as e:
+                duration = time.time() - start_time
+                stats_collector.complete_request(stats, success=False, error=str(e))
+
+                if metrics_collector:
+                    metrics_collector.record_request_end(
+                        endpoint=endpoint,
+                        model=request.model,
+                        status="error",
+                        duration=duration,
+                        streaming=True,
+                    )
+
+                logger.error(
+                    "chat_completion_stream_unhandled",
+                    model=request.model,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
+                raise
 
         return StreamingResponse(
             stream_generator(),
@@ -836,6 +871,41 @@ async def completions(
                 logger.exception(
                     "completion_stream_unexpected_error",
                     model=request.model,
+                )
+                raise
+            # ★ Last clause on purpose, and the mirror of the pre-flight's.
+            # `asyncio.CancelledError` is a `BaseException`, so a client that
+            # hangs up *after* bytes have flowed lands here and nowhere else:
+            # starlette cancels the body pump, the cancellation is thrown into
+            # this generator at its `yield`, and the clause above -- which
+            # enumerates `Exception` -- never sees it. Without this the ledger
+            # keeps the request in-flight forever (`_fail_preflight` states the
+            # invariant; this is the other half of it) and never counts it at
+            # all. `logger.error`, not `logger.exception`: a disconnect is not a
+            # crash and a full traceback per hang-up is noise. `error_type` is
+            # required because `str(CancelledError())` is `""`.
+            # The classification is deliberately left alone -- `success=False`,
+            # same level -- so this agrees with `_fail_preflight`, which closes
+            # the same exception class the same way. Whether a disconnect is a
+            # *failure* is a separate question and not settled here.
+            except BaseException as e:
+                duration = time.time() - start_time
+                stats_collector.complete_request(stats, success=False, error=str(e))
+
+                if metrics_collector:
+                    metrics_collector.record_request_end(
+                        endpoint=endpoint,
+                        model=request.model,
+                        status="error",
+                        duration=duration,
+                        streaming=True,
+                    )
+
+                logger.error(
+                    "completion_stream_unhandled",
+                    model=request.model,
+                    error=str(e),
+                    error_type=type(e).__name__,
                 )
                 raise
 
@@ -1844,6 +1914,38 @@ async def messages(
                         streaming=True,
                     )
                 logger.exception("messages_stream_unexpected_error", model=request.model)
+                raise
+            # ★ Last clause on purpose, and the mirror of the pre-flight's.
+            # `asyncio.CancelledError` is a `BaseException`, so a client that
+            # hangs up *after* bytes have flowed lands here and nowhere else:
+            # starlette cancels the body pump, the cancellation is thrown into
+            # this generator at its `yield`, and the clause above -- which
+            # enumerates `Exception` -- never sees it. Without this the ledger
+            # keeps the request in-flight forever (`_fail_preflight` states the
+            # invariant; this is the other half of it) and never counts it at
+            # all. `logger.error`, not `logger.exception`: a disconnect is not a
+            # crash and a full traceback per hang-up is noise. `error_type` is
+            # required because `str(CancelledError())` is `""`.
+            # The classification is deliberately left alone -- `success=False`,
+            # same level -- so this agrees with `_fail_preflight`, which closes
+            # the same exception class the same way. Whether a disconnect is a
+            # *failure* is a separate question and not settled here.
+            except BaseException as e:
+                stats_collector.complete_request(stats, success=False, error=str(e))
+                if metrics_collector:
+                    metrics_collector.record_request_end(
+                        endpoint=endpoint,
+                        model=request.model,
+                        status="error",
+                        duration=time.time() - start_time,
+                        streaming=True,
+                    )
+                logger.error(
+                    "messages_stream_unhandled",
+                    model=request.model,
+                    error=str(e),
+                    error_type=type(e).__name__,
+                )
                 raise
 
         return StreamingResponse(
