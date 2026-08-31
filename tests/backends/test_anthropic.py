@@ -795,3 +795,110 @@ class TestStreamingErrorBodyDecoding:
 
         assert exc_info.value.status_code == 400
         assert "declined" in str(exc_info.value)
+
+
+def _error_response(status: int, raw: str) -> "httpx.Response":
+    """A real `httpx.Response` whose body is exactly `raw`.
+
+    Built from `content=` rather than `json=` on purpose: `.text` has to be
+    the literal bytes the upstream sent, because the message this handler
+    falls back to *is* `response.text`.
+    """
+    import httpx
+
+    return httpx.Response(
+        status,
+        content=raw.encode(),
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+
+
+class TestNonStreamingErrorBodyShapes:
+    """O-8: the `error` member of an error body may not be an object.
+
+    `isinstance(body, dict)` guards the *outer* payload only. When the
+    upstream answers `{"error": "Too Many Requests"}` or `{"error": [...]}` ,
+    `body.get("error", {})` returns that str / list and `.get("message")` on
+    it raises `AttributeError` — from outside any `try`, so it escapes the
+    backend and the route alike and the caller gets a 500 whose body is this
+    gateway's own Python internals.
+
+    This is a regression, not an unfinished feature. On `develop` the `.get`
+    chain sat *inside* the `try` that wrapped `response.json()`, so
+    `AttributeError` was absorbed by `except Exception` and the message
+    degraded to `response.text`. Narrowing that `try` to `response.json()`
+    alone — needed to carry `body` to the passthrough call sites — moved the
+    chain out from under the umbrella.
+
+    The fix restores the `develop` message (`response.text`) rather than
+    inventing a better one: the streaming twin 128 lines below already uses
+    that exact shape, and one file should not hold two answers to one
+    question.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected_body", "expected_message"),
+        [
+            pytest.param(
+                '{"error": "Too Many Requests"}',
+                {"error": "Too Many Requests"},
+                '{"error": "Too Many Requests"}',
+                id="error-is-a-string",
+            ),
+            pytest.param(
+                '{"error": ["first", "second"]}',
+                {"error": ["first", "second"]},
+                '{"error": ["first", "second"]}',
+                id="error-is-a-list",
+            ),
+            pytest.param(
+                '{"error": {"message": "declined"}}',
+                {"error": {"message": "declined"}},
+                "declined",
+                id="error-is-an-object",
+            ),
+            pytest.param(
+                '{"detail": "no error key at all"}',
+                {"detail": "no error key at all"},
+                '{"detail": "no error key at all"}',
+                id="no-error-key",
+            ),
+            pytest.param(
+                "<html><body>502 Bad Gateway</body></html>",
+                "<html><body>502 Bad Gateway</body></html>",
+                "<html><body>502 Bad Gateway</body></html>",
+                id="not-json-at-all",
+            ),
+        ],
+    )
+    def test_every_body_shape_raises_upstream_error(
+        self, raw: str, expected_body: object, expected_message: str
+    ) -> None:
+        from lexora.backends.base import BackendUpstreamError
+
+        backend = AnthropicBackend(name="frontier", error_passthrough=True)
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            backend._handle_error_response(_error_response(400, raw))
+
+        assert exc_info.value.status_code == 400
+        # O-7 pinned verbatim passthrough; this fix must not move a byte of it.
+        assert exc_info.value.body == expected_body
+        assert str(exc_info.value) == f"API error (400): {expected_message}"
+
+    def test_non_passthrough_backends_are_affected_too(self) -> None:
+        """The blast radius is every Anthropic tier, not just `frontier`.
+
+        `error_passthrough` only gates the 429 / 503 / 529 short-circuit
+        above; a plain 400 reaches the same `>= 400` branch either way.
+        """
+        from lexora.backends.base import BackendUpstreamError
+
+        backend = AnthropicBackend(name="heavy")
+
+        with pytest.raises(BackendUpstreamError) as exc_info:
+            backend._handle_error_response(
+                _error_response(400, '{"error": "Too Many Requests"}')
+            )
+
+        assert exc_info.value.status_code == 400

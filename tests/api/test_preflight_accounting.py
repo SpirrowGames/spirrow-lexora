@@ -24,7 +24,7 @@ metrics へ登録する。PR-B が新設した passthrough の pre-flight は
 import asyncio
 import concurrent.futures
 from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
@@ -321,3 +321,36 @@ class TestPreflightUnlistedExceptionDoesNotLeak:
         assert stats["failed_requests"] == 1
         # (a) ★ the leak detector.
         assert _active_requests(endpoint) == before
+
+
+def test_preflight_unhandled_log_names_the_exception_type(
+    client: TestClient, mock_backend: MagicMock
+) -> None:
+    """B-14: the log line for a `BaseException` exit must say what left.
+
+    `str(e)` is the empty string for every `BaseException` that is not an
+    `Exception` — `CancelledError`, `KeyboardInterrupt`, `SystemExit` all
+    measure as `''`. Those are precisely the class of exception the
+    `except BaseException` clause was added for, so `error=str(e)` alone
+    produced a log record that named the endpoint and nothing else.
+
+    This asserts a property of the shipped code (an empty `str()`), not the
+    gate's unverified claim that a client disconnect is what raises it. The
+    level is deliberately unchanged: demoting `CancelledError` would encode
+    "a cancel here is normal traffic, not a fault", which nothing in this
+    repository has measured. That question belongs to F-3.
+    """
+    from lexora.api import routes as routes_module
+
+    mock_backend.chat_completions_stream = _raising_stream(asyncio.CancelledError())
+
+    with patch.object(routes_module.logger, "error") as logged:
+        with pytest.raises((asyncio.CancelledError, concurrent.futures.CancelledError)):
+            client.post("/v1/chat/completions", json=CHAT_BODY)
+
+    call = next(
+        c
+        for c in logged.call_args_list
+        if c.args and c.args[0] == "chat_completion_stream_preflight_unhandled"
+    )
+    assert (call.kwargs["error"], call.kwargs["error_type"]) == ("", "CancelledError")

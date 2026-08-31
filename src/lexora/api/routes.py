@@ -404,6 +404,7 @@ async def chat_completions(
                     "chat_completion_stream_preflight_unhandled",
                     model=request.model,
                     error=str(e),
+                    error_type=type(e).__name__,
                 )
                 _fail_preflight(
                     stats_collector,
@@ -755,6 +756,7 @@ async def completions(
                     "completion_stream_preflight_unhandled",
                     model=request.model,
                     error=str(e),
+                    error_type=type(e).__name__,
                 )
                 _fail_preflight(
                     stats_collector,
@@ -1797,6 +1799,7 @@ async def messages(
                 "messages_stream_preflight_unhandled",
                 model=request.model,
                 error=str(e),
+                error_type=type(e).__name__,
             )
             _fail_preflight(
                 stats_collector,
