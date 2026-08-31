@@ -30,9 +30,20 @@ logger = get_logger(__name__)
 #     as literally zero — distinguished from "we do not know" by the
 #     ``pricing_known`` column that ``record`` writes.
 DEFAULT_PRICING: dict[str, dict[str, float]] = {
-    # Anthropic
+    # Anthropic — Claude 4 series (Sonnet / Opus, per anthropic.com/pricing)
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-opus-4-20250514": {"input": 15.0, "output": 75.0},
+    # NOTE: Claude 5 series (Fable / Opus, the frontier tier candidates)
+    # are deliberately absent. This module refuses to invent prices for
+    # placeholder model IDs — an invented price keyed to an invented ID
+    # is written to the ledger as authoritative (D-6c's `pricing_known=1`
+    # path), which is the exact class of silent-wrong-billing that D-6c
+    # was built to prevent, re-entering through the constant instead of
+    # the lookup. When Anthropic publishes the real IDs and per-MTok
+    # prices, add them here **together** with a citation date; until
+    # then, frontier requests correctly land in the `pricing_known=0`
+    # bucket with a `cost_pricing_unknown` warning (see the config
+    # comment on `backends.frontier.models[0]`).
     # Claude Code (uses Anthropic pricing internally)
     "claude-code-sonnet": {"input": 3.0, "output": 15.0},
     "claude-code-opus": {"input": 15.0, "output": 75.0},
