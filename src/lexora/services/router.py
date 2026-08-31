@@ -16,8 +16,7 @@ class BackendRouter:
     """Routes requests to appropriate backends based on model name.
 
     Supports multi-backend configuration where different models can be served
-    by different backend instances. Also supports fallback backends when
-    primary backends fail or hit rate limits.
+    by different backend instances.
 
     Args:
         routing_settings: Routing configuration.
@@ -42,7 +41,6 @@ class BackendRouter:
         #: legacy single-backend mode keeps its probe without saying so.
         self._health_checked: dict[str, bool] = {}
         self._model_to_backend: dict[str, str] = {}
-        self._fallback_map: dict[str, list[str]] = {}
 
         self._tier_to_backend: dict[str, str] = {}
         self._tier_to_model: dict[str, str] = {}
@@ -64,15 +62,6 @@ class BackendRouter:
                         backend=name,
                         url=settings.url,
                         type=settings.type,
-                    )
-
-                # Store fallback configuration
-                if settings.fallback_backends:
-                    self._fallback_map[name] = settings.fallback_backends
-                    logger.info(
-                        "fallback_registered",
-                        backend=name,
-                        fallbacks=settings.fallback_backends,
                     )
 
             # Register tier mappings
@@ -199,29 +188,6 @@ class BackendRouter:
         """
         return name in self._tier_to_backend
 
-    def get_fallback_backends(self, backend_name: str) -> list[Backend]:
-        """Get fallback backends for a given backend.
-
-        Args:
-            backend_name: Name of the primary backend.
-
-        Returns:
-            List of fallback backend instances.
-        """
-        fallback_names = self._fallback_map.get(backend_name, [])
-        fallbacks = []
-        for name in fallback_names:
-            backend = self._backends.get(name)
-            if backend is not None:
-                fallbacks.append(backend)
-            else:
-                logger.warning(
-                    "fallback_backend_not_found",
-                    primary=backend_name,
-                    fallback=name,
-                )
-        return fallbacks
-
     def get_backend_by_name(self, name: str) -> Backend | None:
         """Get a backend by its name.
 
@@ -250,15 +216,6 @@ class BackendRouter:
             Dictionary of backend name to instance.
         """
         return self._backends
-
-    @property
-    def fallback_map(self) -> dict[str, list[str]]:
-        """Get the fallback configuration map.
-
-        Returns:
-            Dictionary of backend name to list of fallback backend names.
-        """
-        return self._fallback_map
 
     @property
     def routing_enabled(self) -> bool:
