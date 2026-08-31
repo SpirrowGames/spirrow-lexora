@@ -1,40 +1,33 @@
 """B-17: a client that disconnects *mid-stream* must still close the ledger.
 
-`#10` moved `stats_collector.start_request()` above the streaming
-pre-flight and made the last clause of every pre-flight
-`except BaseException` so that a cancellation closes the ledger instead
-of leaking `ACTIVE_REQUESTS` (see `_fail_preflight`'s docstring, which
-states the invariant). The structural defence stopped at the pre-flight:
-the three `stream_generator()` bodies still ended in `except Exception`,
-and `asyncio.CancelledError` is a `BaseException`, not an `Exception`.
-So a disconnect *after* the first byte went out skipped
-`complete_request` entirely -- the gauge stayed `inc()`'d forever and the
-attempt never appeared in `total_requests` either.
+`#10` declared the ACTIVE_REQUESTS invariant in `_fail_preflight`'s
+docstring and made the last clause of every streaming pre-flight
+`except BaseException`. The three `stream_generator()` bodies still
+ended at `except Exception`, and `asyncio.CancelledError` is not an
+`Exception` -- so a disconnect *after* the first byte skipped
+`complete_request()`: the gauge stayed in-flight forever and the attempt
+never reached `total_requests` either.
 
-The leak is **not** a regression introduced by `#10`: measured against
-`develop` (`d4fec9c`) the same three routes leak `+1.0` with identical
-numbers, and it fires with `error_passthrough=False` too, so it is
-neither a frontier problem nor a passthrough problem. It is folded in
-here because `#10` is the change that declared the invariant, and an
-invariant stated in one function's docstring and broken in the function
-next to it is worse than one nobody claimed.
+Not a regression from `#10`: the same four cases fail against `develop`
+(d4fec9c) with the identical +1.0 per route, and one of them runs with
+`error_passthrough=False`, so the leak is neither a frontier nor a
+passthrough problem. It is folded in here because `#10` is the change
+that stated the invariant.
 
-Why raw ASGI instead of `TestClient`
-------------------------------------
-`TestClient` cannot express "disconnect after the first body chunk": it
-drives the app to completion and hands back a finished `Response`. The
-disconnect path only exists in `StreamingResponse.__call__` for
-`asgi.spec_version < 2.4`, where the body pump and
-`listen_for_disconnect()` share an `anyio` task group and a
-`http.disconnect` message cancels the pump. `2.3` is what uvicorn's HTTP
-protocols advertise (`h11_impl.py` / `httptools_impl.py`), so that is the
-version driven here; it is a fact about the pinned stack
-(starlette 0.50.0 / fastapi 0.128.0), not a law about ASGI.
+Why raw ASGI and not `TestClient`: `TestClient` drives the app to
+completion and hands back a finished `Response`, so it cannot express
+"hang up after the first chunk". The disconnect path only exists in
+`StreamingResponse.__call__` for `asgi.spec_version < 2.4`, where the
+body pump and `listen_for_disconnect()` share an anyio task group. `2.3`
+is what uvicorn's HTTP protocols advertise, so that is what is driven
+here -- a fact about the pinned stack (starlette 0.50.0 /
+fastapi 0.128.0), not a law about ASGI.
 
-Mutation evidence (recorded so the detector is not merely asserted):
-deleting the three new `except BaseException` clauses turns all three
-cases below red, while the rest of the suite stays green -- before this
-file the whole suite was blind to the leak.
+Mutation, so the detector is measured rather than asserted: dropping the
+new clause from `chat_completions` reds the two chat cases, from
+`completions` reds `completions`, from `messages` reds `messages`; with
+all three dropped the rest of the suite is still 469 passed, i.e. it was
+blind to this.
 """
 
 import asyncio

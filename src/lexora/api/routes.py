@@ -489,18 +489,15 @@ async def chat_completions(
             # ★ Last clause on purpose, and the mirror of the pre-flight's.
             # `asyncio.CancelledError` is a `BaseException`, so a client that
             # hangs up *after* bytes have flowed lands here and nowhere else:
-            # starlette cancels the body pump, the cancellation is thrown into
-            # this generator at its `yield`, and the clause above -- which
-            # enumerates `Exception` -- never sees it. Without this the ledger
-            # keeps the request in-flight forever (`_fail_preflight` states the
-            # invariant; this is the other half of it) and never counts it at
-            # all. `logger.error`, not `logger.exception`: a disconnect is not a
-            # crash and a full traceback per hang-up is noise. `error_type` is
-            # required because `str(CancelledError())` is `""`.
-            # The classification is deliberately left alone -- `success=False`,
-            # same level -- so this agrees with `_fail_preflight`, which closes
-            # the same exception class the same way. Whether a disconnect is a
-            # *failure* is a separate question and not settled here.
+            # the clause above enumerates `Exception` and never sees it, and
+            # the ledger would keep the request in-flight forever
+            # (`_fail_preflight` states that invariant; this is its other
+            # half). `logger.error`, not `logger.exception` -- a disconnect is
+            # not a crash and a traceback per hang-up is noise -- and
+            # `error_type` because a bare `CancelledError` stringifies to "".
+            # `success=False` and the level are deliberately left as they are,
+            # to agree with `_fail_preflight` on the same exception class;
+            # whether a disconnect is a *failure* is not settled here.
             except BaseException as e:
                 duration = time.time() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
@@ -873,21 +870,9 @@ async def completions(
                     model=request.model,
                 )
                 raise
-            # ★ Last clause on purpose, and the mirror of the pre-flight's.
-            # `asyncio.CancelledError` is a `BaseException`, so a client that
-            # hangs up *after* bytes have flowed lands here and nowhere else:
-            # starlette cancels the body pump, the cancellation is thrown into
-            # this generator at its `yield`, and the clause above -- which
-            # enumerates `Exception` -- never sees it. Without this the ledger
-            # keeps the request in-flight forever (`_fail_preflight` states the
-            # invariant; this is the other half of it) and never counts it at
-            # all. `logger.error`, not `logger.exception`: a disconnect is not a
-            # crash and a full traceback per hang-up is noise. `error_type` is
-            # required because `str(CancelledError())` is `""`.
-            # The classification is deliberately left alone -- `success=False`,
-            # same level -- so this agrees with `_fail_preflight`, which closes
-            # the same exception class the same way. Whether a disconnect is a
-            # *failure* is a separate question and not settled here.
+            # ★ Last clause on purpose: the mid-stream half of the
+            # ACTIVE_REQUESTS invariant. See the same clause in
+            # `chat_completions` above for why.
             except BaseException as e:
                 duration = time.time() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
@@ -1915,21 +1900,9 @@ async def messages(
                     )
                 logger.exception("messages_stream_unexpected_error", model=request.model)
                 raise
-            # ★ Last clause on purpose, and the mirror of the pre-flight's.
-            # `asyncio.CancelledError` is a `BaseException`, so a client that
-            # hangs up *after* bytes have flowed lands here and nowhere else:
-            # starlette cancels the body pump, the cancellation is thrown into
-            # this generator at its `yield`, and the clause above -- which
-            # enumerates `Exception` -- never sees it. Without this the ledger
-            # keeps the request in-flight forever (`_fail_preflight` states the
-            # invariant; this is the other half of it) and never counts it at
-            # all. `logger.error`, not `logger.exception`: a disconnect is not a
-            # crash and a full traceback per hang-up is noise. `error_type` is
-            # required because `str(CancelledError())` is `""`.
-            # The classification is deliberately left alone -- `success=False`,
-            # same level -- so this agrees with `_fail_preflight`, which closes
-            # the same exception class the same way. Whether a disconnect is a
-            # *failure* is a separate question and not settled here.
+            # ★ Last clause on purpose: the mid-stream half of the
+            # ACTIVE_REQUESTS invariant. See the same clause in
+            # `chat_completions` above for why.
             except BaseException as e:
                 stats_collector.complete_request(stats, success=False, error=str(e))
                 if metrics_collector:
