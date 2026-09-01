@@ -472,3 +472,115 @@ class TestThinkingControls:
         request = {"messages": []}
         backend._apply_thinking_controls(request)
         assert "chat_template_kwargs" not in request
+
+
+# --- B-20: streaming error body must not be decoded twice --------------------
+
+
+class _FakeStreamResponse:
+    """Minimal stand-in for the httpx response yielded by `client.stream`.
+
+    Mirrors the equivalent in tests/backends/test_anthropic.py; kept local
+    to this module so the vllm tests do not sprout a cross-module fixture
+    dependency.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aiter_bytes(self):  # pragma: no cover - never reached on error paths
+        return
+        yield b""
+
+
+class _FakeStreamCM:
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeStreamResponse:
+        return self._response
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+async def _drain_vllm_stream(
+    backend: VLLMBackend, response: _FakeStreamResponse
+) -> None:
+    """Run chat_completions_stream against a canned error response."""
+    backend._client.stream = MagicMock(return_value=_FakeStreamCM(response))
+    request = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    async for _ in backend.chat_completions_stream(request):
+        pass
+
+
+class TestStreamingErrorBodyDecoding:
+    """B-20: an undecodable streaming error body must not escape as UnicodeDecodeError.
+
+    The pre-fix shape:
+
+        try:
+            error_json = json.loads(error_body)
+            error_message = error_json.get("error", {}).get(
+                "message", error_body.decode()   # eager default
+            )
+        except Exception:
+            error_message = error_body.decode()  # ← same decode, no `errors=`
+
+    On a non-UTF-8 body, `json.loads` raises `UnicodeDecodeError` (bytes
+    inputs are decoded natively before parsing). Because `UnicodeDecodeError`
+    is a subclass of `ValueError` and therefore of `Exception`, control
+    falls into the `except` — where the second `.decode()` throws
+    `UnicodeDecodeError` again, this time uncaught. The generator dies
+    without ever raising `BackendError`, and the caller loses the upstream
+    status code.
+
+    `match=` is not optional here: without it the `raises` block would
+    accept `UnicodeDecodeError` (also a `ValueError` subclass ⊂ `Exception`
+    — the same trap B-19 pinned) and the test would go green while the
+    bug still stands.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalid_utf8_error_body_raises_backend_error_with_status(
+        self,
+    ) -> None:
+        backend = VLLMBackend(base_url="http://test-vllm:8000")
+        response = _FakeStreamResponse(
+            500, body=b"\xff\xfe upstream exploded \x80\x81"
+        )
+
+        with pytest.raises(BackendError, match=r"vLLM error \(500\)"):
+            await _drain_vllm_stream(backend, response)
+
+    @pytest.mark.asyncio
+    async def test_utf16_json_error_body_raises_backend_error_with_status(
+        self,
+    ) -> None:
+        """A UTF-16 JSON body: `json.loads` accepts it, plain `.decode()` does not.
+
+        RFC 4627 lets `json.loads` sniff UTF-16, so parsing succeeds; the
+        old `.get("message", body.decode())` default was evaluated eagerly
+        and blew up even on this "well-formed" path.
+        """
+        import json as _json
+
+        backend = VLLMBackend(base_url="http://test-vllm:8000")
+        payload = _json.dumps({"error": {"message": "declined"}}).encode("utf-16")
+        response = _FakeStreamResponse(400, body=payload)
+
+        with pytest.raises(BackendError, match=r"vLLM error \(400\)"):
+            await _drain_vllm_stream(backend, response)

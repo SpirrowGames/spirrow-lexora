@@ -255,3 +255,104 @@ class TestClose:
         with patch.object(backend._client, "aclose", new_callable=AsyncMock) as mock_close:
             await backend.close()
             mock_close.assert_called_once()
+
+
+# --- B-20: streaming error body must not be decoded twice --------------------
+
+
+class _FakeStreamResponse:
+    """Minimal stand-in for the httpx response yielded by `client.stream`.
+
+    Mirrors the equivalent in tests/backends/test_anthropic.py; kept local
+    to this module so the openai_compatible tests do not sprout a
+    cross-module fixture dependency.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aiter_bytes(self):  # pragma: no cover - never reached on error paths
+        return
+        yield b""
+
+
+class _FakeStreamCM:
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeStreamResponse:
+        return self._response
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+async def _drain_openai_stream(
+    backend: OpenAICompatibleBackend, response: _FakeStreamResponse
+) -> None:
+    """Run chat_completions_stream against a canned error response."""
+    backend._client.stream = MagicMock(return_value=_FakeStreamCM(response))
+    request = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    async for _ in backend.chat_completions_stream(request):
+        pass
+
+
+class TestStreamingErrorBodyDecoding:
+    """B-20: an undecodable streaming error body must not escape as UnicodeDecodeError.
+
+    Symmetric to `TestStreamingErrorBodyDecoding` in test_vllm.py — the two
+    backends share the same pre-fix shape (`_post_stream` on 4xx/5xx) and
+    the same failure mode. See that class's docstring for the mechanism.
+
+    `match=` is not optional: `UnicodeDecodeError` is a `ValueError`
+    subclass ⊂ `Exception`, so `pytest.raises(BackendError)` alone would
+    also accept the raw decode failure and go green while the bug stands
+    (B-19 pinned the same trap).
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalid_utf8_error_body_raises_backend_error_with_status(
+        self,
+    ) -> None:
+        backend = OpenAICompatibleBackend(
+            base_url="https://api.openai.com",
+            api_key="sk-test",
+            name="test_backend",
+        )
+        response = _FakeStreamResponse(
+            500, body=b"\xff\xfe upstream exploded \x80\x81"
+        )
+
+        with pytest.raises(BackendError, match=r"API error \(500\)"):
+            await _drain_openai_stream(backend, response)
+
+    @pytest.mark.asyncio
+    async def test_utf16_json_error_body_raises_backend_error_with_status(
+        self,
+    ) -> None:
+        """A UTF-16 JSON body: `json.loads` accepts it, plain `.decode()` does not."""
+        import json as _json
+
+        backend = OpenAICompatibleBackend(
+            base_url="https://api.openai.com",
+            api_key="sk-test",
+            name="test_backend",
+        )
+        payload = _json.dumps({"error": {"message": "declined"}}).encode("utf-16")
+        response = _FakeStreamResponse(400, body=payload)
+
+        with pytest.raises(BackendError, match=r"API error \(400\)"):
+            await _drain_openai_stream(backend, response)

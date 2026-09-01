@@ -263,15 +263,34 @@ class OpenAICompatibleBackend(Backend):
 
                 if response.status_code >= 400:
                     error_body = await response.aread()
-                    try:
-                        import json
+                    # Decode exactly once, with replacement, BEFORE the
+                    # `try`. The pre-fix shape called `.decode()` (no
+                    # `errors=`) at two sites: eagerly as the `.get(...,
+                    # default)` fallback, and again in the `except`. A
+                    # non-UTF-8 upstream body (WAF page, mislabelled
+                    # UTF-16, …) makes `json.loads(bytes)` raise
+                    # `UnicodeDecodeError` — which is a `ValueError`
+                    # subclass, so the bare `except Exception` catches
+                    # it, and then the second `.decode()` raises the
+                    # same error uncaught. The upstream status code is
+                    # lost and the generator dies. Decoding once up
+                    # front means neither branch below can throw a
+                    # decoding error, and the trap cannot come back by
+                    # someone editing one branch in isolation. Mirrors
+                    # `anthropic.py` §"Decode exactly once, with
+                    # replacement".
+                    import json
 
+                    error_text = (
+                        error_body.decode(errors="replace") if error_body else ""
+                    )
+                    try:
                         error_json = json.loads(error_body)
                         error_message = error_json.get("error", {}).get(
-                            "message", error_body.decode()
+                            "message", error_text
                         )
                     except Exception:
-                        error_message = error_body.decode()
+                        error_message = error_text
                     raise BackendError(
                         f"API error ({response.status_code}): {error_message}"
                     )
