@@ -256,14 +256,37 @@ class VLLMBackend(Backend):
                 if response.status_code >= 400:
                     # Read error body for non-streaming error response
                     error_body = await response.aread()
+                    # Decode exactly once, with replacement, BEFORE the
+                    # `try`. The pre-fix shape called `.decode()` (no
+                    # `errors=`) at two sites — the `.get(..., default)`
+                    # fallback (Python evaluates arguments eagerly, so
+                    # the default ran whether or not the key was
+                    # present) and again in the bare `except`. On a
+                    # non-UTF-8 upstream body (vLLM ingress error page,
+                    # mislabelled UTF-16, …) something inside the `try`
+                    # always fails; which line goes first depends on
+                    # the byte pattern and does not matter for the
+                    # shape of the bug. What matters is that repeating
+                    # the same decode in `except` turns a diagnosable
+                    # `BackendError` (carrying the upstream status and
+                    # body) into a bare `UnicodeDecodeError` — the
+                    # upstream status is lost and the generator dies.
+                    # Decoding once up front means neither branch below
+                    # can throw a decoding error, and the trap cannot
+                    # come back by someone editing one branch in
+                    # isolation. Mirrors `anthropic.py` §"Decode
+                    # exactly once, with replacement" / `gemini.py`.
+                    import json
+                    error_text = (
+                        error_body.decode(errors="replace") if error_body else ""
+                    )
                     try:
-                        import json
                         error_json = json.loads(error_body)
                         error_message = error_json.get("error", {}).get(
-                            "message", error_body.decode()
+                            "message", error_text
                         )
                     except Exception:
-                        error_message = error_body.decode()
+                        error_message = error_text
                     raise BackendError(
                         f"vLLM error ({response.status_code}): {error_message}"
                     )
