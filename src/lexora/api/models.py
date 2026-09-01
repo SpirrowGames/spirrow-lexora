@@ -6,6 +6,27 @@ from pydantic import BaseModel, Field
 
 
 # Convenience endpoint models for simple text generation
+#
+# `temperature` deliberately has no default (2026-09-01, T-frontier-tier).
+# It used to default to 0.7, which meant a caller who said nothing about
+# sampling still had 0.7 sent upstream under their name. That is a value the
+# endpoint invented, not one the caller chose, and it made these two routes
+# unusable for the frontier tier: Claude Fable 5 / Opus 5 / Sonnet 5 removed
+# `temperature` and `top_p` from the Messages API and reject them with a 400,
+# so every /generate and /chat call to frontier failed on a parameter the
+# caller never asked for.
+#
+# `None` now means "the caller did not say", and the route omits the key
+# entirely rather than forwarding a null (the Anthropic backend forwards any
+# present `temperature`, and a null is rejected the same as a string would
+# be). Callers that want a specific temperature still send one and it is
+# still passed through unchanged — this removes an invented value, it does
+# not drop a stated one.
+#
+# Behaviour change: a /generate or /chat caller that relied on the implicit
+# 0.7 against a vLLM tier now gets vLLM's own default instead. The
+# OpenAI-shaped routes (/v1/chat/completions, /v1/completions) and
+# /v1/messages were already `float | None = None` and are untouched.
 
 
 class GenerateRequest(BaseModel):
@@ -13,7 +34,13 @@ class GenerateRequest(BaseModel):
 
     prompt: str = Field(description="The prompt to generate text from")
     max_tokens: int = Field(default=1000, description="Maximum tokens to generate")
-    temperature: float = Field(default=0.7, description="Sampling temperature")
+    temperature: float | None = Field(
+        default=None,
+        description=(
+            "Sampling temperature. Omitted from the upstream request when "
+            "unset — see the note on fabricated defaults below."
+        ),
+    )
     model: str | None = Field(default=None, description="Model to use (optional)")
     user: str | None = Field(default=None, description="User identifier for rate limiting")
 
@@ -38,7 +65,13 @@ class ChatRequest(BaseModel):
 
     messages: list[SimpleChatMessage] = Field(description="Chat messages")
     max_tokens: int = Field(default=1000, description="Maximum tokens to generate")
-    temperature: float = Field(default=0.7, description="Sampling temperature")
+    temperature: float | None = Field(
+        default=None,
+        description=(
+            "Sampling temperature. Omitted from the upstream request when "
+            "unset — see the note on fabricated defaults below."
+        ),
+    )
     model: str | None = Field(default=None, description="Model to use (optional)")
     user: str | None = Field(default=None, description="User identifier for rate limiting")
 

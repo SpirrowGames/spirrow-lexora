@@ -285,7 +285,11 @@ class TestGenerateEndpoint(TestConvenienceAPI):
         # Verify defaults were applied
         call_args = mock_backend.completions.call_args[0][0]
         assert call_args["max_tokens"] == 1000
-        assert call_args["temperature"] == 0.7
+        # `temperature` has no default: a caller who said nothing about
+        # sampling must not have a value invented and sent under their name.
+        # The key is omitted entirely rather than set to None, because the
+        # Anthropic backend forwards any key that is present.
+        assert "temperature" not in call_args
 
 
 class TestChatEndpoint(TestConvenienceAPI):
@@ -486,7 +490,8 @@ class TestChatEndpoint(TestConvenienceAPI):
         # Verify defaults were applied
         call_args = mock_backend.chat_completions.call_args[0][0]
         assert call_args["max_tokens"] == 1000
-        assert call_args["temperature"] == 0.7
+        # See the /generate counterpart: no invented sampling value.
+        assert "temperature" not in call_args
 
 
 class TestConvenienceRateLimiting(TestConvenienceAPI):

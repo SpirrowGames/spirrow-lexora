@@ -1420,12 +1420,17 @@ async def generate(
     backend = backend_router.get_backend_for_model(model)
 
     # Build completions request
-    completion_request = {
+    completion_request: dict[str, Any] = {
         "model": model,
         "prompt": request.prompt,
         "max_tokens": request.max_tokens,
-        "temperature": request.temperature,
     }
+    # Only send `temperature` when the caller actually chose one. Setting the
+    # key to None instead would not help: the Anthropic backend forwards any
+    # key that is *present* (`if "temperature" in request`), so a null would
+    # reach upstream and be rejected exactly like a bad value.
+    if request.temperature is not None:
+        completion_request["temperature"] = request.temperature
 
     # Pass through extra fields
     extra_fields = request.model_dump(
@@ -1581,12 +1586,14 @@ async def chat(
     backend = backend_router.get_backend_for_model(model)
 
     # Build chat completions request
-    chat_request = {
+    chat_request: dict[str, Any] = {
         "model": model,
         "messages": [msg.model_dump() for msg in request.messages],
         "max_tokens": request.max_tokens,
-        "temperature": request.temperature,
     }
+    # See the note in the /generate handler: present-but-null is forwarded.
+    if request.temperature is not None:
+        chat_request["temperature"] = request.temperature
 
     # Pass through extra fields
     extra_fields = request.model_dump(
