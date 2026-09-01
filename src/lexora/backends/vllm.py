@@ -258,20 +258,24 @@ class VLLMBackend(Backend):
                     error_body = await response.aread()
                     # Decode exactly once, with replacement, BEFORE the
                     # `try`. The pre-fix shape called `.decode()` (no
-                    # `errors=`) at two sites: eagerly as the `.get(...,
-                    # default)` fallback, and again in the `except`. A
+                    # `errors=`) at two sites — the `.get(..., default)`
+                    # fallback (Python evaluates arguments eagerly, so
+                    # the default ran whether or not the key was
+                    # present) and again in the bare `except`. On a
                     # non-UTF-8 upstream body (vLLM ingress error page,
-                    # mislabelled UTF-16, …) makes `json.loads(bytes)`
-                    # raise `UnicodeDecodeError` — which is a
-                    # `ValueError` subclass, so the bare `except
-                    # Exception` catches it, and then the second
-                    # `.decode()` raises the same error uncaught. The
-                    # upstream status code is lost and the generator
-                    # dies. Decoding once up front means neither branch
-                    # below can throw a decoding error, and the trap
-                    # cannot come back by someone editing one branch in
+                    # mislabelled UTF-16, …) something inside the `try`
+                    # always fails; which line goes first depends on
+                    # the byte pattern and does not matter for the
+                    # shape of the bug. What matters is that repeating
+                    # the same decode in `except` turns a diagnosable
+                    # `BackendError` (carrying the upstream status and
+                    # body) into a bare `UnicodeDecodeError` — the
+                    # upstream status is lost and the generator dies.
+                    # Decoding once up front means neither branch below
+                    # can throw a decoding error, and the trap cannot
+                    # come back by someone editing one branch in
                     # isolation. Mirrors `anthropic.py` §"Decode
-                    # exactly once, with replacement".
+                    # exactly once, with replacement" / `gemini.py`.
                     import json
                     error_text = (
                         error_body.decode(errors="replace") if error_body else ""
