@@ -212,58 +212,62 @@ class TestFrontierModelEnvOverride:
             asyncio.run(router.close())
 
 
-class TestFrontierPricingHonestUnpriced:
-    """T-frontier-tier F-1 (msg-016): placeholder IDs must land unpriced.
+class TestFrontierPricingRealAndReconcilable:
+    """T-frontier-tier F-1 (msg-016), after the real numbers landed.
 
-    Original design tried to seed both Fable 5 and Opus 5 in
-    DEFAULT_PRICING so requirement 6 (reconcilable frontier costs)
-    would work at the shipped defaults. Bohr's spec review
-    (msg-016 F-1) — endorsed by Einstein (msg-018) — observed that
-    the price *and* the ID are both placeholders, so any entry
-    keyed to them writes a confident-wrong cost to the ledger,
-    which is the exact failure class D-6c was built to prevent
-    re-entering through the constant instead of the lookup.
+    The original rule was: a placeholder ID must never carry a price,
+    because an entry keyed to an invented ID writes a confident-wrong
+    cost to the ledger — the exact failure D-6c exists to prevent,
+    re-entering through the constant instead of the lookup. The rule
+    was never "frontier stays unpriced forever"; it was **add the ID
+    and the price together, or neither**, with a citation date.
 
-    The correct honest state until Anthropic's published IDs and
-    per-MTok figures are known: no Fable 5 / Opus 5 entries in
-    DEFAULT_PRICING; frontier requests degrade safely to
-    ``pricing_known=0`` and log ``cost_pricing_unknown``. These
-    tests pin the honest path so a future edit re-adding an
-    invented price is caught immediately.
+    2026-09-01: both landed. `claude-fable-5` is the real Anthropic ID
+    (the old `claude-fable-5-20260101` carried a date suffix that no
+    Anthropic Claude 5 model ID has) and $10 / $50 per MTok are the
+    published base rates. So the invariant flips from "must be absent"
+    to "must be present, and must still refuse date-suffixed
+    placeholders" — same rule, other side of the transition.
+
+    The unpriced degrade path is NOT dropped: it still has coverage
+    below against a genuinely unknown model, because that path is what
+    protects the *next* model added before its price is known.
     """
 
-    def test_default_frontier_model_is_unpriced_until_verified(self) -> None:
-        """Placeholder IDs stay OUT of DEFAULT_PRICING until real numbers land."""
+    def test_shipped_frontier_model_is_priced(self) -> None:
+        """ID and price must travel together — here, both present."""
         from lexora.services.cost_tracker import DEFAULT_PRICING
 
         settings = create_settings(REPO_CONFIG)
         default_model = settings.routing.backends["frontier"].models[0].name
-        assert default_model not in DEFAULT_PRICING, (
-            f"frontier default model {default_model!r} appears in "
-            "DEFAULT_PRICING; if you have added it, the price must be "
-            "from Anthropic's published pricing page with a citation "
-            "date in the constant's comment (msg-016 F-1). If the ID "
-            "is still a placeholder, remove the pricing entry — a "
-            "confident-wrong ledger row is worse than an unpriced one."
+        assert default_model in DEFAULT_PRICING, (
+            f"frontier default model {default_model!r} is missing from "
+            "DEFAULT_PRICING. Shipping a frontier tier whose model has no "
+            "price puts every billed frontier request in the "
+            "pricing_known=0 bucket, so requirement 6 (reconcilable "
+            "frontier costs) cannot be met. Add the price from Anthropic's "
+            "published pricing page with a citation date — or, if the ID is "
+            "not verified yet, revert the ID too. Never one without the "
+            "other (msg-016 F-1)."
         )
 
-    def test_opus_5_placeholder_is_unpriced(self) -> None:
-        """The Opus 5 placeholder ID must not carry an invented price either."""
+    def test_placeholder_ids_are_never_priced(self) -> None:
+        """Date-suffixed placeholder IDs must not carry prices."""
         from lexora.services.cost_tracker import DEFAULT_PRICING
 
-        assert "claude-opus-5-20260601" not in DEFAULT_PRICING, (
-            "Placeholder ID with placeholder price violates F-1 — "
-            "when the real Opus 5 ID and price are known, add both "
-            "together (never one without the other)."
-        )
+        for placeholder in (
+            "claude-fable-5-20260101",
+            "claude-opus-5-20260601",
+        ):
+            assert placeholder not in DEFAULT_PRICING, (
+                f"Placeholder ID {placeholder!r} carries a price. Anthropic's "
+                "Claude 5 model IDs have no date suffix, so this ID cannot be "
+                "billed — a price keyed to it can only ever be "
+                "confident-wrong (msg-016 F-1)."
+            )
 
-    def test_unpriced_frontier_records_pricing_known_zero(
-        self, tmp_path
-    ) -> None:
-        """End-to-end honest-path check: recording a frontier request against
-        the shipped default model yields ``pricing_known=0`` and the model
-        surfaces in ``unpriced_models``. If someone re-adds a fabricated
-        price entry this test flips (which is exactly what F-1 forbids)."""
+    def test_priced_frontier_records_pricing_known_one(self, tmp_path) -> None:
+        """End-to-end: the shipped default now yields a reconcilable row."""
         from lexora.services.cost_tracker import CostTracker
 
         settings = create_settings(REPO_CONFIG)
@@ -278,11 +282,32 @@ class TestFrontierPricingHonestUnpriced:
             tier="frontier",
         )
         rows = tracker.get_recent(limit=1)
+        assert rows[0]["pricing_known"] == 1
+        # 100 in @ $10/MTok + 50 out @ $50/MTok
+        assert rows[0]["cost_usd"] == pytest.approx(0.0035)
+
+        report = tracker.get_costs(period="all")
+        assert default_model not in report["unpriced_models"]
+        assert report["summary"]["unpriced_requests"] == 0
+
+    def test_unknown_model_still_degrades_to_unpriced(self, tmp_path) -> None:
+        """The D-6c honest-degrade path stays covered for the next new model."""
+        from lexora.services.cost_tracker import CostTracker
+
+        tracker = CostTracker(db_path=tmp_path / "costs.db")
+        tracker.record(
+            model="claude-not-yet-priced-9",
+            endpoint="/v1/chat/completions",
+            tokens_input=100,
+            tokens_output=50,
+            tier="frontier",
+        )
+        rows = tracker.get_recent(limit=1)
         assert rows[0]["pricing_known"] == 0
         assert rows[0]["cost_usd"] == 0.0
 
         report = tracker.get_costs(period="all")
-        assert default_model in report["unpriced_models"]
+        assert "claude-not-yet-priced-9" in report["unpriced_models"]
         assert report["summary"]["unpriced_requests"] == 1
 
 
