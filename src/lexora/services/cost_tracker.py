@@ -33,17 +33,33 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
     # Anthropic — Claude 4 series (Sonnet / Opus, per anthropic.com/pricing)
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-opus-4-20250514": {"input": 15.0, "output": 75.0},
-    # NOTE: Claude 5 series (Fable / Opus, the frontier tier candidates)
-    # are deliberately absent. This module refuses to invent prices for
-    # placeholder model IDs — an invented price keyed to an invented ID
-    # is written to the ledger as authoritative (D-6c's `pricing_known=1`
-    # path), which is the exact class of silent-wrong-billing that D-6c
-    # was built to prevent, re-entering through the constant instead of
-    # the lookup. When Anthropic publishes the real IDs and per-MTok
-    # prices, add them here **together** with a citation date; until
-    # then, frontier requests correctly land in the `pricing_known=0`
-    # bucket with a `cost_pricing_unknown` warning (see the config
-    # comment on `backends.frontier.models[0]`).
+    # Claude 5 series. Added 2026-09-01 with the real model ID and the real
+    # base per-MTok rates, read that day from
+    # https://platform.claude.com/docs/en/about-claude/pricing — which is what
+    # the previous note here asked for before anything was written down. The
+    # placeholder ID `claude-fable-5-20260101` is NOT listed and must not be:
+    # it never existed upstream, and pricing an ID that cannot be billed is
+    # the invented-price failure this table exists to avoid.
+    #
+    # These are the *base* input/output rates. This table is a flat
+    # {input, output} pair per model, so it cannot express the modifiers
+    # Anthropic applies on top: prompt-cache writes (1.25x / 2x) and reads
+    # (0.1x), the Batch API's 50% discount, and the 1.1x `inference_geo: us`
+    # multiplier. Lexora sends none of those today (no cache_control, no
+    # batch, no inference_geo), so base rates are exact for what it actually
+    # issues. If any of them is ever used, this table starts under-reporting
+    # and the schema — not just the numbers — has to change.
+    "claude-fable-5": {"input": 10.0, "output": 50.0},
+    "claude-opus-5": {"input": 5.0, "output": 25.0},
+    # NOTE: `gemini-3.1-pro-preview` (the naysayer tier) is still absent, and
+    # not by oversight. Google prices it on a context-size step —
+    # $2.00/$12.00 per MTok for prompts <= 200k, $4.00/$18.00 above that
+    # (ai.google.dev/gemini-api/docs/pricing, read 2026-09-01). A flat pair
+    # cannot say that. Writing the <=200k rate here would set
+    # `pricing_known=1` and silently under-bill every prompt over 200k, which
+    # is worse than the honest `pricing_known=0` it lands in today. Pricing
+    # that tier correctly needs a schema that carries thresholds; that is a
+    # separate change.
     # Claude Code (uses Anthropic pricing internally)
     "claude-code-sonnet": {"input": 3.0, "output": 15.0},
     "claude-code-opus": {"input": 15.0, "output": 75.0},

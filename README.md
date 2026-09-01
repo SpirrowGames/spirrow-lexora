@@ -205,7 +205,7 @@ Tiers are named entry points that the router resolves to a concrete `(backend, m
 | `medium` | `heavy` (vLLM, local GPU) | `Qwen3.8-27B` (think, `reasoning_effort=medium`) | Standard tasks with thinking |
 | `heavy` | `deep` (vLLM, local GPU) | `Qwen3.8-27B` (think, `reasoning_effort=xhigh`) | Complex reasoning (marginal cost zero — do not confuse "heavy" with "expensive"; heavy means "runs the biggest local reasoning budget", not "the paid frontier model") |
 | `naysayer` | `gemini` (Google Gemini API, paid) | `gemini-3.1-pro-preview` | Independent-distribution reviewer (data-governance gate: plain `generateContent` only) |
-| `frontier` | `frontier` (Anthropic API, paid) | `claude-fable-5-20260101` (env-configurable via `LEXORA_FRONTIER_MODEL`) | Top-of-line paid model; distinct entry so cost/latency/decline behaviour are chosen deliberately |
+| `frontier` | `frontier` (Anthropic API, paid) | `claude-fable-5` (env-configurable via `LEXORA_FRONTIER_MODEL`) | Top-of-line paid model; distinct entry so cost/latency/decline behaviour are chosen deliberately |
 
 ### Frontier Tier — Operational Notes
 

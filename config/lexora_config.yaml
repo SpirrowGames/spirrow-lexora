@@ -234,18 +234,16 @@ routing:
       health_check: false
       default_max_tokens: 8000
       error_passthrough: true
-      # !!! 初回の課金呼び出し前に、実 Anthropic モデル ID と実 per-MTok
-      # 価格の両方を埋める !!! `claude-fable-5-20260101` は placeholder で、
-      # Anthropic が公開する実 ID とは違う可能性が高い。実 ID を
-      # `name:` に (または env `LEXORA_FRONTIER_MODEL` に) 入れ、同じ ID を
-      # `src/lexora/services/cost_tracker.py` の DEFAULT_PRICING に価格つきで
-      # 追加する。埋めるまでは frontier リクエストが
-      # pricing_known=0 の unpriced 行として台帳に載り、
-      # `cost_pricing_unknown` warning が出る (T-frontier-tier D-6c の
-      # 安全側デグラード)。placeholder が黙って通ることは無いが、
-      # 課金の突合 (要件 6) は price の実値が入るまで意味を持たない。
+      # 2026-09-01 に placeholder を実 ID へ差し替え済み。旧値
+      # `claude-fable-5-20260101` は日付サフィックス付きで、Anthropic の
+      # 実 ID (日付サフィックス無し) とは別物だった。同じ ID を
+      # `src/lexora/services/cost_tracker.py` の DEFAULT_PRICING にも
+      # 実価格つきで登録済み ($10 / $50 per MTok, base rate) ∴ frontier の
+      # 課金行は pricing_known=1 で台帳に載る。
+      # 片方だけ直すと「実在する ID に価格が無い」か「価格はあるが ID が
+      # 実在しない」のどちらかになるので、ID と価格は必ず同じ変更で動かす。
       models:
-        - name: "claude-fable-5-20260101"
+        - name: "claude-fable-5"
           capabilities: ["code", "reasoning", "analysis", "general", "frontier"]
           description: "Anthropic Claude Fable 5 (frontier ティア既定モデル、30 日保持・分類器あり)"
 
