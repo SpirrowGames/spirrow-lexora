@@ -232,7 +232,7 @@ class ClaudeCodeBackend(Backend):
                     f"Claude Code process failed (exit {process.returncode}): {error_msg[:200]}"
                 )
 
-            output = stdout.decode("utf-8").strip()
+            output = stdout.decode("utf-8", errors="replace").strip()
 
             try:
                 result = json.loads(output)
@@ -355,7 +355,7 @@ class ClaudeCodeBackend(Backend):
                 if not line:
                     break
 
-                line_str = line.decode("utf-8").strip()
+                line_str = line.decode("utf-8", errors="replace").strip()
                 if not line_str:
                     continue
 
