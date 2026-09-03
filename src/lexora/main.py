@@ -4,12 +4,13 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from lexora import __version__
 from lexora.api.routes import router
+from lexora.backends.base import ModelNotFoundError
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import create_settings, Settings
 from lexora.services.metrics import MetricsCollector
@@ -122,6 +123,53 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Include API routes
     app.include_router(router)
+
+    # ModelNotFoundError -> 404 in the caller's dialect (T-silent-routing
+    # R-1a / R-2). Registered as a global handler so every endpoint that
+    # calls into ``BackendRouter.get_backend_for_model`` — the /v1/*, /chat,
+    # /generate and /v1/messages families — reports the same status for
+    # "unknown model" and "ambiguous model", without a wrapping try/except
+    # at each callsite.
+    #
+    # The body shape follows the endpoint the request landed on:
+    #
+    # * /v1/messages returns the Anthropic ``{"type": "error", "error":
+    #   {...}}`` envelope so the ``anthropic`` SDK parses the failure
+    #   natively (the endpoint uses ``anthropic_error_body`` everywhere
+    #   else on the error path — a 404 in OpenAI shape would be the one
+    #   response that SDK would fail to typecheck).
+    # * Everything else returns the OpenAI ``{"error": {"message":,
+    #   "type":, "param":, "code":}}`` envelope with ``code:
+    #   model_not_found``, matching upstream vLLM / OpenAI for the same
+    #   HTTP status.
+    #
+    # The API code stays ``model_not_found`` for both unknown and ambiguous
+    # cases; the router logs the distinct event names
+    # (``model_unknown_refused`` / ``model_ambiguous_refused``) so operators
+    # can grep the two apart without introducing a client-side branch
+    # nobody has (T-silent-routing msg-082 objection B / msg-083 §2).
+    from lexora.api.anthropic_compat import anthropic_error_body
+
+    @app.exception_handler(ModelNotFoundError)
+    async def _model_not_found_handler(
+        request: Request, exc: ModelNotFoundError
+    ) -> JSONResponse:
+        if request.url.path == "/v1/messages":
+            return JSONResponse(
+                status_code=404,
+                content=anthropic_error_body("not_found_error", str(exc)),
+            )
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                    "param": "model",
+                    "code": "model_not_found",
+                }
+            },
+        )
 
     # Add metrics endpoint
     @app.get("/metrics", include_in_schema=False)

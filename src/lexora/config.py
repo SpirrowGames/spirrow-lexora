@@ -9,6 +9,81 @@ import yaml
 from pydantic import BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from lexora.utils.logging import get_logger
+
+_logger = get_logger(__name__)
+
+
+class DuplicateYamlKeyError(ValueError):
+    """Raised when a YAML mapping declares the same key twice.
+
+    Purpose (T-silent-routing R-5): PyYAML's SafeLoader silently keeps the
+    last value when a mapping has duplicate keys, so a config that reads
+    ``naysayer: {backend: gemini} / naysayer: {backend: heavy}`` at the
+    ``routing.backends`` level parses to a dict Python then sees as
+    single-keyed and correct. The disagreement between what the file says
+    and what the application sees is exactly the failure this branch is
+    against: a config that lies is worse than a config that will not load.
+
+    The message names the key and every line it appears on so an operator
+    diffing the file can find the collision without re-parsing.
+    """
+
+
+class _StrictSafeLoader(yaml.SafeLoader):
+    """SafeLoader that raises on duplicate keys in any mapping.
+
+    Applied to *every* mapping in the file, not just ones the schema knows
+    about. R-5 is intentionally wider than R-1a / R-1b: this loader also
+    catches ``routing.tiers.frontier`` declared twice, ``models:`` entries
+    with duplicated fields, and any future config key. Fixing the class
+    of bug at the parser is smaller than adding a validator per field.
+    """
+
+
+def _construct_strict_mapping(
+    loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    """Build a mapping, but raise when the same key appears twice."""
+    loader.flatten_mapping(node)
+    seen: dict[Any, tuple[int, int]] = {}
+    for key_node, _ in node.value:
+        # ``construct_object`` is what SafeLoader would call for each key,
+        # so scalar keys become the same Python objects the default loader
+        # would produce (``"heavy"`` stays ``"heavy"``, not a ScalarNode).
+        key = loader.construct_object(key_node, deep=True)
+        try:
+            hash(key)
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found unhashable key ({exc})",
+                key_node.start_mark,
+            ) from exc
+        if key in seen:
+            first_line, first_col = seen[key]
+            raise DuplicateYamlKeyError(
+                f"duplicate key {key!r} in YAML mapping: first seen at "
+                f"line {first_line}, column {first_col}; repeated at "
+                f"line {key_node.start_mark.line + 1}, column "
+                f"{key_node.start_mark.column + 1}. A YAML mapping with "
+                f"duplicate keys parses to whatever the last one says, so "
+                f"the file and the loaded config disagree. Fix the source "
+                f"file — do not rely on the loader picking a winner."
+            )
+        seen[key] = (key_node.start_mark.line + 1, key_node.start_mark.column + 1)
+    # Delegate the actual mapping construction to the base implementation so
+    # the value nodes are converted through the normal path.
+    return loader.construct_mapping(node, deep=deep)  # type: ignore[no-any-return]
+
+
+_StrictSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_strict_mapping,
+)
+
+
 #: Backend types whose implementation actually honours ``error_passthrough``.
 #: This is a wiring fact, not a policy: ``backends/factory.py`` passes the
 #: flag to ``AnthropicBackend`` only, and only the anthropic backend raises
@@ -253,6 +328,45 @@ class RoutingSettings(BaseSettings):
         description="Task classifier settings",
     )
 
+    @model_validator(mode="after")
+    def _reject_tier_backend_collisions(self) -> "RoutingSettings":
+        """Refuse configs where a tier name is also declared as a backend model name.
+
+        T-silent-routing R-1b: tier names are gateway abstractions with a 1:1
+        mapping to a backend. If a tier name ``frontier`` is also declared as
+        a concrete model name on some backend, ``get_backend_for_model``'s
+        tier lookup wins (see ``BackendRouter.get_backend_for_model``), which
+        means the model declaration is unreachable but present. Reject rather
+        than accept-and-ignore.
+
+        The stronger case — the *same tier* claimed by two different
+        backends — cannot reach this validator: ``tiers`` is a ``dict[str,
+        TierSettings]`` so duplicate top-level tier keys are already
+        collapsed by the YAML loader (SafeLoader) into a single entry, last-
+        writer-wins, before Pydantic sees the payload. R-5's strict loader
+        catches that class at parse time; this validator catches the
+        cross-section collision (tier name vs model name) that R-5 cannot
+        see.
+        """
+        tier_names = set(self.tiers)
+        offenders: list[tuple[str, str]] = []
+        for backend_name, backend_settings in self.backends.items():
+            for model_info in backend_settings.models:
+                if model_info.name in tier_names:
+                    offenders.append((backend_name, model_info.name))
+        if offenders:
+            lines = ", ".join(
+                f"backend '{bn}' declares model '{mn}'" for bn, mn in offenders
+            )
+            raise ValueError(
+                f"tier/model name collision in routing config: {lines}. "
+                f"A tier name is a gateway alias and always wins over a "
+                f"concrete model name at request time, so the model "
+                f"declaration is unreachable. Rename either side rather "
+                f"than shipping a declaration that never routes."
+            )
+        return self
+
 
 class ServerSettings(BaseSettings):
     """Server settings."""
@@ -342,7 +456,13 @@ def load_yaml_config(config_path: Path | None = None) -> dict:
         return {}
 
     with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        # Strict loader (R-5): duplicate keys in any mapping are rejected
+        # rather than silently overwritten. See ``_StrictSafeLoader``. This
+        # runs before Pydantic and is the only layer that can see the raw
+        # text — by the time a dict reaches ``RoutingSettings``, a duplicate
+        # top-level tier key (``routing.tiers.frontier`` declared twice, for
+        # instance) has already been collapsed to whichever appeared last.
+        return yaml.load(f, Loader=_StrictSafeLoader) or {}
 
 
 def _apply_frontier_model_override(
