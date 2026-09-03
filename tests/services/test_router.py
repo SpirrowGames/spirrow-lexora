@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from lexora.backends.base import BackendError
+from lexora.backends.base import BackendError, ModelNotFoundError
 from lexora.config import BackendSettings, RoutingSettings, TierSettings, VLLMSettings
 from lexora.services.router import BackendRouter
 
@@ -26,7 +26,15 @@ class TestBackendRouterSingleMode:
         assert router.default_backend is router.backends["default"]
 
     def test_get_backend_for_model_returns_default(self) -> None:
-        """Test that any model returns the default backend."""
+        """Single-backend legacy mode routes every name to the one backend.
+
+        T-silent-routing R-2's "refuse unknown names" applies only when
+        multi-backend routing is enabled: in legacy single-mode there are
+        no candidates to silently pick between, and the whole shape of
+        the mode is "one backend accepts everything, model name is
+        ignored". Refusing here would break every existing caller of the
+        legacy configuration.
+        """
         routing_settings = RoutingSettings(enabled=False)
         vllm_settings = VLLMSettings(url="http://localhost:8000")
 
@@ -99,8 +107,17 @@ class TestBackendRouterMultiMode:
         assert backend1 is router.backends["backend1"]
         assert backend2 is router.backends["backend2"]
 
-    def test_get_backend_for_unmapped_model_returns_default(self) -> None:
-        """Test that unmapped models return default backend."""
+    def test_get_backend_for_unmapped_model_refuses(self) -> None:
+        """Unmapped names are refused, not silently sent to default.
+
+        T-silent-routing R-2: the old behavior fell through to
+        ``default_backend`` with a DEBUG-only log line, which vanished
+        under production's INFO filter. That was the 2026-08 failure
+        (``model=frontier`` silently answered by the heavy backend under
+        the vLLM name) this branch exists to fix. Multi-backend mode now
+        raises ``ModelNotFoundError`` — the API surfaces it as HTTP 404
+        via the exception handler registered in ``main.py``.
+        """
         routing_settings = RoutingSettings(
             enabled=True,
             default_backend="backend1",
@@ -122,11 +139,17 @@ class TestBackendRouterMultiMode:
             vllm_settings=vllm_settings,
         )
 
-        backend = router.get_backend_for_model("unknown-model")
-        assert backend is router.backends["backend1"]
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            router.get_backend_for_model("unknown-model")
+        assert exc_info.value.reason == "unknown"
 
     def test_get_backend_for_invalid_default_raises_error(self) -> None:
-        """Test that invalid default backend raises error."""
+        """A misconfigured ``default_backend`` name is unreachable in
+        multi-backend mode after T-silent-routing R-2 (unknown names
+        raise ``ModelNotFoundError`` before the default-backend lookup
+        runs). The test now pins that path — an unknown-model request
+        raises ``ModelNotFoundError``, and the misconfigured default is
+        never consulted."""
         routing_settings = RoutingSettings(
             enabled=True,
             default_backend="nonexistent",
@@ -144,7 +167,7 @@ class TestBackendRouterMultiMode:
             vllm_settings=vllm_settings,
         )
 
-        with pytest.raises(BackendError):
+        with pytest.raises(ModelNotFoundError):
             router.get_backend_for_model("unknown-model")
 
 
@@ -401,31 +424,52 @@ class TestBackendRouterTierRouting:
         assert router.get_backend_for_model("light") is router.backends["backend1"]
         assert router.get_backend_for_model("heavy") is router.backends["backend2"]
 
-    def test_tier_takes_precedence_over_model(self) -> None:
-        """Test that tier mapping takes precedence when name collides with model."""
-        router = self._make_router(
-            tiers={
-                "model-a": TierSettings(backend="backend2"),
-            }
-        )
+    def test_tier_name_colliding_with_model_is_rejected_at_construction(
+        self,
+    ) -> None:
+        """A tier whose name is also declared as a backend model is
+        rejected at ``RoutingSettings`` construction (T-silent-routing
+        R-1b). The old test measured which of the two won at request
+        time; the new posture is that the config that lets them collide
+        does not start.
+        """
+        with pytest.raises(ValueError, match="tier/model name collision"):
+            RoutingSettings(
+                enabled=True,
+                default_backend="backend1",
+                backends={
+                    "backend1": BackendSettings(
+                        url="http://localhost:8001",
+                        models=["model-a"],
+                    ),
+                    "backend2": BackendSettings(
+                        url="http://localhost:8002",
+                        models=["model-b"],
+                    ),
+                },
+                tiers={
+                    "model-a": TierSettings(backend="backend2"),
+                },
+            )
 
-        # "model-a" is registered as both a model (→backend1) and a tier (→backend2)
-        # Tier should win
-        assert router.get_backend_for_model("model-a") is router.backends["backend2"]
-
-    def test_unknown_name_falls_to_default(self) -> None:
-        """Test that names matching neither tier nor model fall to default."""
+    def test_unknown_name_refused_not_fall_through(self) -> None:
+        """T-silent-routing R-2: names matching neither tier nor model
+        are refused, not silently routed to ``default_backend``."""
         router = self._make_router(
             tiers={
                 "light": TierSettings(backend="backend1"),
             }
         )
 
-        backend = router.get_backend_for_model("unknown")
-        assert backend is router.backends["backend1"]  # default
+        with pytest.raises(ModelNotFoundError):
+            router.get_backend_for_model("unknown")
 
     def test_tier_with_invalid_backend_is_skipped(self) -> None:
-        """Test that tiers referencing non-existent backends are not registered."""
+        """A tier referencing a non-existent backend is not registered
+        as a route. Because the tier alias never enters
+        ``_tier_to_backend``, a request for that alias falls through the
+        tier lookup and — post R-2 — is refused as "unknown" rather than
+        silently routed to ``default_backend``."""
         router = self._make_router(
             tiers={
                 "broken": TierSettings(backend="nonexistent"),
@@ -433,9 +477,11 @@ class TestBackendRouterTierRouting:
             }
         )
 
-        # "broken" tier should not be registered
-        assert router.get_backend_for_model("broken") is router.backends["backend1"]  # falls to default
-        # "valid" tier should work
+        # "broken" tier is not registered, so the name is treated as
+        # unknown and refused.
+        with pytest.raises(ModelNotFoundError):
+            router.get_backend_for_model("broken")
+        # "valid" tier still works.
         assert router.get_backend_for_model("valid") is router.backends["backend2"]
 
     def test_get_backend_name_for_model_resolves_tier(self) -> None:

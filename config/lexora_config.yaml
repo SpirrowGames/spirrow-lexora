@@ -12,7 +12,15 @@ server:
 routing:
   enabled: true
   default_backend: "heavy"
-  default_model_for_unknown_task: "Qwen3.8-27B"
+  # tier alias, not a raw model name (T-silent-routing R-1a): the raw name
+  # `Qwen3.8-27B` is declared by three backends (heavy / light / deep, same
+  # upstream URL, different reasoning_effort / thinking_mode), so requesting
+  # it by name is refused with 404 rather than routed to a winner picked by
+  # YAML declaration order. Tier aliases go through the unambiguous tier
+  # lookup, so this field points at a tier — `heavy` here matches
+  # `default_backend` so /generate and /chat without an explicit model land
+  # on the same backend as everything else that falls to the default.
+  default_model_for_unknown_task: "heavy"
 
   # ティアベースルーティング
   # 呼び出し側は model: "light" 等のティア名を指定するだけでよい
