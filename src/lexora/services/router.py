@@ -530,11 +530,28 @@ class BackendRouter:
         the current model ID — and after R-1a / R-2 those names are refused
         with 404. Advertising them would make ``/v1/models`` describe a
         gateway that does not exist. Concrete IDs therefore appear only when
-        exactly one backend declares them; the rest of the upstream's
-        catalogue is reachable through the tier alias that resolves to it.
-        The narrowing runs one way only: everything advertised is
-        routable, while a declared name whose own upstream does not report
-        it is routable without being advertised.
+        exactly one backend declares them.
+
+        The narrowing runs **both** ways (T-models-advertise-side): the
+        advertised set is the routable set, not merely a subset of it. This
+        used to stop at the subset, on the reasoning that a declared name
+        the upstream does not report is still reachable through the tier
+        alias that resolves to its backend. That reasoning has two holes,
+        and the shipped config fell into both at once. ``list_models`` is
+        not a catalogue for every backend — ``ClaudeCodeBackend`` returns a
+        hardcoded empty list, because the Claude Code CLI has no catalogue
+        to report — so "an upstream reported it" answers "does not exist"
+        about a model that demonstrably routes; and no shipped tier maps to
+        ``claude_code``, so the consolation about tier reachability was
+        false for it. Both shipped ``claude-code-*`` names were routable
+        and absent from ``/v1/models``, making the whole backend
+        undiscoverable through the API.
+
+        The rule that replaces the proxy is the one already applied to
+        tier aliases: a name this gateway declares is advertised on this
+        gateway's own authority. W-3 is not weakened by it — the set being
+        advertised is the routable one, so an ambiguous name (404 by R-1a)
+        and an upstream-only name (404 by R-2) are both still held out.
 
         A concrete row's ``backend`` is the backend that declares the
         model (T-silent-routing R-7), which is not the same as the backend
@@ -676,6 +693,59 @@ class BackendRouter:
                     backend=name,
                     error=str(e),
                 )
+
+        # T-models-advertise-side: fill in the routable names no upstream
+        # reported, so the advertised set is the routable set rather than
+        # a subset of it.
+        #
+        # ``_model_to_backend`` is the by-name routable set exactly — an
+        # ambiguous name was deliberately left out of it at registration,
+        # so iterating it advertises every *routable* declaration and no
+        # merely *declared* one. That distinction is the whole reason
+        # this loop reads the index rather than the config: advertising
+        # every declared name would put ambiguous names back into a
+        # listing that R-1a refuses to route.
+        #
+        # ``_seen_ids`` keeps this additive. A name the declaring
+        # backend's upstream did report already has a row carrying the
+        # vendor's own ``created`` / ``owned_by``, and that row is the
+        # more truthful one; this loop must fill the gap, not overwrite
+        # what was actually reported.
+        #
+        # Legacy single-backend mode keeps an empty index (every name
+        # routes to the one backend), so this loop is a no-op there and
+        # the listing stays exactly what the upstream said.
+        for model_id, declaring_backend_name in self._model_to_backend.items():
+            if model_id in _seen_ids:
+                continue
+            _seen_ids.add(model_id)
+            all_models.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    # Same two values, and the same reasoning, as a tier
+                    # row below. No upstream vouched for this row: it
+                    # exists because this gateway's config declares the
+                    # name and this gateway routes it. ``owned_by``
+                    # records who asserts the row, which is what the
+                    # gateway can actually know — the vendor string is
+                    # not knowable here, and a plausible invented one
+                    # would be worse than an honest one. ``created: 0``
+                    # is the "no creation time exists" sentinel for the
+                    # same reason it is on a tier row.
+                    "created": 0,
+                    "owned_by": "lexora",
+                    # Additive marker, in the idiom `type: "tier"`
+                    # already established below: an upstream-reported row
+                    # carries no `type`, so a client can tell a row this
+                    # gateway asserts from one an upstream confirmed
+                    # without having to read `owned_by` as a proxy.
+                    "type": "declared",
+                    # R-7: the declaring backend, which is exactly what
+                    # ``get_backend_name_for_model`` will answer.
+                    "backend": declaring_backend_name,
+                }
+            )
 
         # Tier aliases. Emitted after backend models so a listing consumer
         # reading top-down sees concrete IDs first, then the tier names that

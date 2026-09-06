@@ -306,7 +306,26 @@ class TestBackendRouterListModels:
 
     @pytest.mark.asyncio
     async def test_list_all_models_handles_backend_error(self) -> None:
-        """Test that backend errors are handled gracefully."""
+        """A failing catalogue call must not remove routable names.
+
+        This test changed with T-models-advertise-side and the change is
+        deliberate. It used to assert the listing was exactly one row —
+        ``model-a`` from the backend that answered — which encoded the
+        old rule that a name is advertised only when some upstream
+        reported it. Under that rule a transient ``BackendError`` from
+        ``backend2`` also deleted ``model-b`` from ``/v1/models`` while
+        the router went on routing it, so ``/v1/models`` disagreed with
+        the router because a catalogue call timed out.
+
+        The advertised set is the routable set now, and routability is a
+        property of the config, not of whether an upstream answered a
+        listing call just then. ``model-b`` is therefore still
+        advertised, and reachability is ``GET /health``'s surface, not
+        this one. The original detector is unchanged underneath: the
+        backend that answered still contributes its own row, so a
+        ``BackendError`` that escaped the ``except`` and aborted the
+        whole listing still fails here.
+        """
         routing_settings = RoutingSettings(
             enabled=True,
             default_backend="backend1",
@@ -341,9 +360,23 @@ class TestBackendRouterListModels:
 
         models = await router.list_all_models()
 
-        # Should still return models from backend1
-        assert len(models["data"]) == 1
-        assert models["data"][0]["id"] == "model-a"
+        rows = {m["id"]: m for m in models["data"]}
+        # The backend that answered still contributes its own row, with
+        # the upstream's payload passed through rather than replaced.
+        assert "model-a" in rows
+        assert rows["model-a"]["backend"] == "backend1"
+        assert "created" not in rows["model-a"], (
+            "backend1's row came from its upstream; it must not be "
+            "overwritten by the declared-name row."
+        )
+        # And the name whose backend could not be asked is still routable,
+        # so it is still advertised.
+        assert "model-b" in rows, (
+            "backend2 failed its catalogue call, but the router still "
+            f"routes 'model-b'. Got: {sorted(rows)}"
+        )
+        assert rows["model-b"]["backend"] == "backend2"
+        assert set(rows) == set(router._model_to_backend)
 
 
 class TestBackendRouterClose:
