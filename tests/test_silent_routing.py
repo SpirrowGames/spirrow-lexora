@@ -26,9 +26,14 @@ introduces (msg-078 through msg-083):
   ``default_backend``. The refusal is logged at WARNING (not DEBUG) so
   the operational surface for fall-through requests survives the
   ``INFO``-level log filter that runs in production.
-* W-3 — ``/v1/models`` never enumerates a name the router will 404.
-  Ambiguous names are filtered out of the listing so the advertised set
-  is a subset of the routable set.
+* W-2 — a refusal message may only offer remedies that exist in the
+  config being served. "Use a tier name" is generated from the tiers
+  that actually reach the colliding backends; when no tier does, the
+  message says the name is not routable instead of inventing one.
+* W-3 — ``/v1/models`` never enumerates a name the router will 404. The
+  listing is narrowed to the by-name routable set, which drops both
+  ambiguous names and names only the upstream knows about, so the
+  advertised set is a subset of the routable set.
 * 404 body shape — clients see the OpenAI standard ``model_not_found``
   code; the anthropic-shaped ``/v1/messages`` endpoint sees the
   Anthropic ``{"type": "error", ...}`` envelope. The distinction between
@@ -171,6 +176,83 @@ class TestTierBackendCollision:
         )
         assert "light" in settings.tiers
         assert settings.backends["b1"].models[0].name == "real-model"
+
+
+class TestSameTierDeclaredTwiceIsRefused:
+    """R-1b acceptance test, stated the way the spec states it.
+
+    Spec v2 (msg-081 §3.2, restated in msg-083): *"given a config where
+    two backends declare the same tier, loading the configuration must
+    fail"* — and explicitly **which layer refuses is not part of the
+    requirement**. The point of writing it layer-agnostically is to
+    catch the case where R-1b was implemented but is unreachable because
+    the parser already ate the collision (Einstein, msg-080): an R-1b
+    unit test alone would pass without ever proving the config is
+    refused end to end.
+
+    How the collision is expressed here follows from the schema, not
+    from a choice: ``RoutingSettings.tiers`` is a ``dict[str,
+    TierSettings]`` whose *key* is the tier name and whose ``backend``
+    field names the backend. There is no field on a backend by which it
+    could claim a tier, so "two backends declare the same tier" can only
+    be written as one tier key appearing twice with two different
+    ``backend`` values — which is the form below. Under stock
+    ``yaml.SafeLoader`` this parses to the second entry with nothing
+    logged; the R-5 loader refuses it. R-1b is therefore not an empty
+    requirement, and it is satisfied one layer below where it was
+    originally written.
+    """
+
+    def test_two_backends_claiming_one_tier_fails_to_load(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            "routing:\n"
+            "  enabled: true\n"
+            "  default_backend: b1\n"
+            "  backends:\n"
+            "    b1:\n"
+            "      url: http://localhost:1\n"
+            "    b2:\n"
+            "      url: http://localhost:2\n"
+            "  tiers:\n"
+            "    heavy:\n"
+            "      backend: b1\n"
+            "    heavy:\n"
+            "      backend: b2\n",
+            encoding="utf-8",
+        )
+        # Deliberately broad: the requirement is "the config does not
+        # load", not "layer X raised". ``DuplicateYamlKeyError`` is a
+        # ``ValueError``, as is Pydantic's ``ValidationError``, so this
+        # keeps passing if the refusal ever moves between layers.
+        with pytest.raises(ValueError):
+            create_settings(path)
+
+    def test_stock_loader_would_have_accepted_it(self, tmp_path: Path) -> None:
+        """Pin the reason the test above is not tautological.
+
+        If PyYAML ever started rejecting duplicate keys on its own, the
+        test above would pass for a reason that has nothing to do with
+        this branch, and deleting ``_StrictSafeLoader`` would not turn it
+        red. This asserts the stock loader still silently picks a winner,
+        so the coverage above is attributable to the code we added.
+        """
+        import yaml
+
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            "tiers:\n"
+            "  heavy:\n"
+            "    backend: b1\n"
+            "  heavy:\n"
+            "    backend: b2\n",
+            encoding="utf-8",
+        )
+        with open(path, "r", encoding="utf-8") as fh:
+            stock = yaml.safe_load(fh)
+        assert stock == {"tiers": {"heavy": {"backend": "b2"}}}
 
 
 # --------------------------------------------------------------------------
@@ -369,17 +451,124 @@ class TestUnknownModelRefused:
 
 
 # --------------------------------------------------------------------------
+# W-2 — a refusal message may only advertise remedies that exist
+# --------------------------------------------------------------------------
+
+
+class TestRefusalMessageOffersOnlyRealRemedies:
+    """W-3's sibling: the *message* must not describe a gateway that isn't.
+
+    "Use a tier name instead" is sound advice only when some tier
+    reaches one of the backends that declared the requested name. Two
+    backends can share a model name with neither exposed as a tier, and
+    in that config the advice sends the caller hunting for something
+    that does not exist. Since this whole branch is about the gateway
+    not stating things about itself that are untrue, a hardcoded remedy
+    string would reproduce the defect one layer up from where it was
+    fixed.
+    """
+
+    def test_message_lists_the_tiers_that_actually_reach_the_backends(
+        self,
+    ) -> None:
+        router = _shared_model_router()
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            router.get_backend_for_model("dup-model")
+        message = str(exc_info.value)
+        # Every colliding backend is named: the operator has to know
+        # which declarations collided, not which one would have won.
+        for backend_name in ("b1", "b2", "b3"):
+            assert backend_name in message
+        # ...and every tier offered is one that exists in this config.
+        for tier in ("light", "medium", "heavy"):
+            assert tier in message
+
+    def test_message_refuses_to_invent_a_tier_when_none_exists(self) -> None:
+        """The case W-2 was written for: no tier reaches the collision.
+
+        Without the config lookup this message would still say "use a
+        tier name instead" while the config declares no tiers at all.
+        """
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(
+                        url="http://localhost:1", models=[{"name": "dup-model"}]
+                    ),
+                    "b2": BackendSettings(
+                        url="http://localhost:2", models=[{"name": "dup-model"}]
+                    ),
+                },
+                # No tiers at all — nothing to recommend.
+                tiers={},
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            router.get_backend_for_model("dup-model")
+        message = str(exc_info.value)
+        assert "not routable" in message
+        assert "/v1/models" in message
+        assert "Use one of these tier names" not in message
+
+    def test_message_ignores_tiers_pointing_elsewhere(self) -> None:
+        """Only tiers reaching a *declaring* backend are a remedy.
+
+        A tier that routes to some unrelated backend does not help a
+        caller who asked for this name, so listing it would be a
+        different flavour of the same lie.
+        """
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(
+                        url="http://localhost:1", models=[{"name": "dup-model"}]
+                    ),
+                    "b2": BackendSettings(
+                        url="http://localhost:2", models=[{"name": "dup-model"}]
+                    ),
+                    "b3": BackendSettings(
+                        url="http://localhost:3", models=[{"name": "unrelated"}]
+                    ),
+                },
+                tiers={"elsewhere": TierSettings(backend="b3")},
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            router.get_backend_for_model("dup-model")
+        message = str(exc_info.value)
+        assert "elsewhere" not in message
+        assert "not routable" in message
+
+    def test_both_lookup_paths_give_the_same_message(self) -> None:
+        """``get_backend_name_for_model`` reaches the caller through the
+        same 404 handler, so its advice must not be a shorter variant."""
+        router = _shared_model_router()
+        with pytest.raises(ModelNotFoundError) as by_backend:
+            router.get_backend_for_model("dup-model")
+        with pytest.raises(ModelNotFoundError) as by_name:
+            router.get_backend_name_for_model("dup-model")
+        assert str(by_backend.value) == str(by_name.value)
+
+
+# --------------------------------------------------------------------------
 # W-3 — /v1/models never enumerates a name the router will 404
 # --------------------------------------------------------------------------
 
 
-class TestListModelsFiltersAmbiguous:
+class TestListModelsMatchesRoutableSet:
     """W-3: the advertised set is a subset of the routable set.
 
-    Left unfiltered, three vllm backends proxying the same upstream would
-    return three identical rows for a name we then 404 on request. That
-    is exactly the "advertise an endpoint that structurally 404s"
-    failure Bohr called out in W-3.
+    Two ways a listed id can become unroutable once R-1a / R-2 are in:
+    the name is declared by several backends (ambiguous), or the
+    upstream serves it and no backend declares it. Both end in a 404, so
+    both have to leave the listing — filtering only the first would fix
+    the case we happened to think of rather than the invariant.
     """
 
     @pytest.mark.asyncio
@@ -446,8 +635,8 @@ class TestListModelsFiltersAmbiguous:
 
     @pytest.mark.asyncio
     async def test_duplicate_rows_from_shared_upstream_deduplicated(self) -> None:
-        """Three backends proxying the same upstream must not produce
-        three identical rows for the same non-ambiguous id."""
+        """Two backends proxying the same upstream must not produce two
+        identical rows for the same routable id."""
         router = BackendRouter(
             routing_settings=RoutingSettings(
                 enabled=True,
@@ -463,11 +652,14 @@ class TestListModelsFiltersAmbiguous:
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),
         )
+        # ``solo`` is declared by exactly one backend, so it is routable
+        # and survives the W-3 filter — but both backends point at the
+        # same upstream and so both report it.
         upstream_payload = {
             "object": "list",
             "data": [
                 {
-                    "id": "shared-extra",
+                    "id": "solo",
                     "object": "model",
                     "created": 1,
                     "owned_by": "vllm",
@@ -478,7 +670,98 @@ class TestListModelsFiltersAmbiguous:
         router.backends["b2"].list_models = AsyncMock(return_value=upstream_payload)
         listing = await router.list_all_models()
         ids = [m["id"] for m in listing["data"]]
-        assert ids.count("shared-extra") == 1
+        assert ids.count("solo") == 1
+
+    @pytest.mark.asyncio
+    async def test_upstream_only_name_is_not_advertised(self) -> None:
+        """W-3 in full: ambiguity is not the only way to 404.
+
+        A vLLM upstream serves the pre-rename alias next to the current
+        model ID, and this gateway declares only the latter. Before R-2,
+        asking for the alias fell through to ``default_backend`` and
+        answered 200, so listing it was true. After R-2 it is refused —
+        so listing it would make ``/v1/models`` advertise a name that
+        structurally 404s, which is the exact contradiction W-3 forbids
+        and the one this branch would otherwise have introduced.
+        """
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(
+                        url="http://localhost:1", models=[{"name": "current-name"}]
+                    ),
+                },
+                tiers={"light": TierSettings(backend="b1")},
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        router.backends["b1"].list_models = AsyncMock(
+            return_value={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "current-name",
+                        "object": "model",
+                        "created": 1,
+                        "owned_by": "vllm",
+                    },
+                    {
+                        "id": "legacy-alias",
+                        "object": "model",
+                        "created": 1,
+                        "owned_by": "vllm",
+                    },
+                ],
+            }
+        )
+        listing = await router.list_all_models()
+        ids = {m["id"] for m in listing["data"]}
+        assert "current-name" in ids
+        assert "light" in ids
+        assert "legacy-alias" not in ids, (
+            "'legacy-alias' is served by the upstream but declared by no "
+            f"backend, so the router 404s it. Got ids: {sorted(ids)}"
+        )
+        # And the invariant itself, stated once: everything advertised
+        # can actually be routed.
+        for model_id in ids:
+            router.get_backend_for_model(model_id)
+
+    @pytest.mark.asyncio
+    async def test_legacy_single_backend_listing_is_not_narrowed(self) -> None:
+        """The filter is scoped to multi-backend mode.
+
+        Legacy mode routes every name to the one backend and keeps an
+        empty by-name index, so filtering on that index would empty the
+        listing rather than narrow it — the listing would stop describing
+        a gateway that does route those names.
+        """
+        router = BackendRouter(
+            routing_settings=RoutingSettings(enabled=False),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        router.backends["default"].list_models = AsyncMock(
+            return_value={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "whatever-upstream-serves",
+                        "object": "model",
+                        "created": 1,
+                        "owned_by": "vllm",
+                    }
+                ],
+            }
+        )
+        listing = await router.list_all_models()
+        ids = {m["id"] for m in listing["data"]}
+        assert ids == {"whatever-upstream-serves"}
+        # Still routable in this mode — the listing stays true.
+        assert router.get_backend_for_model("whatever-upstream-serves") is (
+            router.backends["default"]
+        )
 
 
 # --------------------------------------------------------------------------

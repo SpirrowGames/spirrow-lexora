@@ -191,8 +191,8 @@ routing:
 
 **Behavior:**
 - Requests are routed to the appropriate backend based on the `model` parameter
-- Unregistered model names are routed to `default_backend`
-- `/v1/models` aggregates models from all backends and appends the configured tier aliases as `{"type": "tier", "id": "<tier>", "resolved_model": "<concrete-id>"}` entries so callers can see both the concrete model IDs the backend serves and the tier names the router accepts
+- Unregistered model names are **refused with `404` / `code: model_not_found`**, not routed to `default_backend`. A name declared by two or more backends is refused the same way, because there is no non-arbitrary way to pick between them — use the tier alias instead; the refusal message lists the tiers that reach the colliding backends. Both refusals are logged at `WARNING` (`model_unknown_refused` / `model_ambiguous_refused`), so a caller sending a name this gateway does not serve is visible at the shipping log level instead of being answered by whichever model `default_backend` happens to point at. This applies to multi-backend mode (`routing.enabled: true`); legacy single-backend mode has one backend and no choice to make, so it still accepts any name
+- `/v1/models` aggregates models from all backends and appends the configured tier aliases as `{"type": "tier", "id": "<tier>", "resolved_model": "<concrete-id>"}` entries so callers can see both the concrete model IDs the backend serves and the tier names the router accepts. In multi-backend mode the concrete entries are narrowed to the names the router will actually route: a name declared by several backends, or one only the upstream knows about (vLLM keeps pre-rename aliases), is left out rather than advertised and then refused
 - `/health` returns health status of all backends (`healthy`, `degraded`, `unhealthy`)
 
 ### Tier Reference (shipped `config/lexora_config.yaml`)

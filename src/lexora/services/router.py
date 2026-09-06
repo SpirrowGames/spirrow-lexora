@@ -152,6 +152,55 @@ class BackendRouter:
                 url=vllm_settings.url,
             )
 
+    def _tiers_reaching(self, backend_names: list[str]) -> list[str]:
+        """Tier aliases that route to any of ``backend_names``.
+
+        The remedy half of a refusal message has to be built from the
+        config that is loaded right now (T-silent-routing W-2). Telling a
+        caller "use a tier name instead" is only true when some tier
+        actually reaches one of the backends declaring the name they
+        asked for: two backends can share a model name without either
+        being exposed as a tier, and in that arrangement the advice would
+        send the caller looking for a tier that does not exist. Naming a
+        remedy that is not there is the same class of defect as routing
+        silently — the gateway would be stating something about itself
+        that is not so.
+
+        Returns the tier names in declaration order, deduplicated.
+        """
+        wanted = set(backend_names)
+        return [
+            tier
+            for tier, backend in self._tier_to_backend.items()
+            if backend in wanted
+        ]
+
+    def _ambiguous_model_message(self, model: str) -> str:
+        """Build the 404 message for an ambiguous by-name request (W-2).
+
+        Names every backend that declares ``model`` (the operator needs to
+        know which declarations collided, not which one would have won),
+        then either lists the tier aliases that actually reach those
+        backends or says plainly that the name cannot be routed.
+        """
+        declared = self._ambiguous_models[model]
+        alternatives = self._tiers_reaching(declared)
+        head = (
+            f"Model '{model}' is declared by multiple backends "
+            f"({', '.join(declared)}); the router cannot pick one without "
+            f"guessing."
+        )
+        if alternatives:
+            return (
+                f"{head} Use one of these tier names instead: "
+                f"{', '.join(alternatives)}."
+            )
+        return (
+            f"{head} No tier routes to any of those backends, so this name "
+            f"is not routable through this gateway. See GET /v1/models for "
+            f"the names it does accept."
+        )
+
     def get_backend_for_model(self, model: str) -> Backend:
         """Get the appropriate backend for a model.
 
@@ -195,12 +244,7 @@ class BackendRouter:
                     backends=declared,
                 )
                 raise ModelNotFoundError(
-                    message=(
-                        f"Model '{model}' is declared by multiple backends "
-                        f"({', '.join(declared)}); the router cannot pick "
-                        f"one without guessing. Use a tier name instead of "
-                        f"a raw model name."
-                    ),
+                    message=self._ambiguous_model_message(model),
                     model_name=model,
                     reason="ambiguous",
                 )
@@ -275,11 +319,12 @@ class BackendRouter:
         backend_name = self._tier_to_backend.get(model)
         if backend_name is None:
             if model in self._ambiguous_models:
+                # Same generated message as ``get_backend_for_model``: this
+                # exception reaches the caller through the same handler, so
+                # a shorter variant here would make the advice the client
+                # sees depend on which of the two lookups the endpoint used.
                 raise ModelNotFoundError(
-                    message=(
-                        f"Model '{model}' is declared by multiple backends "
-                        f"({', '.join(self._ambiguous_models[model])})."
-                    ),
+                    message=self._ambiguous_model_message(model),
                     model_name=model,
                     reason="ambiguous",
                 )
@@ -446,14 +491,25 @@ class BackendRouter:
         kept: extra fields do not fail OpenAI-client validation, only missing
         declared ones do.
 
+        In multi-backend mode the advertised set is narrowed to the routable
+        set (T-silent-routing W-3): a backend's upstream may serve names this
+        gateway does not declare — vLLM keeps the pre-rename alias alongside
+        the current model ID — and after R-1a / R-2 those names are refused
+        with 404. Advertising them would make ``/v1/models`` describe a
+        gateway that does not exist. Concrete IDs therefore appear only when
+        exactly one backend declares them; the rest of the upstream's
+        catalogue is reachable through the tier alias that resolves to it.
+
         Returns:
             Combined models list in OpenAI format.
         """
         all_models: list[dict[str, Any]] = []
 
-        #: Track which ambiguous names we have already filtered so the
-        #: WARNING is issued once per name per listing, not once per copy.
-        _filtered_ambiguous: set[str] = set()
+        #: Track which unroutable names we have already filtered so the log
+        #: line is issued once per name per listing, not once per copy —
+        #: three backends proxying one upstream would otherwise report the
+        #: same name three times.
+        _filtered_unroutable: set[str] = set()
         #: Track ids we have already emitted so a name declared by multiple
         #: passthrough backends (three vllm backends all proxying the same
         #: upstream /v1/models) is not returned three times.
@@ -469,15 +525,47 @@ class BackendRouter:
                     # with 404. Listing an id the router will not route is
                     # exactly the class of failure this branch is against
                     # ("advertised endpoint that structurally 404s").
-                    if isinstance(model_id, str) and model_id in self._ambiguous_models:
-                        if model_id not in _filtered_ambiguous:
-                            logger.warning(
-                                "list_models_ambiguous_filtered",
-                                model=model_id,
-                                backends=self._ambiguous_models[model_id],
-                            )
-                            _filtered_ambiguous.add(model_id)
-                        continue
+                    #
+                    # The routable-by-name set is ``_model_to_backend``
+                    # exactly: tier aliases are appended separately below,
+                    # ambiguous names were deliberately left out of the
+                    # index at registration, and a name only the upstream
+                    # knows about was never in it. Filtering on membership
+                    # therefore covers all three refusal cases with one
+                    # test rather than only the ambiguous one.
+                    #
+                    # Only in multi-backend mode. Legacy single-backend
+                    # mode routes every name to the one backend, so
+                    # everything the upstream advertises is routable there
+                    # and ``_model_to_backend`` is empty — filtering on it
+                    # would empty the listing instead of narrowing it.
+                    if self._routing_enabled and isinstance(model_id, str):
+                        if model_id not in self._model_to_backend:
+                            if model_id not in _filtered_unroutable:
+                                _filtered_unroutable.add(model_id)
+                                if model_id in self._ambiguous_models:
+                                    # Ambiguity is an operator-fixable
+                                    # config fault, so it stays at WARNING.
+                                    logger.warning(
+                                        "list_models_ambiguous_filtered",
+                                        model=model_id,
+                                        backends=self._ambiguous_models[model_id],
+                                    )
+                                else:
+                                    # An upstream serving more names than
+                                    # this gateway declares is ordinary
+                                    # (vLLM keeps legacy aliases), and
+                                    # nothing is being routed here, so this
+                                    # is not the silent-decision case. The
+                                    # loud surface for these names is the
+                                    # request-time ``model_unknown_refused``
+                                    # WARNING, which is unaffected.
+                                    logger.debug(
+                                        "list_models_unroutable_filtered",
+                                        model=model_id,
+                                        backend=name,
+                                    )
+                            continue
                     # Deduplicate by id. Three vllm backends pointing at the
                     # same upstream URL each return an identical row for the
                     # concrete model — carrying all three past this point
