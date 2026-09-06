@@ -103,6 +103,29 @@ three are use (b): every one is cited to show that a quantity was unstable,
 and every one says so. A count of failing test NODES within a single run,
 such as the 4-of-16 above, is not a run-count at all, and this rule does not
 reach it.
+
+KNOWN DEFECT in that rule, recorded here because the rule is stated here and
+the repair is still open. Its text is universal, so its extension is the
+repository and not this file. Enumerated 2026-09-07 over every comment and
+docstring block in `src/` and `tests/`: outside this file the rule reaches four
+run-counts its author did not have in hand, and it condemns two of them --
+the tolerance note at `tests/services/test_rate_limiter.py` and the sampling
+note in `_tokens_from_result` at `backends/claude_code.py`. Both cite how much
+evidence stands behind a fact that observation found steady but did not prove
+deterministic, so limb (a) is unavailable, and neither is offered as
+evidence of instability, so (b) is unavailable too. Deleting either number
+leaves the surviving claim with no recorded basis, which is worse than the
+text that is there. Both should stand. The gap is structural rather than a
+matter of wording: the rule has a limb for a quantity proven fixed and a limb
+for a quantity shown to move, and none for bounded evidence about a quantity
+that is neither -- which is the case where saying how many runs there were
+carries the most information, because it is the reader's only handle on how
+far to trust it. Note which of the neighbours pass: that same docstring
+carries a second run-count the rule admits, and so does its test file, and
+both are admitted only because what they happened to observe turned out to be
+unstable. The verdict tracks what the measurement found, not whether citing it
+was sound practice. Until this is repaired, do not apply the rule to delete
+either site.
 """
 
 import asyncio
