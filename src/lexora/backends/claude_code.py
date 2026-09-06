@@ -138,6 +138,68 @@ class ClaudeCodeBackend(Backend):
 
         return system_prompt, user_prompt
 
+    @staticmethod
+    def _tokens_from_result(result: dict[str, Any]) -> tuple[int, int]:
+        """Extract (prompt_tokens, completion_tokens) from a CLI result JSON.
+
+        NOTE on the summation, 2026-09-06. The CLI splits the prompt across
+        three sibling fields of one `usage` object, and `input_tokens` is only
+        the uncached remainder. Measured on CLI 2.1.263 with the command
+        `_build_command` builds for this path (`claude -p --model sonnet
+        --output-format json --no-session-persistence --max-turns 1`), three
+        independent samples of the same trivial prompt gave:
+
+            input_tokens  cache_creation  cache_read   input side total
+                       2               0      50,167             50,169
+                       2          26,435      23,732             50,169
+                       2          17,224      23,732             40,958
+
+        Until 2026-09-06 this backend reported `input_tokens` alone, so the
+        ledger recorded 2 for a prompt of roughly 41,000-50,000 tokens — four
+        orders of magnitude low, on every request through this backend.
+
+        Tokens served from the cache are tokens the model was prompted with;
+        caching changes what they cost, not whether they were sent. OpenAI's
+        own `usage.prompt_tokens`, which this backend's response shape imitates,
+        is likewise the total *including* cached tokens, with the cached portion
+        broken out separately in `prompt_tokens_details.cached_tokens`. Summing
+        all three is therefore what makes this field mean what its name says.
+
+        Note the third sample: the input-side total is not a constant either.
+        It tracks session state, so treat any single figure above as a sample
+        rather than as a property of the CLI.
+
+        `completion_tokens` stays at `usage.output_tokens` and is deliberately
+        NOT the whole invocation. The same result JSON carries a `modelUsage`
+        block showing that one call bills more than one model — sample three
+        billed `claude-sonnet-5` (4 output tokens) and
+        `claude-haiku-4-5-20251001` (8 more), and the top-level `usage` matched
+        the first exactly, excluding the second (measured, n=3). Whether this
+        field should describe one completion or the whole invocation is a
+        question about what the field means, and answering it needs a decision
+        this change did not make. The input-side omission is a different kind of
+        defect: those tokens were already inside the object being read. The two
+        are not fixed together, and a test pins the output side as it stands so
+        that changing it is a visible choice.
+
+        All three input fields are read with a 0 default: older CLI builds need
+        not emit the cache keys, and absent must mean "no cached tokens" rather
+        than an exception or a collapse to zero.
+
+        Args:
+            result: Parsed `--output-format json` result object from the CLI.
+
+        Returns:
+            Tuple of (prompt_tokens, completion_tokens).
+        """
+        usage = result.get("usage", {})
+        prompt_tokens = (
+            usage.get("input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+        )
+        return prompt_tokens, usage.get("output_tokens", 0)
+
     def _make_openai_response(
         self,
         content: str,
@@ -242,9 +304,7 @@ class ClaudeCodeBackend(Backend):
 
             # Parse Claude Code JSON result format
             content = result.get("result", output)
-            usage = result.get("usage", {})
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
+            input_tokens, output_tokens = self._tokens_from_result(result)
             stop_reason = result.get("stop_reason", "end_turn")
             finish_reason = "stop" if stop_reason == "end_turn" else "length"
 
