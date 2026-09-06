@@ -60,9 +60,36 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
     # is worse than the honest `pricing_known=0` it lands in today. Pricing
     # that tier correctly needs a schema that carries thresholds; that is a
     # separate change.
-    # Claude Code (uses Anthropic pricing internally)
-    "claude-code-sonnet": {"input": 3.0, "output": 15.0},
-    "claude-code-opus": {"input": 15.0, "output": 75.0},
+    #
+    # NOTE: `claude-code-opus` / `claude-code-sonnet` are absent, and not by
+    # oversight. They are not upstream model IDs: `config/lexora_config.yaml`
+    # binds them to the `claude_code` backend, which runs the Claude Code CLI
+    # as a subprocess (`claude -p --model opus|sonnet`, see
+    # `backends/claude_code.py`) instead of issuing a metered HTTP request.
+    # Until 2026-09-06 this table listed them at Anthropic's per-MTok API
+    # rates, which wrote a non-zero cost and `pricing_known=1` onto every such
+    # row. Three things measured 2026-09-06 against Claude Code CLI 2.1.263,
+    # each of which alone makes a flat per-MTok pair wrong here:
+    #   - `claude-code-opus` / `claude-code-sonnet` are Lexora-local names.
+    #     `--model sonnet` was served by `claude-sonnet-5` and, in the same
+    #     invocation, `claude-haiku-4-5-20251001` (the result JSON's
+    #     `modelUsage` names both). One request is not one upstream model, so
+    #     there is no single ID whose published rate would apply.
+    #   - The `usage.input_tokens` that `backends/claude_code.py` reads was 2
+    #     on a request whose `cache_creation_input_tokens` was 26,435 and
+    #     `cache_read_input_tokens` 23,732. Whatever rate this table held, it
+    #     was multiplied by a number that does not measure the input.
+    #   - On the host measured, the CLI authenticates as a subscription seat
+    #     (`~/.claude.json` `oauthAccount.billingType = "stripe_subscription"`,
+    #     `organizationType = "claude_max"`, no `ANTHROPIC_API_KEY` and no
+    #     `ANTHROPIC_AUTH_TOKEN` in the environment), which is not billed per
+    #     token at all. Auth mode is per-host state and a deployment could
+    #     hold an API key instead; that is why it is listed third rather than
+    #     first — the two points above hold either way.
+    # Absent from the table these two land at cost 0.0 with `pricing_known=0`,
+    # i.e. "we cannot say what this was billed", which is what the ledger can
+    # defend. Filling them in needs all three to change: metered billing, a
+    # stable upstream model ID, and a token count that measures the input.
     # OpenAI
     "gpt-4": {"input": 30.0, "output": 60.0},
     "gpt-4-turbo": {"input": 10.0, "output": 30.0},

@@ -203,3 +203,74 @@ class TestCostTrackerMigration:
         """Constructing twice must not fail on ALTER TABLE."""
         CostTracker(db_path=db_path)
         CostTracker(db_path=db_path)  # would raise "duplicate column" if not guarded
+
+
+class TestSubscriptionBackendIsNotPriced:
+    """R-10: the ledger must not price a model it cannot show was billed.
+
+    ``claude-code-opus`` / ``claude-code-sonnet`` are not upstream API model
+    IDs. They are Lexora-local names for the ``claude_code`` backend, which
+    shells out to the Claude Code CLI (``claude -p``) rather than issuing a
+    metered HTTP request. Pricing them at Anthropic's per-MTok API rates put
+    a non-zero ``cost_usd`` and ``pricing_known=1`` into every such row.
+    """
+
+    def test_cli_backend_ids_absent_from_default_pricing(self) -> None:
+        """The two CLI-backend IDs must not be pricing keys."""
+        for cli_id in ("claude-code-sonnet", "claude-code-opus"):
+            assert cli_id not in DEFAULT_PRICING, (
+                f"{cli_id!r} must not appear in DEFAULT_PRICING — it names a "
+                "CLI subprocess, not a billable upstream model ID (R-10)."
+            )
+
+    def test_cli_backend_records_unpriced_not_free(self, db_path: Path) -> None:
+        """``calculate_cost`` returns 0.0 with ``pricing_known`` False.
+
+        Asserting the flag as well as the number is the point: ``0.0`` alone
+        is what a genuinely free local model returns, and the distinction
+        between "no vendor charge" and "we cannot say" is the subject of
+        this requirement.
+        """
+        tracker = CostTracker(db_path=db_path)
+        for cli_id in ("claude-code-sonnet", "claude-code-opus"):
+            cost, pricing_known = tracker.calculate_cost(cli_id, 1_000_000, 1_000_000)
+            assert (cost, pricing_known) == (0.0, False), (
+                f"{cli_id!r} priced at {cost} with pricing_known={pricing_known}; "
+                "an unbillable ID must land in the honest unpriced state (R-10)."
+            )
+
+    def test_gemini_naysayer_tier_stays_unpriced(self, db_path: Path) -> None:
+        """``gemini-3.1-pro-preview`` remains deliberately absent.
+
+        Its published price is a context-size step, which a flat
+        {input, output} pair cannot express. Pinning it here so that the
+        R-10 deletion is not later "balanced" by filling this one in.
+        """
+        assert "gemini-3.1-pro-preview" not in DEFAULT_PRICING
+        tracker = CostTracker(db_path=db_path)
+        assert tracker.calculate_cost("gemini-3.1-pro-preview", 1_000_000, 1_000_000) == (
+            0.0,
+            False,
+        )
+
+    def test_priced_models_are_untouched(self, db_path: Path) -> None:
+        """Fence: the models that *are* billable keep their rates.
+
+        Green on both sides of the R-10 change. It exists to catch a
+        deletion that takes a neighbouring line with it.
+        """
+        tracker = CostTracker(db_path=db_path)
+        expected = {
+            "claude-sonnet-4-20250514": 3.0 + 15.0,
+            "claude-opus-4-20250514": 15.0 + 75.0,
+            "claude-fable-5": 10.0 + 50.0,
+            "claude-opus-5": 5.0 + 25.0,
+            "gpt-4": 30.0 + 60.0,
+            "gemini-2.5-flash": 0.15 + 0.60,
+            "Qwen3-32B": 0.0,
+            "Qwen3.8-27B": 0.0,
+        }
+        for model, total in expected.items():
+            cost, pricing_known = tracker.calculate_cost(model, 1_000_000, 1_000_000)
+            assert pricing_known is True, f"{model!r} lost its price"
+            assert cost == pytest.approx(total), f"{model!r} repriced"
