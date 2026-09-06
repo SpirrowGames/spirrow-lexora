@@ -1482,12 +1482,23 @@ async def generate(
             detail="No model specified and no default model configured",
         )
 
-    # Get backend for the model
+    # Get backend for the model, then resolve the name -- in that order.
+    # Routing keys off the name the caller sent. A tier alias resolves to a
+    # concrete model that may be declared by several backends, and
+    # `get_backend_for_model` refuses such a name as ambiguous rather than
+    # picking a winner (404), so resolving first would break routing for
+    # every tier whose concrete model is shared. The shipping config is in
+    # exactly that state: `light`, `medium` and `heavy` all resolve to
+    # `Qwen3.8-27B`, which three backends declare.
     backend = backend_router.get_backend_for_model(model)
+    resolved_model = backend_router.resolve_model(model)
 
-    # Build completions request
+    # Build completions request. The wire field carries the resolved concrete
+    # model: a tier alias is a name in Lexora's config and nothing upstream
+    # declares it. This is the same two-step `/v1/chat/completions` and
+    # `/v1/completions` perform.
     completion_request: dict[str, Any] = {
-        "model": model,
+        "model": resolved_model,
         "prompt": request.prompt,
         "max_tokens": request.max_tokens,
     }
@@ -1554,14 +1565,12 @@ async def generate(
                 retries=retries,
             )
 
-        # Record cost. Unlike `/v1/chat/completions`, this handler never
-        # rewrites the outgoing `model` field, so there is no `resolved_model`
-        # variable here to reuse. `CostTracker.record` requires the concrete
-        # model in `model` and the alias in `tier`, so the same router is asked
-        # at the recording site rather than a name being made up.
+        # Record cost. `CostTracker.record` takes the concrete model in
+        # `model` and the alias in `tier`; `resolved_model` is the same value
+        # the outgoing request carries, so the ledger and the wire agree.
         if cost_tracker and (tokens_input > 0 or tokens_output > 0):
             cost_tracker.record(
-                model=backend_router.resolve_model(model),
+                model=resolved_model,
                 endpoint=endpoint,
                 tokens_input=tokens_input,
                 tokens_output=tokens_output,
@@ -1667,12 +1676,16 @@ async def chat(
             detail="No model specified and no default model configured",
         )
 
-    # Get backend for the model
+    # Get backend for the model, then resolve the name. See the note in
+    # `/generate`: routing takes the requested name because the resolved one
+    # can be ambiguous across backends, and the wire takes the resolved one
+    # because a tier alias names nothing upstream declares.
     backend = backend_router.get_backend_for_model(model)
+    resolved_model = backend_router.resolve_model(model)
 
     # Build chat completions request
     chat_request: dict[str, Any] = {
-        "model": model,
+        "model": resolved_model,
         "messages": [msg.model_dump() for msg in request.messages],
         "max_tokens": request.max_tokens,
     }
@@ -1737,12 +1750,11 @@ async def chat(
                 retries=retries,
             )
 
-        # Record cost. See the note in `/generate`: this handler does not
-        # rewrite the outgoing `model` field either, so the concrete ID is
-        # resolved here instead of being carried in a variable.
+        # Record cost. Same shape as `/generate`: `resolved_model` in the
+        # `model` column, the alias in `tier`.
         if cost_tracker and (tokens_input > 0 or tokens_output > 0):
             cost_tracker.record(
-                model=backend_router.resolve_model(model),
+                model=resolved_model,
                 endpoint=endpoint,
                 tokens_input=tokens_input,
                 tokens_output=tokens_output,
