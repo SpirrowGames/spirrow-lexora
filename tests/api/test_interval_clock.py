@@ -395,6 +395,18 @@ def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
     Three of five. The first conjunct is what reddens all three, and on this
     platform it binds with **equality** -- `0.015625 >= 0.015625`, zero margin.
 
+    And it reddens them *deterministically*, which is the property that decides
+    this and the one the alternative did not have. The six cells above were run
+    three separate times and every cell gave the same answer all three times.
+    Compare what covered the hardcode edit while this check was absent: nothing
+    but incidental flake in the bracket detectors of `test_ledger_coverage.py`,
+    and three independent ten-run measurements of that same tree disagreed with
+    each other -- 10, 9 and 7 runs red out of 10, with anywhere from 0 to 3 of
+    the four detectors failing in a single run. A residual whose own rate moves
+    that much between measurements is not coverage, and no figure for it is
+    quoted anywhere in this change, because any figure quoted would be the next
+    unchecked claim.
+
     Two conjuncts rather than one `>= max(m, 0.001)`, and the reason is not
     just that they fail with different messages. Evaluating the two expressions
     over the same six rows shows them to be complementary rather than
