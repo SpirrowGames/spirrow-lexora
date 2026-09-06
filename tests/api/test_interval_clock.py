@@ -323,23 +323,131 @@ class TestPreflightDurationSurvivesABackwardsClock:
         _assert_bracketed(metrics.durations)
 
 
-def test_duration_slack_still_covers_the_handlers_clock() -> None:
-    """`DURATION_SLACK` must not be finer than the tick of the handler's clock.
+def test_the_outer_clock_is_finer_than_the_slack() -> None:
+    """`test_ledger_coverage.py`'s bracket budgets for ONE clock's quantum.
 
-    Moving the handler to `time.monotonic()` left `test_ledger_coverage.py`'s
-    `DURATION_SLACK` derived from `get_clock_info("time")` -- a clock the
-    handler no longer reads. Re-deriving it is deliberately deferred to its own
-    change, so what makes the deferral safe rather than lucky is this one
-    inequality, and it is measured on whichever platform runs the suite instead
-    of being argued from the two this was written on. Were monotonic's tick
-    ever coarser than both `time`'s tick and the 1 ms floor, that bracket would
-    be tighter than the clock feeding it and would flake on a true reading.
+    That bracket widens each end by `DURATION_SLACK`, and its derivation says
+    the outer reading `wall` -- taken off `time.perf_counter()` -- is "the true
+    elapsed of an interval that strictly contains the handler's, leaving the
+    inner clock's own quantum as the only error term". The word doing the work
+    is *only*. It holds because `perf_counter` is far finer than the slack; on
+    a platform where it is not, the outer reading carries a quantum of its own
+    that the bracket never budgets for, and the derivation stops being true
+    while the numbers still look reasonable.
 
-    Measured where this was written: both clocks report 15.625 ms, so the
-    inequality holds with equality -- which is exactly why it is worth a
-    check rather than a sentence.
+    Nothing in the repository made that so. It is a property of whichever
+    platform runs the suite, and it was stated only in a comment -- "resolution
+    1e-07 here" -- which is precisely the unchecked-claim shape this suite
+    keeps finding. So it is measured here instead of asserted there.
+
+    This is the second of the derivation's two premises. The first -- that the
+    slack is not finer than the handler's tick -- is fenced separately, by
+    `test_the_slack_covers_the_handlers_tick_and_the_floor` below. Neither
+    stands in for the other, and they fail in different ways: a *platform* is
+    what reddens this one, whereas no platform can redden that one and only an
+    *edit* to the derivation can. Both are kept. Why the second survives
+    despite being unreddenable by any platform is measured in its own
+    docstring, not argued here.
+
+    Measured where this was written: `perf_counter` reports 1e-07 against a
+    slack of 15.625 ms, five orders of magnitude, so unlike the check it
+    replaces this one does not hold by a whisker. The Linux CI runner was not
+    measurable from there and is not assumed: this assertion going green on it
+    is itself the measurement that `perf_counter` is finer than `DURATION_SLACK`
+    there too, and a red one would be the finding.
     """
-    assert DURATION_SLACK >= time.get_clock_info("monotonic").resolution
+    outer = time.get_clock_info("perf_counter").resolution
+    assert outer < DURATION_SLACK, (
+        f"perf_counter resolution {outer!r} is not finer than DURATION_SLACK "
+        f"{DURATION_SLACK!r}: `wall` in test_ledger_coverage.py carries a "
+        f"quantum of its own that the duration bracket does not budget for"
+    )
+
+
+def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
+    """`DURATION_SLACK` must clear the handler's tick, and must clear the floor.
+
+    This check was deleted once and is restored here, so the argument that
+    deleted it is written out rather than left to be re-derived. That argument:
+    now that `DURATION_SLACK` is read off the handler's own clock this is
+    `max(m, 0.001) >= m`, true for every `m`, so no platform can redden it, so
+    it is a tautology and not a fence.
+
+    Its first half is true and its conclusion does not follow. "No platform
+    reddens it" and "no edit reddens it" are different properties, and only the
+    second makes a check worthless. A regression test restates the correct
+    implementation on purpose -- that restatement is the whole mechanism by
+    which it fences later edits to it. Measured on this tree, on **Windows**
+    (`m` = `monotonic` and `t` = `time` both 15.625 ms, `p` = `perf_counter`
+    1e-07), one single-site mutation of the derivation line in
+    `test_ledger_coverage.py` per cell, `__pycache__` cleared between cells,
+    classified by pytest exit code:
+
+        edit to the derivation line           becomes        this test
+        ------------------------------------  -------------  ----------
+        (control -- unmutated)                max(m, 0.001)  green
+        hardcode the floor                    0.001          RED
+        max -> min                            min(m, 0.001)  RED
+        wrong clock: perf_counter for m       max(p, 0.001)  RED
+        floor dropped                         m              green here
+        regress to get_clock_info("time")     max(t, 0.001)  green
+
+    Three of five. The first conjunct is what reddens all three, and on this
+    platform it binds with **equality** -- `0.015625 >= 0.015625`, zero margin.
+
+    And it reddens them *deterministically*, which is the property that decides
+    this and the one the alternative did not have. The six cells above were run
+    five separate times -- the two assertions below byte-identical throughout --
+    and every cell gave the same answer every time. Compare what covered the
+    hardcode edit while this check was absent: nothing but incidental flake in
+    the bracket detectors of `test_ledger_coverage.py`, and three independent
+    ten-run measurements of that same tree disagreed with each other -- 10, 9
+    and 7 runs red out of 10, with anywhere from 0 to 3 of the four detectors
+    failing in a single run. Those three numbers are quoted only against each
+    other, as evidence that the rate moves. None of them is this file's
+    estimate of how much that residual covers, and no such estimate is given
+    anywhere in this change, because it would be the next unchecked claim.
+
+    Two conjuncts rather than one `>= max(m, 0.001)`, and the reason is not
+    just that they fail with different messages. Evaluating the two expressions
+    over the same six rows shows them to be complementary rather than
+    overlapping: on this box the tick conjunct reddens 3 of the 5 edits and the
+    floor conjunct reddens **0**, and substituting a fine-grained `m` of 1e-09
+    into the same arithmetic flips it exactly -- tick 0, floor 2, those being
+    the floor-dropped and `max -> min` rows. Neither conjunct alone covers both
+    platform classes. `>= m` on its own would be a fence with a hole in it on a
+    fine-grained runner; `>= 0.001` on its own would be a fence with a hole in
+    it here. The floor conjunct is also not a restatement of the derivation --
+    it is an independent statement of design intent, which is what lets it
+    survive an edit that rewrites the derivation entirely.
+
+    So the floor half is a **prediction on this platform, not a measurement**.
+    It reddens nothing in the table above, because `m` is 15.625 ms here and
+    the floor is a no-op; and the 1e-09 column is arithmetic on these two
+    expressions, not an observation of Linux. What CI settles is the weaker
+    claim that both conjuncts *hold* on the Linux runner -- where
+    `DURATION_SLACK` is the floor, so this conjunct should bind there with
+    equality, `0.001 >= 0.001`, and a red would be the finding. CI does not
+    settle that the floor conjunct catches the floor-dropped edit on Linux:
+    that needs the mutation pushed, and it is deliberately not.
+
+    The ceiling, so that no more is claimed for this than it gives: it guards
+    the *value* of `DURATION_SLACK` and never its *provenance*. The drift this
+    change exists to remove -- deriving off `time` instead of `monotonic` -- is
+    value-invariant on both platforms this project runs on, which is why the
+    last row above is green. No value assertion can catch that one, and this
+    one does not pretend to.
+    """
+    m = time.get_clock_info("monotonic").resolution
+    assert DURATION_SLACK >= m, (
+        f"DURATION_SLACK {DURATION_SLACK!r} is finer than the handler's tick "
+        f"{m!r}: test_ledger_coverage.py's bracket is tighter than the clock "
+        f"feeding it and will flake on a true reading"
+    )
+    assert DURATION_SLACK >= 0.001, (
+        f"DURATION_SLACK {DURATION_SLACK!r} is below the 1 ms floor that keeps "
+        f"the bracket from going exactly tight on a fine-grained platform"
+    )
 
 
 class TestHandlerDurationSurvivesABackwardsClock:
