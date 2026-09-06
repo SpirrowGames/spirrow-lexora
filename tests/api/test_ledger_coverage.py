@@ -331,9 +331,18 @@ class TestLedgerCoversEveryNonStreamingRoute:
         # at least the delay the backend was held open for, at most the wall
         # time of the whole call measured from out here -- each end widened by
         # the slack the handler's clock needs, which is the entire reason
-        # this is not `SLOW <= duration <= wall`. See `DURATION_SLACK`. A
-        # constant still fails one end or the other whatever value it takes:
-        # 0.0 and -999.0 undershoot, 999.0 overshoots.
+        # this is not `SLOW <= duration <= wall`. See `DURATION_SLACK`.
+        #
+        # What the bracket catches is a constant *outside* the band: 0.0
+        # and -999.0 undershoot the lower bound, 999.0 overshoots the
+        # upper one -- each measured red at all four params. What it does
+        # not catch is a constant *inside* the band, and one always
+        # exists: `SLOW` itself clears both ends on every platform,
+        # because the lower bound is `SLOW - DURATION_SLACK` and `wall`
+        # is an outer reading of a call the backend holds open for `SLOW`
+        # (measured green at all four params). So this brackets the
+        # magnitude, not the provenance -- it says the recorded number is
+        # the right size, not that it came from a clock.
         assert isinstance(kwargs["duration"], float)
         assert SLOW - DURATION_SLACK <= kwargs["duration"] <= wall + DURATION_SLACK
 

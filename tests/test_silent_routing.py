@@ -1190,6 +1190,18 @@ class TestListModelsAdvertisesEveryRoutableName:
         # fabricated timestamp.
         assert row["owned_by"] == "lexora"
         assert row["created"] == 0
+        # The marker that makes the two lines above honest. ``owned_by:
+        # "lexora"`` is stamped on rows for vendor-owned IDs as well
+        # (``claude-sonnet-4-20250514``, ``gemini-3.1-pro-preview``), and
+        # that is a statement about who asserts the row rather than a
+        # claim of ownership *only* while ``type`` says the row is this
+        # gateway's own assertion. Until this line the marker was
+        # unfenced: the string is emitted in exactly one place and
+        # deleting that line left the whole suite green, so any tidying
+        # pass could drop it and turn five production rows into
+        # upstream-looking claims that Lexora owns Anthropic's and
+        # Google's models.
+        assert row["type"] == "declared"
 
     @pytest.mark.asyncio
     async def test_a_reported_row_is_not_replaced_by_a_declared_one(self) -> None:
@@ -1207,6 +1219,19 @@ class TestListModelsAdvertisesEveryRoutableName:
         assert len(rows) == 1, f"expected one row for 'reported', got {rows}"
         assert rows[0]["created"] == 1_700_000_000
         assert rows[0]["owned_by"] == "vllm"
+        # The other half of the ``type`` fence, and the half that carries
+        # the meaning: what matters is the *distinction*, not the
+        # marker's presence. A suite that only asserted ``type ==
+        # "declared"`` on the declared row (see the sibling test above)
+        # would still pass against an emit site that stamped ``type`` on
+        # every row, which would erase the distinction while satisfying
+        # the assertion. ``reported`` came from the upstream, so it must
+        # carry no marker at all.
+        assert "type" not in rows[0], (
+            "'reported' was reported by the upstream, so it must carry no "
+            "'type' key: the marker is what tells a row this gateway "
+            f"asserts from one an upstream confirmed. Got: {rows[0]}"
+        )
 
     @pytest.mark.asyncio
     async def test_ambiguous_declared_name_stays_out_even_if_unreported(self) -> None:

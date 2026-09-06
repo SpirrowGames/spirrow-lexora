@@ -718,6 +718,15 @@ class BackendRouter:
         for model_id, declaring_backend_name in self._model_to_backend.items():
             if model_id in _seen_ids:
                 continue
+            # Deliberately redundant today, and kept anyway. This loop
+            # walks dict keys, so no id can repeat inside it, and
+            # ``_seen_ids`` has no reader after this loop -- the tier
+            # loop below does not consult it. Deleting this line changes
+            # no behaviour. It stays so that every producer phase in this
+            # method maintains ``_seen_ids`` the same way (guard, add,
+            # append), because whoever writes a third phase will copy the
+            # nearest neighbour, and a phase that does not add is the one
+            # that breaks the next one.
             _seen_ids.add(model_id)
             all_models.append(
                 {

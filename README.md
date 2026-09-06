@@ -197,7 +197,7 @@ routing:
 
 ### Tier Reference (shipped `config/lexora_config.yaml`)
 
-Tiers are named entry points that the router resolves to a concrete `(backend, model)` pair. A caller sends `model: "<tier>"` on any OpenAI-compat request; the router picks the right backend, sends the concrete model upstream, and the cost tracker records both the tier alias and the resolved model separately (so pricing follows the actual upstream, not the alias).
+Tiers are named entry points that the router resolves to a concrete `(backend, model)` pair. A caller sends `model: "<tier>"` on any OpenAI-compat request; the router picks the right backend, sends the concrete model upstream, and the cost tracker records both the tier alias and the resolved model separately, so pricing is looked up against the name that was served rather than the alias. That resolved name is an upstream model ID for the metered HTTP backends only — the `claude-code-*` names are Lexora-local (the backend shells out to the Claude Code CLI, and one invocation can be served by more than one upstream model), so they are absent from `DEFAULT_PRICING` on purpose and their rows record `pricing_known=0` instead of a rate.
 
 | Tier | Backend | Concrete model | Purpose |
 |------|---------|----------------|---------|

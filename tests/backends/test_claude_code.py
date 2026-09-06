@@ -174,3 +174,26 @@ class TestChatCompletionsUsageWiring:
         assert response["usage"]["prompt_tokens"] == 50169
         assert response["usage"]["completion_tokens"] == 4
         assert response["usage"]["total_tokens"] == 50173
+
+
+class TestListModels:
+    """`list_models` returns an empty catalogue, and that is the behaviour.
+
+    Until this class, `ClaudeCodeBackend.list_models` had no test at all
+    while its docstring said "Return configured model in OpenAI format" --
+    a claim the body contradicts and nothing checked. The empty list is
+    correct: this backend shells out to the CLI and has no upstream
+    catalogue to report, and the `claude-code-*` names reach `/v1/models`
+    through `BackendRouter.list_all_models`, which advertises declared
+    names on the gateway's own authority. Pinning the empty list here
+    makes "so do not re-derive the config here" a checked statement rather
+    than a comment: a well-meaning change that returned the configured
+    models would double-emit rows into a loop that already deduplicates,
+    and it now goes red instead of shipping.
+
+    Hermetic: no subprocess, no `claude` binary.
+    """
+
+    async def test_returns_empty_list(self):
+        backend = ClaudeCodeBackend(model="sonnet")
+        assert await backend.list_models() == {"object": "list", "data": []}

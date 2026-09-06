@@ -497,7 +497,18 @@ class ClaudeCodeBackend(Backend):
         raise BackendError("Embeddings are not supported by Claude Code backend")
 
     async def list_models(self) -> dict[str, Any]:
-        """Return configured model in OpenAI format."""
+        """Return an empty catalogue -- a CLI subprocess has none to report.
+
+        This backend runs the Claude Code CLI (``claude -p``) rather than
+        talking to a model-listing HTTP API, so there is no upstream to
+        ask and nothing an upstream vouched for. The ``claude-code-*``
+        names are declared in config and advertised by
+        ``BackendRouter.list_all_models`` on the gateway's own authority,
+        as rows marked ``type: "declared"``; re-deriving them here would
+        duplicate the router's knowledge. Returning ``[]`` is the
+        behaviour, not a stub -- fenced by
+        ``tests/backends/test_claude_code.py``'s ``TestListModels``.
+        """
         return {"object": "list", "data": []}
 
     async def health_check(self) -> bool:
