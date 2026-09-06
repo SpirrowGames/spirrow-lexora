@@ -238,7 +238,36 @@ def get_task_classifier(request: Request) -> TaskClassifier | None:
 
 
 def get_cost_tracker(request: Request) -> CostTracker | None:
-    """Get cost tracker from app state."""
+    """Get cost tracker from app state.
+
+    Ledger coverage, measured 2026-09-06 at `05f6827`. Every row in
+    `request_costs` is written through this dependency, so the table below is
+    what `/stats/costs` and `/stats/costs/recent` are summing over:
+
+        endpoint               non-streaming     streaming
+        /v1/chat/completions   records a row     no row
+        /v1/completions        records a row     no row
+        /v1/embeddings         records a row     (no streaming form)
+        /generate              records a row     (no streaming form)
+        /chat                  records a row     (no streaming form)
+        /v1/messages           records a row     no row
+
+    Until 2026-09-06 the four middle non-streaming cells read "no row" too.
+    Those handlers computed `tokens_input` / `tokens_output` for the stats
+    collector and dropped them, and did not take this dependency at all. No
+    comment recorded a reason, so the split between the recorded pair and the
+    silent four tracked which handlers had been edited rather than a decision
+    about what to bill. `/stats/costs` totals are larger from that date on:
+    added coverage, not double counting -- the two pre-existing call sites are
+    untouched and no past row was rewritten.
+
+    The three streaming paths still open no row, and that one *is* a decision.
+    Each `stream_generator` relays the bytes `backend.*_stream` yields without
+    decoding them, in both the passthrough and non-passthrough branches, so a
+    token count there would have to come from reading SSE frames mid-relay.
+    Where that parsing belongs is left open here, and written down rather than
+    left as a silent asymmetry.
+    """
     return getattr(request.app.state, "cost_tracker", None)
 
 
@@ -680,6 +709,7 @@ async def completions(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> dict[str, Any] | StreamingResponse:
     """Proxy completion request to vLLM.
 
@@ -691,6 +721,7 @@ async def completions(
         rate_limiter: Rate limiter.
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
+        cost_tracker: Cost tracker.
 
     Returns:
         OpenAI-compatible completion response or streaming response.
@@ -959,6 +990,21 @@ async def completions(
                 retries=retries,
             )
 
+        # Record cost. Same shape as `/v1/chat/completions`: the `model`
+        # column takes the resolved concrete ID and the `tier` column takes
+        # the alias the caller used, so pricing looks up the real upstream.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=resolved_model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(request.model),
+                user_id=request.user,
+                duration=duration,
+                tier=request.model if backend_router.is_tier(request.model) else None,
+            )
+
         logger.info(
             "completion_success",
             model=request.model,
@@ -1036,6 +1082,7 @@ async def embeddings(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> dict[str, Any]:
     """Proxy embeddings request to vLLM.
 
@@ -1046,6 +1093,7 @@ async def embeddings(
         rate_limiter: Rate limiter.
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
+        cost_tracker: Cost tracker.
 
     Returns:
         OpenAI-compatible embeddings response.
@@ -1095,6 +1143,22 @@ async def embeddings(
                 status="success",
                 duration=duration,
                 tokens_input=tokens_input,
+            )
+
+        # Record cost. `tokens_output` is always 0 here, which is why the
+        # guard is `or` and not `and`. No embedding model is in
+        # `DEFAULT_PRICING`, so these rows land on `pricing_known=0` and cost
+        # 0.0 -- "no price for this" is a statement; no row was not one.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=resolved_model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(request.model),
+                user_id=request.user,
+                duration=duration,
+                tier=request.model if backend_router.is_tier(request.model) else None,
             )
 
         logger.info(
@@ -1382,6 +1446,7 @@ async def generate(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     model_registry: ModelRegistry | None = Depends(get_model_registry),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> GenerateResponse:
     """Simple text generation endpoint.
 
@@ -1397,6 +1462,7 @@ async def generate(
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
         model_registry: Model registry for default model lookup.
+        cost_tracker: Cost tracker.
 
     Returns:
         GenerateResponse with generated text.
@@ -1488,6 +1554,23 @@ async def generate(
                 retries=retries,
             )
 
+        # Record cost. Unlike `/v1/chat/completions`, this handler never
+        # rewrites the outgoing `model` field, so there is no `resolved_model`
+        # variable here to reuse. `CostTracker.record` requires the concrete
+        # model in `model` and the alias in `tier`, so the same router is asked
+        # at the recording site rather than a name being made up.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=backend_router.resolve_model(model),
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(model),
+                user_id=request.user,
+                duration=duration,
+                tier=model if backend_router.is_tier(model) else None,
+            )
+
         logger.info(
             "generate_success",
             model=model,
@@ -1548,6 +1631,7 @@ async def chat(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     model_registry: ModelRegistry | None = Depends(get_model_registry),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> ChatResponse:
     """Simple chat endpoint.
 
@@ -1563,6 +1647,7 @@ async def chat(
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
         model_registry: Model registry for default model lookup.
+        cost_tracker: Cost tracker.
 
     Returns:
         ChatResponse with assistant response.
@@ -1650,6 +1735,21 @@ async def chat(
                 tokens_input=tokens_input,
                 tokens_output=tokens_output,
                 retries=retries,
+            )
+
+        # Record cost. See the note in `/generate`: this handler does not
+        # rewrite the outgoing `model` field either, so the concrete ID is
+        # resolved here instead of being carried in a variable.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=backend_router.resolve_model(model),
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(model),
+                user_id=request.user,
+                duration=duration,
+                tier=model if backend_router.is_tier(model) else None,
             )
 
         logger.info(
