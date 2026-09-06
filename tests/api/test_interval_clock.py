@@ -369,7 +369,7 @@ def test_the_outer_clock_is_finer_than_the_slack() -> None:
     this holds by six orders rather than five.
 
     That run also reddened this assertion, which nothing here predicted. It was
-    a throwaway branch, never merged, carrying one edit: the 1 ms floor dropped
+    a throwaway branch, never merged, whose mutation was the 1 ms floor dropped
     from `DURATION_SLACK`. On Linux the floor is what the slack IS, so dropping
     it collapses the slack onto `m` = 1e-09, which is exactly `p`, and this
     check fails with `assert 1e-09 < 1e-09`. On Windows the floor is a no-op --
