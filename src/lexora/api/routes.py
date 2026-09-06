@@ -614,8 +614,21 @@ async def chat_completions(
             )
 
         # Record cost. The tier alias (if any) goes to its own column; the
-        # `model` column carries the resolved concrete model ID so pricing
-        # tracks the actual upstream, not the caller's alias.
+        # `model` column carries the resolved concrete model ID rather than
+        # the caller's alias, so pricing is looked up against the name that
+        # was actually served.
+        #
+        # That resolved ID is an upstream model ID for the metered HTTP
+        # backends only. The `claude-code-*` names are Lexora-local: the
+        # `claude_code` backend shells out to the Claude Code CLI instead
+        # of issuing a metered request, and one invocation can be served by
+        # more than one upstream model. Those IDs are therefore absent from
+        # `DEFAULT_PRICING` on purpose, and their rows land on
+        # `cost_usd=0.0` / `pricing_known=0` -- "we cannot say" rather than
+        # a rate. The reasoning and the measurements are in the `NOTE` on
+        # `DEFAULT_PRICING` in `services/cost_tracker.py`; the behaviour is
+        # fenced by `TestSubscriptionBackendIsNotPriced` in
+        # `tests/services/test_cost_tracker.py`.
         if cost_tracker and (tokens_input > 0 or tokens_output > 0):
             cost_tracker.record(
                 model=resolved_model,
@@ -992,7 +1005,9 @@ async def completions(
 
         # Record cost. Same shape as `/v1/chat/completions`: the `model`
         # column takes the resolved concrete ID and the `tier` column takes
-        # the alias the caller used, so pricing looks up the real upstream.
+        # the alias the caller used. The `claude-code-*` exception recorded
+        # at that call site applies here unchanged -- a resolved ID is an
+        # upstream model ID only for the metered HTTP backends.
         if cost_tracker and (tokens_input > 0 or tokens_output > 0):
             cost_tracker.record(
                 model=resolved_model,

@@ -684,10 +684,14 @@ class GeminiBackend(Backend):
         )
 
     async def list_models(self) -> dict[str, Any]:
-        """Return configured models in OpenAI format.
+        """Return an empty catalogue -- this key is not allowed to ask for one.
 
-        Models are managed by configuration; we do not call the Gemini
-        ListModels surface from the gated naysayer key.
+        We do not call the Gemini ListModels surface from the gated
+        naysayer key: it is a separate API surface, refused here for the
+        same reason ``embeddings`` above is. Nor are the configured names
+        re-derived here -- ``BackendRouter.list_all_models`` already
+        advertises every name this backend declares, on the gateway's own
+        authority, as a row marked ``type: "declared"``.
         """
         return {"object": "list", "data": []}
 
