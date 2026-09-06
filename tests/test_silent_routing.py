@@ -35,6 +35,14 @@ introduces (msg-078 through msg-083):
   listing is narrowed to the by-name routable set, which drops both
   ambiguous names and names only the upstream knows about, so the
   advertised set is a subset of the routable set.
+* T-models-advertise-side — W-3 in the other direction, which makes it
+  an equality: a routable name is never hidden either. The subset rule
+  used "an upstream reported it" as a proxy for "it exists", and the
+  proxy is wrong for a backend that is not a model catalogue —
+  ``ClaudeCodeBackend.list_models`` returns a hardcoded empty list, so
+  the shipped ``claude-code-*`` names routed while ``/v1/models`` denied
+  they existed, with no tier mapping to that backend to reach them by
+  either.
 * R-6 — a tier offered as the remedy for an ambiguous name must
   resolve to the name that was asked for, not merely reach one of the
   backends that declared it. A tier that reaches the right backend and
@@ -1048,6 +1056,223 @@ class TestListModelsMatchesRoutableSet:
         assert router.get_backend_for_model("whatever-upstream-serves") is (
             router.backends["default"]
         )
+
+
+# --------------------------------------------------------------------------
+# T-models-advertise-side — W-3 in the other direction: every routable
+# name is advertised
+# --------------------------------------------------------------------------
+
+
+class TestListModelsAdvertisesEveryRoutableName:
+    """The advertised set *is* the routable set, not merely a subset of it.
+
+    W-3 narrowed the listing one way -- nothing advertised may 404 -- and
+    left the other direction open, recorded in ``list_all_models``' own
+    docstring as "a declared name whose own upstream does not report it
+    is routable without being advertised".
+
+    That asymmetry is not hypothetical. It uses "some upstream reported
+    it" as a proxy for "it exists", and the proxy is simply wrong for a
+    backend that is not a model catalogue: ``ClaudeCodeBackend.
+    list_models`` returns a hardcoded empty list, so the shipped
+    ``claude-code-opus`` / ``claude-code-sonnet`` were fully routable and
+    entirely absent from ``/v1/models``. Nor did a tier rescue them --
+    no shipped tier maps to the ``claude_code`` backend -- so the
+    docstring's own consolation ("the rest of the upstream's catalogue is
+    reachable through the tier alias that resolves to it") was false for
+    that backend.
+
+    The rule that replaces the proxy is the one the file already applies
+    to tier aliases: a name this gateway *declares* is advertised on this
+    gateway's own authority. It does not weaken W-3 -- everything newly
+    advertised is routable by construction, and the two filters that make
+    a name unroutable (ambiguity, and upstream-only) both still hold the
+    name out. These tests are the deliberate pair of
+    ``TestListModelsMatchesRoutableSet``: that class measures "advertised
+    is contained in routable", this one measures the converse.
+    """
+
+    @staticmethod
+    def _declared_but_absent_router() -> BackendRouter:
+        """One backend declaring two names; its upstream reports one.
+
+        The general shape of the shipped ``claude_code`` defect with the
+        vendor specifics removed: ``list_models`` under-reports what the
+        gateway declares. ``claude_code`` is the extreme case of this --
+        it reports nothing at all -- not a different case.
+        """
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                # Deliberately not ``b1``. With the declaring backend also
+                # being the default, a row stamped with the default would
+                # be indistinguishable from a row stamped with the
+                # declaring backend, and the attribution assertion below
+                # would pass against a router that ignores declarations.
+                default_backend="elsewhere",
+                backends={
+                    "b1": BackendSettings(
+                        url="http://localhost:1",
+                        models=[{"name": "reported"}, {"name": "declared-only"}],
+                    ),
+                    "elsewhere": BackendSettings(
+                        url="http://localhost:2", models=[{"name": "somewhere-else"}]
+                    ),
+                },
+                tiers={"light": TierSettings(backend="b1")},
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        router.backends["b1"].list_models = AsyncMock(
+            return_value={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "reported",
+                        "object": "model",
+                        "created": 1_700_000_000,
+                        "owned_by": "vllm",
+                    }
+                ],
+            }
+        )
+        router.backends["elsewhere"].list_models = AsyncMock(
+            return_value={"object": "list", "data": []}
+        )
+        return router
+
+    @pytest.mark.asyncio
+    async def test_declared_name_the_upstream_never_reports_is_advertised(
+        self,
+    ) -> None:
+        """The gap class itself: routable **and** advertised, not one or
+        the other."""
+        router = self._declared_but_absent_router()
+        listing = await router.list_all_models()
+        ids = {m["id"] for m in listing["data"]}
+
+        # Precondition stated through the public lookup, so "routable" is
+        # measured rather than read off the config literal above.
+        assert router.get_backend_name_for_model("declared-only") == "b1"
+        assert "declared-only" in ids, (
+            "'declared-only' routes but its backend's upstream never "
+            f"reports it, so it was hidden from /v1/models. Got: {sorted(ids)}"
+        )
+        # The invariant in full, both directions at once, over whatever
+        # the fixture happens to contain.
+        routable = set(router._model_to_backend) | set(router._tier_to_backend)
+        assert ids == routable, (
+            f"advertised != routable. Only advertised: {sorted(ids - routable)}; "
+            f"only routable: {sorted(routable - ids)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_declared_only_row_is_attributed_and_openai_shaped(self) -> None:
+        """A row nobody reported still has to be a well-formed Model row.
+
+        ``backend`` is the field a client reads to learn where a name
+        goes (R-7), and the four OpenAI-declared fields are the ones
+        whose absence does not raise in ``openai-python`` but comes back
+        as ``None`` on ``int`` / ``str``-declared attributes and breaks
+        later and elsewhere.
+        """
+        router = self._declared_but_absent_router()
+        listing = await router.list_all_models()
+        row = next(m for m in listing["data"] if m["id"] == "declared-only")
+
+        for field in ("id", "object", "created", "owned_by"):
+            assert field in row, f"declared-only row is missing {field!r}"
+        assert row["backend"] == router.get_backend_name_for_model("declared-only")
+        # Advertised on this gateway's authority, exactly as a tier alias
+        # is: no upstream vouched for this row, and ``created: 0`` is the
+        # same "no creation time exists" sentinel rather than a plausible
+        # fabricated timestamp.
+        assert row["owned_by"] == "lexora"
+        assert row["created"] == 0
+        # The marker that makes the two lines above honest. ``owned_by:
+        # "lexora"`` is stamped on rows for vendor-owned IDs as well
+        # (``claude-sonnet-4-20250514``, ``gemini-3.1-pro-preview``), and
+        # that is a statement about who asserts the row rather than a
+        # claim of ownership *only* while ``type`` says the row is this
+        # gateway's own assertion. Until this line the marker was
+        # unfenced: the string is emitted in exactly one place and
+        # deleting that line left the whole suite green, so any tidying
+        # pass could drop it and turn five production rows into
+        # upstream-looking claims that Lexora owns Anthropic's and
+        # Google's models.
+        assert row["type"] == "declared"
+
+    @pytest.mark.asyncio
+    async def test_a_reported_row_is_not_replaced_by_a_declared_one(self) -> None:
+        """Fill the gap; do not overwrite what the upstream did say.
+
+        ``reported`` is both declared and reported, so the upstream's own
+        row is the truthful one and has to survive intact -- one row,
+        carrying the vendor's ``created`` / ``owned_by``. Emitting the
+        declared row unconditionally would blank both fields for every
+        model an upstream actually described.
+        """
+        router = self._declared_but_absent_router()
+        listing = await router.list_all_models()
+        rows = [m for m in listing["data"] if m["id"] == "reported"]
+        assert len(rows) == 1, f"expected one row for 'reported', got {rows}"
+        assert rows[0]["created"] == 1_700_000_000
+        assert rows[0]["owned_by"] == "vllm"
+        # The other half of the ``type`` fence, and the half that carries
+        # the meaning: what matters is the *distinction*, not the
+        # marker's presence. A suite that only asserted ``type ==
+        # "declared"`` on the declared row (see the sibling test above)
+        # would still pass against an emit site that stamped ``type`` on
+        # every row, which would erase the distinction while satisfying
+        # the assertion. ``reported`` came from the upstream, so it must
+        # carry no marker at all.
+        assert "type" not in rows[0], (
+            "'reported' was reported by the upstream, so it must carry no "
+            "'type' key: the marker is what tells a row this gateway "
+            f"asserts from one an upstream confirmed. Got: {rows[0]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_declared_name_stays_out_even_if_unreported(self) -> None:
+        """W-3 is not weakened: the converse is over the *routable* set,
+        not the declared one.
+
+        ``dup`` is declared by two backends, so it 404s (R-1a) and is
+        absent from ``_model_to_backend``. Advertising every *declared*
+        name -- the near-miss implementation -- would put it back into the
+        listing, and neither upstream reports it here, so the existing
+        W-3 test that drops it at the upstream row cannot see this.
+        """
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(
+                        url="http://localhost:1",
+                        models=[{"name": "dup"}, {"name": "solo"}],
+                    ),
+                    "b2": BackendSettings(
+                        url="http://localhost:2", models=[{"name": "dup"}]
+                    ),
+                },
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        empty = {"object": "list", "data": []}
+        for name in ("b1", "b2"):
+            router.backends[name].list_models = AsyncMock(return_value=empty)
+
+        listing = await router.list_all_models()
+        ids = {m["id"] for m in listing["data"]}
+        assert "solo" in ids
+        assert "dup" not in ids, (
+            "'dup' is declared by b1 and b2, so the router 404s it. A "
+            f"declared name is not the same as a routable one. Got: {sorted(ids)}"
+        )
+        for model_id in ids:
+            router.get_backend_for_model(model_id)
 
 
 # --------------------------------------------------------------------------

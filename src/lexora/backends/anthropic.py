@@ -604,12 +604,18 @@ class AnthropicBackend(Backend):
         raise BackendError("Embeddings are not supported by Anthropic API")
 
     async def list_models(self) -> dict[str, Any]:
-        """Return configured models in OpenAI format.
+        """Return an empty catalogue -- there is no upstream one to report.
 
-        Anthropic doesn't have a direct /v1/models equivalent,
-        so we return the models from our configuration.
+        Anthropic has no ``/v1/models`` equivalent to query, so this
+        backend has nothing an upstream vouched for. It deliberately does
+        **not** re-derive the list from configuration either: which names
+        are routable is the router's knowledge, and
+        ``BackendRouter.list_all_models`` already advertises every name
+        this backend declares, on the gateway's own authority, as a row
+        marked ``type: "declared"``. Returning the configured models from
+        here would duplicate that knowledge into a loop that would then
+        have to deduplicate it away again.
         """
-        # Return an empty model list; actual models are managed by config
         return {"object": "list", "data": []}
 
     async def health_check(self) -> bool:

@@ -44,6 +44,16 @@ class TestConvenienceAPI:
         """Create a mock backend router."""
         backend_router = MagicMock()
         backend_router.get_backend_for_model = MagicMock(return_value=mock_backend)
+        # The real `resolve_model` is `self._tier_to_model.get(model, model)`:
+        # a name no tier fronts comes back unchanged. Every model name used in
+        # this file is such a name, so the identity is the faithful answer.
+        # Left unset, the attribute is an auto-created child mock that returns
+        # a mock object instead, which would put a property of the test double
+        # on the wire rather than a property of the handler. The other six
+        # test modules that drive a handler through a mock router all set this
+        # attribute; this one did not need to until `/generate` and `/chat`
+        # began resolving.
+        backend_router.resolve_model = MagicMock(side_effect=lambda name: name)
         backend_router.list_all_models = AsyncMock()
         backend_router.health_check = AsyncMock(return_value={"default": True})
         backend_router.default_backend = mock_backend

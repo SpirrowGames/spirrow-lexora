@@ -115,7 +115,7 @@ def _fail_preflight(
             endpoint=endpoint,
             model=model,
             status="error",
-            duration=time.time() - start_time,
+            duration=time.monotonic() - start_time,
             streaming=True,
         )
 
@@ -238,7 +238,36 @@ def get_task_classifier(request: Request) -> TaskClassifier | None:
 
 
 def get_cost_tracker(request: Request) -> CostTracker | None:
-    """Get cost tracker from app state."""
+    """Get cost tracker from app state.
+
+    Ledger coverage, measured 2026-09-06 at `05f6827`. Every row in
+    `request_costs` is written through this dependency, so the table below is
+    what `/stats/costs` and `/stats/costs/recent` are summing over:
+
+        endpoint               non-streaming     streaming
+        /v1/chat/completions   records a row     no row
+        /v1/completions        records a row     no row
+        /v1/embeddings         records a row     (no streaming form)
+        /generate              records a row     (no streaming form)
+        /chat                  records a row     (no streaming form)
+        /v1/messages           records a row     no row
+
+    Until 2026-09-06 the four middle non-streaming cells read "no row" too.
+    Those handlers computed `tokens_input` / `tokens_output` for the stats
+    collector and dropped them, and did not take this dependency at all. No
+    comment recorded a reason, so the split between the recorded pair and the
+    silent four tracked which handlers had been edited rather than a decision
+    about what to bill. `/stats/costs` totals are larger from that date on:
+    added coverage, not double counting -- the two pre-existing call sites are
+    untouched and no past row was rewritten.
+
+    The three streaming paths still open no row, and that one *is* a decision.
+    Each `stream_generator` relays the bytes `backend.*_stream` yields without
+    decoding them, in both the passthrough and non-passthrough branches, so a
+    token count there would have to come from reading SSE frames mid-relay.
+    Where that parsing belongs is left open here, and written down rather than
+    left as a silent asymmetry.
+    """
     return getattr(request.app.state, "cost_tracker", None)
 
 
@@ -330,7 +359,7 @@ async def chat_completions(
             model=request.model,
             user_id=request.user,
         )
-        start_time = time.time()
+        start_time = time.monotonic()
 
         # Record metrics start
         if metrics_collector:
@@ -429,7 +458,7 @@ async def chat_completions(
                         yield chunk
 
                 # Mark as successful on stream completion
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=True)
 
                 # Record metrics
@@ -448,7 +477,7 @@ async def chat_completions(
                     duration=duration,
                 )
             except BackendError as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -468,7 +497,7 @@ async def chat_completions(
                 )
                 raise
             except Exception as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -499,7 +528,7 @@ async def chat_completions(
             # to agree with `_fail_preflight` on the same exception class;
             # whether a disconnect is a *failure* is not settled here.
             except BaseException as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 if metrics_collector:
@@ -535,7 +564,7 @@ async def chat_completions(
         model=request.model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Record metrics start
     if metrics_collector:
@@ -562,7 +591,7 @@ async def chat_completions(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -585,8 +614,21 @@ async def chat_completions(
             )
 
         # Record cost. The tier alias (if any) goes to its own column; the
-        # `model` column carries the resolved concrete model ID so pricing
-        # tracks the actual upstream, not the caller's alias.
+        # `model` column carries the resolved concrete model ID rather than
+        # the caller's alias, so pricing is looked up against the name that
+        # was actually served.
+        #
+        # That resolved ID is an upstream model ID for the metered HTTP
+        # backends only. The `claude-code-*` names are Lexora-local: the
+        # `claude_code` backend shells out to the Claude Code CLI instead
+        # of issuing a metered request, and one invocation can be served by
+        # more than one upstream model. Those IDs are therefore absent from
+        # `DEFAULT_PRICING` on purpose, and their rows land on
+        # `cost_usd=0.0` / `pricing_known=0` -- "we cannot say" rather than
+        # a rate. The reasoning and the measurements are in the `NOTE` on
+        # `DEFAULT_PRICING` in `services/cost_tracker.py`; the behaviour is
+        # fenced by `TestSubscriptionBackendIsNotPriced` in
+        # `tests/services/test_cost_tracker.py`.
         if cost_tracker and (tokens_input > 0 or tokens_output > 0):
             cost_tracker.record(
                 model=resolved_model,
@@ -610,7 +652,7 @@ async def chat_completions(
         return response
 
     except BackendUpstreamError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
         if metrics_collector:
             metrics_collector.record_request_end(
@@ -637,7 +679,7 @@ async def chat_completions(
         logger.error("chat_completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -652,7 +694,7 @@ async def chat_completions(
         logger.error("chat_completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -680,6 +722,7 @@ async def completions(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> dict[str, Any] | StreamingResponse:
     """Proxy completion request to vLLM.
 
@@ -691,6 +734,7 @@ async def completions(
         rate_limiter: Rate limiter.
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
+        cost_tracker: Cost tracker.
 
     Returns:
         OpenAI-compatible completion response or streaming response.
@@ -717,7 +761,7 @@ async def completions(
             model=request.model,
             user_id=request.user,
         )
-        start_time = time.time()
+        start_time = time.monotonic()
 
         # Record metrics start
         if metrics_collector:
@@ -813,7 +857,7 @@ async def completions(
                         yield chunk
 
                 # Mark as successful on stream completion
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=True)
 
                 # Record metrics
@@ -832,7 +876,7 @@ async def completions(
                     duration=duration,
                 )
             except BackendError as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -852,7 +896,7 @@ async def completions(
                 )
                 raise
             except Exception as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -874,7 +918,7 @@ async def completions(
             # ACTIVE_REQUESTS invariant. See the same clause in
             # `chat_completions` above for why.
             except BaseException as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 if metrics_collector:
@@ -910,7 +954,7 @@ async def completions(
         model=request.model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Record metrics start
     if metrics_collector:
@@ -937,7 +981,7 @@ async def completions(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -959,6 +1003,23 @@ async def completions(
                 retries=retries,
             )
 
+        # Record cost. Same shape as `/v1/chat/completions`: the `model`
+        # column takes the resolved concrete ID and the `tier` column takes
+        # the alias the caller used. The `claude-code-*` exception recorded
+        # at that call site applies here unchanged -- a resolved ID is an
+        # upstream model ID only for the metered HTTP backends.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=resolved_model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(request.model),
+                user_id=request.user,
+                duration=duration,
+                tier=request.model if backend_router.is_tier(request.model) else None,
+            )
+
         logger.info(
             "completion_success",
             model=request.model,
@@ -970,7 +1031,7 @@ async def completions(
         return response
 
     except BackendUpstreamError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
         if metrics_collector:
             metrics_collector.record_request_end(
@@ -994,7 +1055,7 @@ async def completions(
         logger.error("completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1009,7 +1070,7 @@ async def completions(
         logger.error("completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1036,6 +1097,7 @@ async def embeddings(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> dict[str, Any]:
     """Proxy embeddings request to vLLM.
 
@@ -1046,6 +1108,7 @@ async def embeddings(
         rate_limiter: Rate limiter.
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
+        cost_tracker: Cost tracker.
 
     Returns:
         OpenAI-compatible embeddings response.
@@ -1064,7 +1127,7 @@ async def embeddings(
         model=resolved_model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Record metrics start
     if metrics_collector:
@@ -1078,7 +1141,7 @@ async def embeddings(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = 0  # Embeddings don't have output tokens
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -1097,6 +1160,22 @@ async def embeddings(
                 tokens_input=tokens_input,
             )
 
+        # Record cost. `tokens_output` is always 0 here, which is why the
+        # guard is `or` and not `and`. No embedding model is in
+        # `DEFAULT_PRICING`, so these rows land on `pricing_known=0` and cost
+        # 0.0 -- "no price for this" is a statement; no row was not one.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=resolved_model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(request.model),
+                user_id=request.user,
+                duration=duration,
+                tier=request.model if backend_router.is_tier(request.model) else None,
+            )
+
         logger.info(
             "embeddings_success",
             model=request.model,
@@ -1106,7 +1185,7 @@ async def embeddings(
         return response
 
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1121,7 +1200,7 @@ async def embeddings(
         logger.error("embeddings_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1382,6 +1461,7 @@ async def generate(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     model_registry: ModelRegistry | None = Depends(get_model_registry),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> GenerateResponse:
     """Simple text generation endpoint.
 
@@ -1397,6 +1477,7 @@ async def generate(
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
         model_registry: Model registry for default model lookup.
+        cost_tracker: Cost tracker.
 
     Returns:
         GenerateResponse with generated text.
@@ -1416,12 +1497,23 @@ async def generate(
             detail="No model specified and no default model configured",
         )
 
-    # Get backend for the model
+    # Get backend for the model, then resolve the name -- in that order.
+    # Routing keys off the name the caller sent. A tier alias resolves to a
+    # concrete model that may be declared by several backends, and
+    # `get_backend_for_model` refuses such a name as ambiguous rather than
+    # picking a winner (404), so resolving first would break routing for
+    # every tier whose concrete model is shared. The shipping config is in
+    # exactly that state: `light`, `medium` and `heavy` all resolve to
+    # `Qwen3.8-27B`, which three backends declare.
     backend = backend_router.get_backend_for_model(model)
+    resolved_model = backend_router.resolve_model(model)
 
-    # Build completions request
+    # Build completions request. The wire field carries the resolved concrete
+    # model: a tier alias is a name in Lexora's config and nothing upstream
+    # declares it. This is the same two-step `/v1/chat/completions` and
+    # `/v1/completions` perform.
     completion_request: dict[str, Any] = {
-        "model": model,
+        "model": resolved_model,
         "prompt": request.prompt,
         "max_tokens": request.max_tokens,
     }
@@ -1443,7 +1535,7 @@ async def generate(
         model=model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     if metrics_collector:
         metrics_collector.record_request_start(endpoint)
@@ -1467,7 +1559,7 @@ async def generate(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -1488,6 +1580,21 @@ async def generate(
                 retries=retries,
             )
 
+        # Record cost. `CostTracker.record` takes the concrete model in
+        # `model` and the alias in `tier`; `resolved_model` is the same value
+        # the outgoing request carries, so the ledger and the wire agree.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=resolved_model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(model),
+                user_id=request.user,
+                duration=duration,
+                tier=model if backend_router.is_tier(model) else None,
+            )
+
         logger.info(
             "generate_success",
             model=model,
@@ -1499,7 +1606,7 @@ async def generate(
         return GenerateResponse(text=text)
 
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1515,7 +1622,7 @@ async def generate(
     except HTTPException:
         raise
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1548,6 +1655,7 @@ async def chat(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     model_registry: ModelRegistry | None = Depends(get_model_registry),
+    cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> ChatResponse:
     """Simple chat endpoint.
 
@@ -1563,6 +1671,7 @@ async def chat(
         rate_limit_enabled: Whether rate limiting is enabled.
         metrics_collector: Prometheus metrics collector.
         model_registry: Model registry for default model lookup.
+        cost_tracker: Cost tracker.
 
     Returns:
         ChatResponse with assistant response.
@@ -1582,12 +1691,16 @@ async def chat(
             detail="No model specified and no default model configured",
         )
 
-    # Get backend for the model
+    # Get backend for the model, then resolve the name. See the note in
+    # `/generate`: routing takes the requested name because the resolved one
+    # can be ambiguous across backends, and the wire takes the resolved one
+    # because a tier alias names nothing upstream declares.
     backend = backend_router.get_backend_for_model(model)
+    resolved_model = backend_router.resolve_model(model)
 
     # Build chat completions request
     chat_request: dict[str, Any] = {
-        "model": model,
+        "model": resolved_model,
         "messages": [msg.model_dump() for msg in request.messages],
         "max_tokens": request.max_tokens,
     }
@@ -1606,7 +1719,7 @@ async def chat(
         model=model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     if metrics_collector:
         metrics_collector.record_request_start(endpoint)
@@ -1631,7 +1744,7 @@ async def chat(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -1652,6 +1765,20 @@ async def chat(
                 retries=retries,
             )
 
+        # Record cost. Same shape as `/generate`: `resolved_model` in the
+        # `model` column, the alias in `tier`.
+        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+            cost_tracker.record(
+                model=resolved_model,
+                endpoint=endpoint,
+                tokens_input=tokens_input,
+                tokens_output=tokens_output,
+                backend=backend_router.get_backend_name_for_model(model),
+                user_id=request.user,
+                duration=duration,
+                tier=model if backend_router.is_tier(model) else None,
+            )
+
         logger.info(
             "chat_success",
             model=model,
@@ -1663,7 +1790,7 @@ async def chat(
         return ChatResponse(response=response_text)
 
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1679,7 +1806,7 @@ async def chat(
     except HTTPException:
         raise
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1775,7 +1902,7 @@ async def messages(
         )
         if metrics_collector:
             metrics_collector.record_request_start(endpoint)
-        start_time = time.time()
+        start_time = time.monotonic()
 
         byte_iter = backend.chat_completions_stream(openai_request).__aiter__()
         try:
@@ -1892,7 +2019,7 @@ async def messages(
                         endpoint=endpoint,
                         model=request.model,
                         status="success",
-                        duration=time.time() - start_time,
+                        duration=time.monotonic() - start_time,
                         streaming=True,
                     )
             except Exception as e:  # noqa: BLE001
@@ -1902,7 +2029,7 @@ async def messages(
                         endpoint=endpoint,
                         model=request.model,
                         status="error",
-                        duration=time.time() - start_time,
+                        duration=time.monotonic() - start_time,
                         streaming=True,
                     )
                 logger.exception("messages_stream_unexpected_error", model=request.model)
@@ -1917,7 +2044,7 @@ async def messages(
                         endpoint=endpoint,
                         model=request.model,
                         status="error",
-                        duration=time.time() - start_time,
+                        duration=time.monotonic() - start_time,
                         streaming=True,
                     )
                 logger.error(
@@ -1942,7 +2069,7 @@ async def messages(
     stats = stats_collector.start_request(
         endpoint=endpoint, model=request.model, user_id=user_id
     )
-    start_time = time.time()
+    start_time = time.monotonic()
     if metrics_collector:
         metrics_collector.record_request_start(endpoint)
 
@@ -1964,7 +2091,7 @@ async def messages(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -2013,7 +2140,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         logger.warning("messages_governance_refused", model=request.model, error=str(e))
         return JSONResponse(
@@ -2027,7 +2154,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         if passthrough:
             logger.warning(
@@ -2053,7 +2180,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         logger.error("messages_error", model=request.model, error=str(e))
         return JSONResponse(
@@ -2067,7 +2194,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         logger.exception("messages_unexpected_error", model=request.model)
         return JSONResponse(
