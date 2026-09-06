@@ -450,9 +450,18 @@ def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
     rather than an observation of Linux. The observation has since been made.
     The floor-dropped cell was pushed on a throwaway branch that was never
     merged and CI ran it on `ubuntu-latest`: run 34053301337, **2 failed, 615
-    passed**, this test among the two, failing on the second conjunct. Verbatim
-    from that run's log, and dated by the run id rather than kept in step with
-    the lines below --
+    passed**, this test among the two, failing on the second conjunct. How a
+    push to such a branch ran CI at all, since `.github/workflows/ci.yml` fires
+    only on `pull_request` and on pushes to `main`/`develop`: that branch
+    carried a second one-line commit widening the push trigger to include
+    `'throwaway/**'`, job body otherwise untouched. That is why the run exists
+    without a PR ever having been opened for a deliberate mutation, and it is
+    the reason to read the sentence above as history rather than as a recipe --
+    pushing this edit to a throwaway branch today runs nothing. The branch is
+    not itself the record; the run id is. Reproducing the cell is those two
+    one-line edits and nothing else: the trigger, and the floor-dropped row of
+    the table above. Verbatim from that run's log, and dated by the run id
+    rather than kept in step with the lines below --
 
         AssertionError: DURATION_SLACK 1e-09 is below the 1 ms floor ...
         assert 1e-09 >= 0.001
