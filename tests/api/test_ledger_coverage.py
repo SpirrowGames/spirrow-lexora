@@ -150,7 +150,19 @@ SLOW = 0.05
 #
 # `wall` is therefore read off `time.perf_counter()` (resolution 1e-07 here),
 # which makes it the true elapsed of an interval that strictly contains the
-# handler's, leaving the inner clock's own quantum as the only error term.
+# handler's, leaving the inner clock's own quantum as the DOMINANT error term.
+# Dominant, and not the only one -- stated as the approximation it is rather
+# than as an identity it is not. The outer clock has a quantum `p` of its own,
+# so the sufficient condition is `slack >= m + p`, and measured here that is
+# `0.015625 >= 0.0156251`: false, by 1e-07. The bracket does not rest on that
+# inequality; it rests on the containment margin, the milliseconds of
+# TestClient round trip that sit outside the handler's own window. Widening
+# the slack to `max(m + p, 0.001)` to close the 1e-07 was considered and
+# declined, and not because 1e-07 is small: it would make
+# `test_the_outer_clock_is_finer_than_the_slack` -- the check that keeps `p`
+# small enough for this paragraph to mean anything -- true by construction,
+# since `p < m + p` reduces to `m > 0`. The repair would manufacture a
+# tautology one level up, and would make this term depend on a third clock.
 # Hence one tick of the handler's clock at each end, with a floor (below):
 # since the backend is held open for `SLOW` inside a window the outer reading
 # strictly contains,
@@ -168,29 +180,30 @@ SLOW = 0.05
 # constant this bracket has to reject misses it by three orders of magnitude.
 #
 # The term is now read off the clock the handler actually reads. That closes
-# the drift, and it also spends the runtime check that used to guard it, so
-# note what happened to the guard rather than leaving it to be rediscovered.
+# the drift. The derivation leans on two premises, they are different from
+# each other, and `test_interval_clock.py` now carries one check for each.
 #
-# The derivation above leans on two things. One is that the slack is not finer
-# than the handler's tick; with the term taken off that same clock it is
-# `max(m, 0.001) >= m`, true for every `m`, and an assertion restating it
-# could not be reddened by any platform -- a tautology, not a fence. It is
-# therefore not restated. The cost is real and is recorded here rather than
-# papered over: an edit that rewrites this line to something finer than the
-# handler's tick is no longer caught by an assertion. Measured on this tree,
-# pinning this to `0.001` reds the four detectors below in 10 runs out of 10
-# -- but only 1 or 2 of the four in any one run, on a varying route id -- so
-# what remains is a flake, which is the shape this file's own docstring warns
-# is not evidence.
+# One is that the slack is not finer than the handler's tick. With the term
+# taken off that same clock this reads `max(m, 0.001) >= m`, which is true for
+# every `m`, and it was briefly deleted here for exactly that reason. The
+# deletion was wrong, and the reasoning that produced it will produce it again
+# unless it is written down: no *platform* can redden that inequality, but an
+# *edit to this line* can, and those are two different properties. Measured by
+# single-site mutation of this line, three of five plausible edits redden it,
+# hardcoding it to `0.001` among them. It is fenced by
+# `test_the_slack_covers_the_handlers_tick_and_the_floor`, which carries the
+# mutation table and names the platform each cell was run on. That check
+# guards this line's *value* and never its *provenance*, so it is green on the
+# drift this change exists to remove -- deriving off `time` is value-invariant
+# on both platforms this project runs on, and no value assertion can see it.
 #
-# The other thing it leans on is contingent, is what the runtime check has
-# moved onto, and until now was asserted nowhere: `wall` is only "the true
-# elapsed of a strictly containing interval" while the OUTER clock's quantum
-# is small next to this slack. Otherwise `perf_counter`'s own tick is a second
-# error term the bracket never budgets for, and "the inner clock's own
-# quantum as the only error term" above is false. Nothing makes that so -- it
-# is a fact about whichever platform runs the suite (here 1e-07 against
-# 15.625 ms, five orders of magnitude), so it is checked at runtime by
+# The other premise is contingent, and until recently was asserted nowhere:
+# `wall` is only "the true elapsed of a strictly containing interval" while
+# the OUTER clock's quantum is small next to this slack. Otherwise
+# `perf_counter`'s own tick is a second error term of a size that matters, and
+# the paragraph above stops being even approximately true. Nothing makes that
+# so -- it is a fact about whichever platform runs the suite (here 1e-07
+# against 15.625 ms, five orders of magnitude), so it is checked at runtime by
 # `test_interval_clock.py::test_the_outer_clock_is_finer_than_the_slack`.
 DURATION_SLACK = max(time.get_clock_info("monotonic").resolution, 0.001)
 

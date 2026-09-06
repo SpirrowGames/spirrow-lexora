@@ -340,12 +340,14 @@ def test_the_outer_clock_is_finer_than_the_slack() -> None:
     1e-07 here" -- which is precisely the unchecked-claim shape this suite
     keeps finding. So it is measured here instead of asserted there.
 
-    This replaces `test_duration_slack_still_covers_the_handlers_clock`, which
-    checked the derivation's *other* premise: that the slack is not finer than
-    the handler's tick. Now that `DURATION_SLACK` is read off the handler's own
-    clock that premise is `max(m, 0.001) >= m` -- true for every `m`, so no
-    platform can redden it. Keeping it would have been a tautology wearing a
-    fence's name, so the check moved to the premise that can still fail.
+    This is the second of the derivation's two premises. The first -- that the
+    slack is not finer than the handler's tick -- is fenced separately, by
+    `test_the_slack_covers_the_handlers_tick_and_the_floor` below. Neither
+    stands in for the other, and they fail in different ways: a *platform* is
+    what reddens this one, whereas no platform can redden that one and only an
+    *edit* to the derivation can. Both are kept. Why the second survives
+    despite being unreddenable by any platform is measured in its own
+    docstring, not argued here.
 
     Measured where this was written: `perf_counter` reports 1e-07 against a
     slack of 15.625 ms, five orders of magnitude, so unlike the check it
@@ -359,6 +361,79 @@ def test_the_outer_clock_is_finer_than_the_slack() -> None:
         f"perf_counter resolution {outer!r} is not finer than DURATION_SLACK "
         f"{DURATION_SLACK!r}: `wall` in test_ledger_coverage.py carries a "
         f"quantum of its own that the duration bracket does not budget for"
+    )
+
+
+def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
+    """`DURATION_SLACK` must clear the handler's tick, and must clear the floor.
+
+    This check was deleted once and is restored here, so the argument that
+    deleted it is written out rather than left to be re-derived. That argument:
+    now that `DURATION_SLACK` is read off the handler's own clock this is
+    `max(m, 0.001) >= m`, true for every `m`, so no platform can redden it, so
+    it is a tautology and not a fence.
+
+    Its first half is true and its conclusion does not follow. "No platform
+    reddens it" and "no edit reddens it" are different properties, and only the
+    second makes a check worthless. A regression test restates the correct
+    implementation on purpose -- that restatement is the whole mechanism by
+    which it fences later edits to it. Measured on this tree, on **Windows**
+    (`m` = `monotonic` and `t` = `time` both 15.625 ms, `p` = `perf_counter`
+    1e-07), one single-site mutation of the derivation line in
+    `test_ledger_coverage.py` per cell, `__pycache__` cleared between cells,
+    classified by pytest exit code:
+
+        edit to the derivation line           becomes        this test
+        ------------------------------------  -------------  ----------
+        (control -- unmutated)                max(m, 0.001)  green
+        hardcode the floor                    0.001          RED
+        max -> min                            min(m, 0.001)  RED
+        wrong clock: perf_counter for m       max(p, 0.001)  RED
+        floor dropped                         m              green here
+        regress to get_clock_info("time")     max(t, 0.001)  green
+
+    Three of five. The first conjunct is what reddens all three, and on this
+    platform it binds with **equality** -- `0.015625 >= 0.015625`, zero margin.
+
+    Two conjuncts rather than one `>= max(m, 0.001)`, and the reason is not
+    just that they fail with different messages. Evaluating the two expressions
+    over the same six rows shows them to be complementary rather than
+    overlapping: on this box the tick conjunct reddens 3 of the 5 edits and the
+    floor conjunct reddens **0**, and substituting a fine-grained `m` of 1e-09
+    into the same arithmetic flips it exactly -- tick 0, floor 2, those being
+    the floor-dropped and `max -> min` rows. Neither conjunct alone covers both
+    platform classes. `>= m` on its own would be a fence with a hole in it on a
+    fine-grained runner; `>= 0.001` on its own would be a fence with a hole in
+    it here. The floor conjunct is also not a restatement of the derivation --
+    it is an independent statement of design intent, which is what lets it
+    survive an edit that rewrites the derivation entirely.
+
+    So the floor half is a **prediction on this platform, not a measurement**.
+    It reddens nothing in the table above, because `m` is 15.625 ms here and
+    the floor is a no-op; and the 1e-09 column is arithmetic on these two
+    expressions, not an observation of Linux. What CI settles is the weaker
+    claim that both conjuncts *hold* on the Linux runner -- where
+    `DURATION_SLACK` is the floor, so this conjunct should bind there with
+    equality, `0.001 >= 0.001`, and a red would be the finding. CI does not
+    settle that the floor conjunct catches the floor-dropped edit on Linux:
+    that needs the mutation pushed, and it is deliberately not.
+
+    The ceiling, so that no more is claimed for this than it gives: it guards
+    the *value* of `DURATION_SLACK` and never its *provenance*. The drift this
+    change exists to remove -- deriving off `time` instead of `monotonic` -- is
+    value-invariant on both platforms this project runs on, which is why the
+    last row above is green. No value assertion can catch that one, and this
+    one does not pretend to.
+    """
+    m = time.get_clock_info("monotonic").resolution
+    assert DURATION_SLACK >= m, (
+        f"DURATION_SLACK {DURATION_SLACK!r} is finer than the handler's tick "
+        f"{m!r}: test_ledger_coverage.py's bracket is tighter than the clock "
+        f"feeding it and will flake on a true reading"
+    )
+    assert DURATION_SLACK >= 0.001, (
+        f"DURATION_SLACK {DURATION_SLACK!r} is below the 1 ms floor that keeps "
+        f"the bracket from going exactly tight on a fine-grained platform"
     )
 
 
