@@ -12,7 +12,30 @@ server:
 routing:
   enabled: true
   default_backend: "heavy"
-  default_model_for_unknown_task: "Qwen3.8-27B"
+  # tier alias, not a raw model name (T-silent-routing R-1a): the raw name
+  # `Qwen3.8-27B` is declared by three backends (heavy / light / deep, same
+  # upstream URL, different reasoning_effort / thinking_mode), so requesting
+  # it by name is refused with 404 rather than routed to a winner picked by
+  # YAML declaration order. Tier aliases go through the unambiguous tier
+  # lookup, so this field points at a tier.
+  #
+  # `heavy` is the tier that preserves today's effective route, and it was
+  # chosen for that and nothing else. Measured on both sides:
+  #   before: "Qwen3.8-27B" -> by-name index -> backend `deep` (timeout
+  #           600.0, reasoning_effort xhigh), because `deep` is declared
+  #           last among the three and the last writer won.
+  #   after:  "heavy"       -> tier `heavy`  -> backend `deep` (timeout
+  #           600.0, reasoning_effort xhigh).
+  # Same backend, same timeout, same upstream model — /generate and /chat
+  # without an explicit `model` land exactly where they landed before.
+  #
+  # Note that this is deliberately NOT `default_backend`. The tier named
+  # `heavy` routes to the backend named `deep`; the backend named `heavy`
+  # is what the `medium` tier uses and what `default_backend` names, and
+  # its timeout is 300.0. Changing this field to `medium` — which reads
+  # like a tidy-up towards `default_backend` — would halve the timeout for
+  # every unknown-task request. Move it only with that measurement redone.
+  default_model_for_unknown_task: "heavy"
 
   # ティアベースルーティング
   # 呼び出し側は model: "light" 等のティア名を指定するだけでよい

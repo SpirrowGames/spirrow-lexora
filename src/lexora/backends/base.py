@@ -11,6 +11,50 @@ class BackendError(Exception):
     pass
 
 
+class ModelNotFoundError(BackendError):
+    """Raised when a requested model name cannot be routed.
+
+    Used by ``BackendRouter`` for two distinct configuration situations that
+    share one API-facing shape (T-silent-routing R-1a / R-2):
+
+    * ``unknown`` — the requested name is neither a registered tier nor a
+      model declared by any backend, and the router refuses to silently
+      fall through to ``default_backend``.
+    * ``ambiguous`` — the requested name is declared as a model by two or
+      more backends, so no single backend can be picked without guessing.
+
+    Both surface to the caller as HTTP 404 with OpenAI's standard
+    ``model_not_found`` code. The distinction stays server-side: the router
+    logs a different event name for each case (``model_unknown_refused`` vs
+    ``model_ambiguous_refused``) and the human-readable ``message`` here
+    explains the specific situation. Clients that want to programmatically
+    distinguish should not — the remedy is identical (change the ``model``
+    string).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        model_name: str,
+        reason: str,
+    ) -> None:
+        """Initialize the error.
+
+        Args:
+            message: Human-readable explanation. Forwarded verbatim as the
+                HTTP response's ``message`` field.
+            model_name: The name the caller requested. Forwarded as the
+                ``param`` value in the OpenAI error envelope.
+            reason: Machine-readable classifier for server-side logging /
+                metrics. One of ``"unknown"`` or ``"ambiguous"``. Not
+                exposed on the API — the API code stays ``model_not_found``
+                regardless.
+        """
+        super().__init__(message)
+        self.model_name = model_name
+        self.reason = reason
+
+
 class BackendConnectionError(BackendError):
     """Raised when connection to backend fails."""
 
