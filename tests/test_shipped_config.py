@@ -150,17 +150,12 @@ def test_shipped_ambiguous_refusal_still_names_the_three_qwen_tiers() -> None:
         )
 
 
-@pytest.mark.asyncio
-async def test_shipped_listing_is_the_five_tier_aliases() -> None:
-    """R-7 regression pin: the advertised set of the shipped config.
+def _shipped_router_with_stubbed_upstreams() -> BackendRouter:
+    """Shipped router whose every upstream serves both Qwen names.
 
-    Every upstream is stubbed to serve both Qwen names — the current one
-    and the pre-rename alias the vLLM servers keep — which is the widest
-    catalogue any backend here reports. ``Qwen3.8-27B`` is ambiguous and
-    ``Qwen3-32B`` is declared by nobody, so both are refused by the
-    router and neither may be advertised; what is left is the five tier
-    aliases. Tightening the listing filter to a per-backend declaration
-    check must not disturb that.
+    That is the widest catalogue any backend here reports — the current
+    model ID and the pre-rename alias the vLLM servers keep — so it is
+    the payload that exercises both listing filters at once.
     """
     router = _shipped_router()
     upstream = {
@@ -172,13 +167,115 @@ async def test_shipped_listing_is_the_five_tier_aliases() -> None:
     }
     for backend in router.backends.values():
         backend.list_models = AsyncMock(return_value=upstream)
+    return router
+
+
+@pytest.mark.asyncio
+async def test_shipped_listing_is_the_tiers_plus_the_declared_concrete_names() -> None:
+    """R-7 / T-models-advertise-side regression pin: the advertised set.
+
+    This pin changed deliberately, and the change is the point of
+    T-models-advertise-side. It used to read
+    ``["light", "medium", "heavy", "naysayer", "frontier"]`` — five tier
+    aliases and zero concrete IDs — under the older rule that a concrete
+    name is advertised only when some upstream reported it. Under that
+    rule the shipped ``claude-code-opus`` / ``claude-code-sonnet`` were
+    routable and invisible: ``ClaudeCodeBackend.list_models`` returns a
+    hardcoded empty list and no shipped tier maps to that backend, so
+    the whole backend was undiscoverable through the HTTP API.
+
+    The advertised set is now the routable set, so every unambiguously
+    declared name appears with the declaring backend on its row. What is
+    still *absent* is what carries the rest of the meaning:
+
+    * ``Qwen3.8-27B`` — declared by ``heavy`` / ``light`` / ``deep``, so
+      it is ambiguous, 404s by name (R-1a), and stays out. Declared is
+      not the same as routable.
+    * ``Qwen3-32B`` — reported by the stubbed upstreams and declared by
+      nobody, so it 404s (R-2) and stays out. W-3 is intact.
+
+    The order is part of the pin: concrete rows first, then tiers, so a
+    consumer reading top-down sees the IDs before the aliases that route
+    to them.
+    """
+    router = _shipped_router_with_stubbed_upstreams()
 
     listing = await router.list_all_models()
     ids = [m["id"] for m in listing["data"]]
-    assert ids == ["light", "medium", "heavy", "naysayer", "frontier"], (
-        f"Advertised ids changed. Got: {ids}"
-    )
+    assert ids == [
+        "gemini-3.1-pro-preview",
+        "claude-code-opus",
+        "claude-code-sonnet",
+        "claude-sonnet-4-20250514",
+        "claude-fable-5",
+        "light",
+        "medium",
+        "heavy",
+        "naysayer",
+        "frontier",
+    ], f"Advertised ids changed. Got: {ids}"
+    assert "Qwen3.8-27B" not in ids
+    assert "Qwen3-32B" not in ids
     # And the invariant the ids alone do not carry: every advertised
     # name routes, and to the backend the row names.
     for row in listing["data"]:
         assert row["backend"] == router.get_backend_name_for_model(row["id"])
+
+
+@pytest.mark.asyncio
+async def test_shipped_advertised_set_equals_routable_set() -> None:
+    """T-models-advertise-side: the invariant, not a list of IDs.
+
+    The pin above goes stale the moment a model is added to the shipped
+    config, and updating it is then a bookkeeping edit that cannot fail.
+    This states the property instead, so a name added to
+    ``config/lexora_config.yaml`` and dropped from ``/v1/models`` fails
+    here without anyone having to think of it.
+
+    "Routable" is enumerated from the router's own two lookup tables
+    because those are exactly what ``get_backend_for_model`` consults —
+    the tier map and the unambiguous by-name index. Rebuilding the set
+    from the YAML instead would re-implement the ambiguity rule in the
+    test and could agree with a broken router for the wrong reason.
+    """
+    router = _shipped_router_with_stubbed_upstreams()
+
+    listing = await router.list_all_models()
+    advertised = {m["id"] for m in listing["data"]}
+    routable = set(router._model_to_backend) | set(router._tier_to_backend)
+
+    assert advertised == routable, (
+        f"/v1/models disagrees with the router. Advertised but not "
+        f"routable (W-3 violated): {sorted(advertised - routable)}; "
+        f"routable but not advertised (hidden): {sorted(routable - advertised)}"
+    )
+    # Not vacuous: an empty listing would satisfy set equality against an
+    # empty routable set, and this config declares plenty.
+    assert len(advertised) >= 10
+
+
+@pytest.mark.asyncio
+async def test_shipped_claude_code_models_are_advertised_and_route() -> None:
+    """The two names this thread was opened for, by name.
+
+    Kept as a named-instance pin next to the invariant above because the
+    invariant would also be satisfied by deleting the ``claude_code``
+    backend from the shipped config. These two names are shipped,
+    working and were hidden; a change that removes them from the API
+    should have to say so here.
+    """
+    router = _shipped_router_with_stubbed_upstreams()
+
+    listing = await router.list_all_models()
+    rows = {m["id"]: m for m in listing["data"]}
+    for name in ("claude-code-opus", "claude-code-sonnet"):
+        assert name in rows, (
+            f"'{name}' is declared by the shipped config and routes, but "
+            f"/v1/models does not list it. Got: {sorted(rows)}"
+        )
+        assert rows[name]["backend"] == "claude_code"
+        assert router.get_backend_name_for_model(name) == "claude_code"
+    # No upstream reports these — the backend's ``list_models`` is a
+    # hardcoded empty list — so both rows exist on this gateway's own
+    # authority, which is what ``owned_by`` records.
+    assert rows["claude-code-opus"]["owned_by"] == "lexora"
