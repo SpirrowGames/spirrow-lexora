@@ -45,37 +45,50 @@ on the by-name path). A mock router answers every lookup, so it cannot tell a
 correct order from an inverted one. The backends are real objects too; only
 their transport methods are replaced.
 
-Mutation, so the detectors below are measured rather than asserted. Counts are
-this file alone, 8 cases:
+Every case below is parametrised over both routes, including the routing fence
+and the control. An earlier revision of this file drove those two through
+`/generate` only, which left `/chat`'s routing unfenced: the isolating
+mutation in the last entry, applied to `/chat` alone, passed all 8 cases of
+that revision. The lesson generalises past this file -- an isolating mutation
+has to be applied *per site*, not once across every site the requirement
+covers, or a fence that exists for the requirement can still be absent at one
+of the places the requirement holds.
 
-- Against `develop` (`cd7cdac`): 4 red / 4 green. Red = both
+Mutation, so the detectors below are measured rather than asserted. Counts are
+this file alone, 12 cases:
+
+- Against `develop` (`cd7cdac`): 4 red / 8 green. Red = both
   `TestTierAliasIsResolvedBeforeItGoesUpstream` cases and both
   `TestDefaultModelIsATierAlias` cases -- each reads the dict the backend was
   handed and finds `dup-model` absent, the alias present. Green, and therefore
-  fences rather than detectors, = all three
-  `TestRoutingUsesTheRequestedName` cases (`develop` already routes by the
-  requested name; the fix must not lose that) and
-  `test_non_tier_name_is_passed_through_unchanged`.
-- `/generate` fixed alone (both edits made there and nowhere else): 2 red / 6
-  green. `[generate]` goes green in both classes while `[chat]` stays red in
-  both -- two independent detectors per class, not one counted twice.
+  fences rather than detectors, = all six `TestRoutingUsesTheRequestedName`
+  cases (`develop` already routes by the requested name; the fix must not lose
+  that) and both `test_non_tier_name_is_passed_through_unchanged` cases.
+- `/generate` fixed alone (the wire field left unresolved in `chat`): 2 red /
+  10 green. `[generate]` is green in both detector classes while `[chat]`
+  reds in both -- two independent detectors per class, not one counted twice.
 - Order inverted in both handlers (`resolve_model` first, its result passed to
-  `get_backend_for_model`): 7 red / 1 green. `TestRoutingUsesTheRequestedName`
-  reds on all three tiers with `ModelNotFoundError` (ambiguous), which is the
-  outcome this file exists to forbid. Note what the count says, though: the
-  four detectors red too, because a request that 404s never reaches a backend
-  and so has no payload to read. **This mutation therefore does not isolate
-  `TestRoutingUsesTheRequestedName`** -- it fails everything driven by a tier.
-  Only `test_non_tier_name_is_passed_through_unchanged` survives, because a
-  non-tier name resolves to itself and cannot detect a swap.
+  `get_backend_for_model`): 10 red / 2 green. `TestRoutingUsesTheRequestedName`
+  reds on all three tiers on both routes with `ModelNotFoundError` (ambiguous),
+  which is the outcome this file exists to forbid. Note what the count says,
+  though: the four detectors red too, because a request that 404s never reaches
+  a backend and so has no payload to read. **This mutation therefore does not
+  isolate `TestRoutingUsesTheRequestedName`** -- it fails everything driven by
+  a tier. Only the two control cases survive, because a non-tier name resolves
+  to itself and cannot detect a swap.
 - Routing forced to `default_backend` while resolution is left correct
-  (`backend = backend_router.default_backend`, both handlers): 2 red / 6
-  green, and this is the mutation that isolates. Only
-  `TestRoutingUsesTheRequestedName[medium-b2]` and `[heavy-b3]` red; `[light-b1]`
-  stays green because `b1` *is* the default, and all four detectors plus the
-  control stay green because the wire still carries `dup-model`. So the
-  routing fence detects "reached the wrong backend" on its own, independently
-  of anything the model-name assertions measure.
+  (`backend = backend_router.default_backend`), both handlers: 4 red / 8
+  green, and this is the mutation that isolates. Only `[medium-b2-*]` and
+  `[heavy-b3-*]` red; `[light-b1-*]` stays green because `b1` *is* the
+  default, and all four detectors plus both controls stay green because the
+  wire still carries `dup-model`. So the routing fence detects "reached the
+  wrong backend" on its own, independently of anything the model-name
+  assertions measure.
+- The same mutation at one handler at a time: `/generate` alone 2 red / 10
+  green (`[medium-b2-generate]`, `[heavy-b3-generate]`), `/chat` alone 2 red /
+  10 green (`[medium-b2-chat]`, `[heavy-b3-chat]`). Per-site, so neither
+  route's routing is being fenced by the other's. The `/chat` half is the one
+  that read 8 green before this file was parametrised.
 """
 
 from __future__ import annotations
@@ -265,27 +278,39 @@ class TestRoutingUsesTheRequestedName:
     """D-A3: `get_backend_for_model` keeps receiving the unresolved name.
 
     Green at `develop` as well -- this is a fence on behaviour the fix must not
-    lose, not a detector for the leak. It reds only against an implementation
-    that resolves first, because `SHARED` is refused as ambiguous.
+    lose, not a detector for the leak. It reds against an implementation that
+    resolves first, because `SHARED` is refused as ambiguous, and against one
+    that reaches the wrong backend with the name still correct on the wire.
+    Only the second of those isolates it; see the module docstring. Both routes
+    are driven, because the requirement holds at both and a mutation at one is
+    invisible to the other.
     """
 
+    @pytest.mark.parametrize(
+        ("endpoint", "build_body", "method"), ROUTES, ids=["generate", "chat"]
+    )
     @pytest.mark.parametrize(("tier", "expected"), TIER_TO_BACKEND)
-    def test_generate_reaches_the_tier_s_own_backend(
-        self, tier: str, expected: str
+    def test_the_tier_s_own_backend_is_reached(
+        self, endpoint: str, build_body: Any, method: str, tier: str, expected: str
     ) -> None:
         backend_router = _router()
-        response = _client(backend_router).post("/generate", json=_generate_body(tier))
+        response = _client(backend_router).post(endpoint, json=build_body(tier))
 
         assert response.status_code == 200
         awaited = [
             name
             for name, backend in backend_router.backends.items()
-            if backend.completions.await_count
+            if getattr(backend, method).await_count
         ]
         assert awaited == [expected]
 
 
-def test_non_tier_name_is_passed_through_unchanged() -> None:
+@pytest.mark.parametrize(
+    ("endpoint", "build_body", "method"), ROUTES, ids=["generate", "chat"]
+)
+def test_non_tier_name_is_passed_through_unchanged(
+    endpoint: str, build_body: Any, method: str
+) -> None:
     """F: resolution is the identity for a name no tier fronts.
 
     The control for the four detectors above. It is why they had to be driven
@@ -295,7 +320,7 @@ def test_non_tier_name_is_passed_through_unchanged() -> None:
     four times without ever measuring whether resolution happened.
     """
     backend_router = _router()
-    response = _client(backend_router).post("/generate", json=_generate_body(SOLO))
+    response = _client(backend_router).post(endpoint, json=build_body(SOLO))
 
     assert response.status_code == 200
-    assert _sent_payload(backend_router, "completions")["model"] == SOLO
+    assert _sent_payload(backend_router, method)["model"] == SOLO

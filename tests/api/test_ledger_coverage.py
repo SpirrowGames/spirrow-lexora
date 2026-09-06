@@ -71,6 +71,19 @@ alone, 16 cases:
   wrong in, not merely if it is negative.
 - `user_id` replaced by a constant at `/generate` alone: 1 red / 15 green, and
   the red is `[generate]`. Per-site, not one assertion counted four times.
+
+The `duration` half of that shipped first as `SLOW <= duration <= wall` with
+`wall` read off `time.monotonic()`, and that version was flaky-red on its own
+unmodified tree. It was reported green on three consecutive local runs, a
+green CI gate and a 590-passed suite; re-measured on the same commit with
+nothing changed, the four detectors red 10 runs in 15, on a different route id
+each time. All of those greens were luck. The mechanism and the tolerance that
+removes it are recorded at `DURATION_SLACK` below. What the episode is worth
+keeping for is the general shape: repeating a run is not evidence about an
+assertion that reads a clock, and neither the gate nor CI can supply that
+evidence, because each runs the suite exactly once. This is the timing form of
+R-11's lesson -- there, a fence existed without working; here, a fence worked
+without staying working.
 """
 
 import asyncio
@@ -119,6 +132,44 @@ USER_ID = "user-42"
 # "duration > 0" would be asserting the clock rather than the column. With
 # the delay the recorded value was 0.0528..0.0597 across the four routes.
 SLOW = 0.05
+
+# The tolerance the bracket on `duration` needs, and why it is this.
+#
+# `routes.py` measures `duration` with `time.time()` (`:1523`/`:1547` and the
+# other record sites). A difference of two readings off a clock quantised to
+# `tick` differs from the true interval by strictly less than `tick` in either
+# direction, so a recorded value can overshoot the interval it measures. On
+# this runner `time.time()` and `time.monotonic()` BOTH report a resolution of
+# 15.625 ms, which is why bracketing a `time.time()` delta between
+# `time.monotonic()` deltas did not hold: measured bare, 300 samples over a
+# 50 ms sleep put the inner value above the outer one 234 times (78%), median
+# +3.3 ms, max +4.9 ms. That bracket survived only on the few ms of slack the
+# TestClient round trip adds outside the handler's own window, and lost the
+# toss often -- the four detectors below red 10 runs in 15 on an unmodified
+# tree.
+#
+# `wall` is therefore read off `time.perf_counter()` (resolution 1e-07 here),
+# which makes it the true elapsed of an interval that strictly contains the
+# handler's, leaving the inner clock's own quantum as the only error term.
+# Hence one tick of the handler's clock at each end, with a floor (below):
+# since the backend is held open for `SLOW` inside a window the outer reading
+# strictly contains,
+#
+#     SLOW - slack  <  duration  <  wall + slack
+#
+# holds by construction rather than by luck. Moving only the outer clock would
+# not have been enough: the coarse clock is the inner one, and the test cannot
+# reach it.
+#
+# The floor exists so this does not merely relocate the same mistake. Where
+# `time.time()` is fine-grained the resolution term is ~0 (1e-09 on Linux CI),
+# which would put the bound back to exactly tight -- and that clock is
+# `adjustable` (measured: `get_clock_info("time").adjustable` is True), so NTP
+# may slew it while the window is open while `asyncio.sleep` is timing `SLOW`
+# off the monotonic clock instead. 1 ms covers that by a wide margin (500 ppm
+# over 50 ms is 25 us) and costs no detection power: every constant this
+# bracket has to reject misses it by three orders of magnitude.
+DURATION_SLACK = max(time.get_clock_info("time").resolution, 0.001)
 
 USAGE = {"prompt_tokens": 11, "completion_tokens": 5}
 
@@ -256,9 +307,9 @@ class TestLedgerCoversEveryNonStreamingRoute:
         self, endpoint: str, body: dict, tokens_input: int, tokens_output: int
     ) -> None:
         tracker = MagicMock()
-        started = time.monotonic()
+        started = time.perf_counter()
         response = _client(_backend(delay=SLOW), tracker).post(endpoint, json=body)
-        wall = time.monotonic() - started
+        wall = time.perf_counter() - started
 
         assert response.status_code == 200
         assert tracker.record.call_count == 1
@@ -277,11 +328,14 @@ class TestLedgerCoversEveryNonStreamingRoute:
         # sites left 582 tests passing.
         assert kwargs["user_id"] == USER_ID
         # `duration` cannot be pinned to a number, so it is bracketed instead:
-        # at least the delay the backend was held open for, and no more than
-        # the wall time of the whole call measured from out here. A constant
-        # fails one end or the other whatever value it takes.
+        # at least the delay the backend was held open for, at most the wall
+        # time of the whole call measured from out here -- each end widened by
+        # the slack the handler's clock needs, which is the entire reason
+        # this is not `SLOW <= duration <= wall`. See `DURATION_SLACK`. A
+        # constant still fails one end or the other whatever value it takes:
+        # 0.0 and -999.0 undershoot, 999.0 overshoots.
         assert isinstance(kwargs["duration"], float)
-        assert SLOW <= kwargs["duration"] <= wall
+        assert SLOW - DURATION_SLACK <= kwargs["duration"] <= wall + DURATION_SLACK
 
 
 class TestExistingRoutesAreUnchanged:
