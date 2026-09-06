@@ -51,9 +51,44 @@ file alone, 16 cases:
   only: 4 red / 12 green. All four detectors stay green and only `TestGuard`'s
   four new-route cases red; its two existing-route cases stay green, which is
   what shows the mutation reached only the new sites.
+
+R-13 (2026-09-06) extended the four detectors from four columns to six. As
+shipped, `user_id` and `duration` were written by the four new call sites and
+asserted nowhere: replacing both with constants at all four sites left the
+whole suite at 582 passed, exit 0 -- not one test noticed. `user_id` is the
+column that says whose bill a row lands on. The added mutations, this file
+alone, 16 cases:
+
+- `user_id` replaced by a constant at all four new sites, `duration`
+  untouched: 4 red / 12 green -- all four detectors, so the column is read on
+  every route and not just one.
+- `duration` replaced by `-999.0` at all four new sites, `user_id` untouched:
+  4 red / 12 green. Disjoint from nothing, but applied separately from the
+  above, so each of the two assertions reds on its own rather than the pair
+  being carried by one of them.
+- `duration` replaced by `999.0` instead: also 4 red / 12 green. The bracket
+  is closed at both ends, so a placeholder fails whichever direction it is
+  wrong in, not merely if it is negative.
+- `user_id` replaced by a constant at `/generate` alone: 1 red / 15 green, and
+  the red is `[generate]`. Per-site, not one assertion counted four times.
+
+The `duration` half of that shipped first as `SLOW <= duration <= wall` with
+`wall` read off `time.monotonic()`, and that version was flaky-red on its own
+unmodified tree. It was reported green on three consecutive local runs, a
+green CI gate and a 590-passed suite; re-measured on the same commit with
+nothing changed, the four detectors red 10 runs in 15, on a different route id
+each time. All of those greens were luck. The mechanism and the tolerance that
+removes it are recorded at `DURATION_SLACK` below. What the episode is worth
+keeping for is the general shape: repeating a run is not evidence about an
+assertion that reads a clock, and neither the gate nor CI can supply that
+evidence, because each runs the suite exactly once. This is the timing form of
+R-11's lesson -- there, a fence existed without working; here, a fence worked
+without staying working.
 """
 
+import asyncio
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -85,6 +120,57 @@ REQUESTED = "heavy"
 RESOLVED = "claude-fable-5"
 BACKEND_NAME = "frontier"
 
+# Sent in the body of every new-route request below, so `user_id` is measured
+# as "the caller's value arrived" rather than "None stayed None" -- the latter
+# is what a hard-coded column would also produce.
+USER_ID = "user-42"
+
+# Real seconds each backend call is made to take, so `duration` has something
+# to measure. Without it every one of the four routes records exactly 0.0
+# (measured on this runner: `time.get_clock_info("time").resolution` is
+# 15.625 ms and the handler finishes inside one tick), and asserting
+# "duration > 0" would be asserting the clock rather than the column. With
+# the delay the recorded value was 0.0528..0.0597 across the four routes.
+SLOW = 0.05
+
+# The tolerance the bracket on `duration` needs, and why it is this.
+#
+# `routes.py` measures `duration` with `time.time()` (`:1523`/`:1547` and the
+# other record sites). A difference of two readings off a clock quantised to
+# `tick` differs from the true interval by strictly less than `tick` in either
+# direction, so a recorded value can overshoot the interval it measures. On
+# this runner `time.time()` and `time.monotonic()` BOTH report a resolution of
+# 15.625 ms, which is why bracketing a `time.time()` delta between
+# `time.monotonic()` deltas did not hold: measured bare, 300 samples over a
+# 50 ms sleep put the inner value above the outer one 234 times (78%), median
+# +3.3 ms, max +4.9 ms. That bracket survived only on the few ms of slack the
+# TestClient round trip adds outside the handler's own window, and lost the
+# toss often -- the four detectors below red 10 runs in 15 on an unmodified
+# tree.
+#
+# `wall` is therefore read off `time.perf_counter()` (resolution 1e-07 here),
+# which makes it the true elapsed of an interval that strictly contains the
+# handler's, leaving the inner clock's own quantum as the only error term.
+# Hence one tick of the handler's clock at each end, with a floor (below):
+# since the backend is held open for `SLOW` inside a window the outer reading
+# strictly contains,
+#
+#     SLOW - slack  <  duration  <  wall + slack
+#
+# holds by construction rather than by luck. Moving only the outer clock would
+# not have been enough: the coarse clock is the inner one, and the test cannot
+# reach it.
+#
+# The floor exists so this does not merely relocate the same mistake. Where
+# `time.time()` is fine-grained the resolution term is ~0 (1e-09 on Linux CI),
+# which would put the bound back to exactly tight -- and that clock is
+# `adjustable` (measured: `get_clock_info("time").adjustable` is True), so NTP
+# may slew it while the window is open while `asyncio.sleep` is timing `SLOW`
+# off the monotonic clock instead. 1 ms covers that by a wide margin (500 ppm
+# over 50 ms is 25 us) and costs no detection power: every constant this
+# bracket has to reject misses it by three orders of magnitude.
+DURATION_SLACK = max(time.get_clock_info("time").resolution, 0.001)
+
 USAGE = {"prompt_tokens": 11, "completion_tokens": 5}
 
 COMPLETION_RESPONSE: dict[str, Any] = {
@@ -112,10 +198,14 @@ EMBEDDINGS_RESPONSE: dict[str, Any] = {
     "usage": {"prompt_tokens": 11, "total_tokens": 11},
 }
 
-COMPLETIONS_BODY = {"model": REQUESTED, "prompt": "Hi"}
-EMBEDDINGS_BODY = {"model": REQUESTED, "input": "Hi"}
-GENERATE_BODY = {"model": REQUESTED, "prompt": "Hi"}
-CHAT_BODY = {"model": REQUESTED, "messages": [{"role": "user", "content": "Hi"}]}
+COMPLETIONS_BODY = {"model": REQUESTED, "prompt": "Hi", "user": USER_ID}
+EMBEDDINGS_BODY = {"model": REQUESTED, "input": "Hi", "user": USER_ID}
+GENERATE_BODY = {"model": REQUESTED, "prompt": "Hi", "user": USER_ID}
+CHAT_BODY = {
+    "model": REQUESTED,
+    "messages": [{"role": "user", "content": "Hi"}],
+    "user": USER_ID,
+}
 CHAT_COMPLETIONS_BODY = {
     "model": REQUESTED,
     "messages": [{"role": "user", "content": "Hi"}],
@@ -142,12 +232,15 @@ EXISTING_ROUTES = [
 ]
 
 
-def _backend(usage: dict[str, int] | None = USAGE) -> MagicMock:
+def _backend(usage: dict[str, int] | None = USAGE, delay: float = 0.0) -> MagicMock:
     """A backend whose three non-streaming methods return `usage`.
 
     `usage=None` strips the block entirely, which is what the guard fence
     drives; the response stays otherwise well-formed so the handlers still
     reach their recording site rather than erroring out earlier.
+
+    `delay` holds each call open for that many real seconds. See `SLOW`: it is
+    what gives the `duration` column a value distinguishable from a constant.
     """
 
     def _with(payload: dict[str, Any]) -> dict[str, Any]:
@@ -158,10 +251,20 @@ def _backend(usage: dict[str, int] | None = USAGE) -> MagicMock:
             body["usage"] = usage
         return body
 
+    def _responder(payload: dict[str, Any]) -> Any:
+        body = _with(payload)
+
+        async def _respond(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            if delay:
+                await asyncio.sleep(delay)
+            return body
+
+        return _respond
+
     backend = MagicMock()
-    backend.completions = AsyncMock(return_value=_with(COMPLETION_RESPONSE))
-    backend.chat_completions = AsyncMock(return_value=_with(CHAT_RESPONSE))
-    backend.embeddings = AsyncMock(return_value=_with(EMBEDDINGS_RESPONSE))
+    backend.completions = AsyncMock(side_effect=_responder(COMPLETION_RESPONSE))
+    backend.chat_completions = AsyncMock(side_effect=_responder(CHAT_RESPONSE))
+    backend.embeddings = AsyncMock(side_effect=_responder(EMBEDDINGS_RESPONSE))
     backend.error_passthrough = False
     return backend
 
@@ -204,7 +307,9 @@ class TestLedgerCoversEveryNonStreamingRoute:
         self, endpoint: str, body: dict, tokens_input: int, tokens_output: int
     ) -> None:
         tracker = MagicMock()
-        response = _client(_backend(), tracker).post(endpoint, json=body)
+        started = time.perf_counter()
+        response = _client(_backend(delay=SLOW), tracker).post(endpoint, json=body)
+        wall = time.perf_counter() - started
 
         assert response.status_code == 200
         assert tracker.record.call_count == 1
@@ -217,6 +322,20 @@ class TestLedgerCoversEveryNonStreamingRoute:
         # The alias goes to its own column, never into `model` -- the contract
         # `CostTracker.record` states in its docstring.
         assert kwargs["tier"] == REQUESTED
+        # `user_id` is the column that says who to bill, so it is measured
+        # against a value the request actually carried. Until R-13 nothing in
+        # the suite asserted it: replacing it with a constant at all four call
+        # sites left 582 tests passing.
+        assert kwargs["user_id"] == USER_ID
+        # `duration` cannot be pinned to a number, so it is bracketed instead:
+        # at least the delay the backend was held open for, at most the wall
+        # time of the whole call measured from out here -- each end widened by
+        # the slack the handler's clock needs, which is the entire reason
+        # this is not `SLOW <= duration <= wall`. See `DURATION_SLACK`. A
+        # constant still fails one end or the other whatever value it takes:
+        # 0.0 and -999.0 undershoot, 999.0 overshoots.
+        assert isinstance(kwargs["duration"], float)
+        assert SLOW - DURATION_SLACK <= kwargs["duration"] <= wall + DURATION_SLACK
 
 
 class TestExistingRoutesAreUnchanged:
