@@ -82,10 +82,14 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
     #   - On the host measured, the CLI authenticates as a subscription seat
     #     (`~/.claude.json` `oauthAccount.billingType = "stripe_subscription"`,
     #     `organizationType = "claude_max"`, no `ANTHROPIC_API_KEY` and no
-    #     `ANTHROPIC_AUTH_TOKEN` in the environment), which is not billed per
-    #     token at all. Auth mode is per-host state and a deployment could
-    #     hold an API key instead; that is why it is listed third rather than
-    #     first — the two points above hold either way.
+    #     `ANTHROPIC_AUTH_TOKEN` in the environment). A seat is not a
+    #     per-request meter. That same record carries
+    #     `hasExtraUsageEnabled = true`, so usage past the plan allowance can
+    #     still be charged — but that is a plan-level overage, not a per-MTok
+    #     rate attributable to one request, so it is not what this table
+    #     computes either. Auth mode is per-host state and a deployment could
+    #     hold an API key instead; that is why this point is listed third
+    #     rather than first — the two above hold either way.
     # Absent from the table these two land at cost 0.0 with `pricing_known=0`,
     # i.e. "we cannot say what this was billed", which is what the ledger can
     # defend. Filling them in needs all three to change: metered billing, a
