@@ -106,7 +106,12 @@ def _hanging_stream(started: asyncio.Event):
     into `stream_generator()` at its `yield`.
     """
 
-    def factory(_request: dict) -> AsyncIterator[bytes]:
+    # `usage_sink` is accepted and ignored: the handlers now hand every
+    # streaming call a per-request `UsageSink` (T-streaming-ledger-row
+    # PR-A), and a double that refused it would fail on `TypeError`
+    # before reaching the behaviour under test here. Ignored, not
+    # filled, because nothing in this file is about the ledger.
+    def factory(_request: dict, usage_sink: Any = None) -> AsyncIterator[bytes]:
         async def gen() -> AsyncIterator[bytes]:
             yield FIRST_CHUNK
             started.set()

@@ -16,6 +16,7 @@ from lexora.backends.base import (
     BackendTimeoutError,
     BackendUnavailableError,
     BackendUpstreamError,
+    UsageSink,
 )
 from lexora.utils.logging import get_logger
 
@@ -394,7 +395,7 @@ class AnthropicBackend(Backend):
             raise BackendError(f"Anthropic API request failed: {e}") from e
 
     async def chat_completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send streaming chat completion request via Anthropic Messages API.
 
@@ -402,6 +403,11 @@ class AnthropicBackend(Backend):
 
         Args:
             request: OpenAI-compatible chat completion request.
+            usage_sink: Filled, when supplied, from the two upstream events
+                that carry the counts. Nothing this method yields changes --
+                the sink is written beside the existing translation, never
+                into it -- so a caller that passes None gets byte-for-byte the
+                stream it got before.
 
         Yields:
             SSE data chunks in OpenAI format.
@@ -500,6 +506,29 @@ class AnthropicBackend(Backend):
                     event_type = event_data.get("type", "")
 
                     if event_type == "message_start":
+                        # The input side of the bill, read beside the
+                        # translation rather than out of it: the OpenAI chunk
+                        # built below has no usage field, and re-parsing bytes
+                        # this method serialised itself would put a parser
+                        # where the number is already a live object.
+                        #
+                        # The nesting is the vendor's and is asymmetric --
+                        # `message_start` carries usage under `message`,
+                        # `message_delta` at the top level. Cross-checked
+                        # against `anthropic_compat.py`'s `message_start`, the
+                        # only other place in this tree that builds these
+                        # events. Still upstream wire shape and not something
+                        # this repo can measure, so it is fenced by fixture in
+                        # `tests/backends/test_anthropic_stream_usage.py`
+                        # rather than asserted as known -- the same footing as
+                        # the cache-field premise at `:235`.
+                        if usage_sink is not None:
+                            start_usage = event_data.get("message", {}).get("usage", {})
+                            if isinstance(start_usage, dict):
+                                usage_sink.prompt_tokens = int(
+                                    start_usage.get("input_tokens", 0) or 0
+                                )
+
                         # Initial chunk with role
                         openai_chunk = {
                             "id": chunk_id,
@@ -536,6 +565,17 @@ class AnthropicBackend(Backend):
                             yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
 
                     elif event_type == "message_delta":
+                        # The output side. Assigned, not accumulated: the
+                        # upstream sends a running total here, so summing the
+                        # events would multiply the bill on any stream that
+                        # emits more than one.
+                        if usage_sink is not None:
+                            delta_usage = event_data.get("usage", {})
+                            if isinstance(delta_usage, dict):
+                                usage_sink.completion_tokens = int(
+                                    delta_usage.get("output_tokens", 0) or 0
+                                )
+
                         delta = event_data.get("delta", {})
                         stop_reason = delta.get("stop_reason", "end_turn")
                         if stop_reason not in _STOP_REASON_MAP:
@@ -593,7 +633,7 @@ class AnthropicBackend(Backend):
         raise BackendError("Text completions are not supported by Anthropic API")
 
     async def completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Not supported by Anthropic API."""
         raise BackendError("Text completions are not supported by Anthropic API")

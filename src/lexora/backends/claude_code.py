@@ -16,6 +16,7 @@ from lexora.backends.base import (
     Backend,
     BackendError,
     BackendTimeoutError,
+    UsageSink,
 )
 from lexora.utils.logging import get_logger
 
@@ -336,7 +337,7 @@ class ClaudeCodeBackend(Backend):
             raise BackendError(f"Claude Code request failed: {e}") from e
 
     async def chat_completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send streaming chat completion request via Claude Code CLI.
 
@@ -345,6 +346,11 @@ class ClaudeCodeBackend(Backend):
 
         Args:
             request: OpenAI-compatible chat completion request.
+            usage_sink: Accepted, not filled here. The ``result`` event below
+                is the same object ``_tokens_from_result`` reads on the
+                non-streaming path, so the count is present; wiring it is
+                PR-B. Until then the sink stays at zero and the handler's
+                guard turns that into "no row" rather than a guess.
 
         Yields:
             SSE data chunks in OpenAI format.
@@ -486,7 +492,7 @@ class ClaudeCodeBackend(Backend):
         raise BackendError("Text completions are not supported by Claude Code backend")
 
     async def completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Not supported — use chat_completions_stream instead."""
         raise BackendError("Text completions are not supported by Claude Code backend")

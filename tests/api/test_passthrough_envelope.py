@@ -24,6 +24,7 @@ object would itself be the data loss.
 """
 
 from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -61,7 +62,12 @@ def _upstream_error(body: object) -> BackendUpstreamError:
 def _raising_stream(exc: BaseException):
     """A backend stream whose first `__anext__` raises."""
 
-    def factory(_request: dict) -> AsyncIterator[bytes]:
+    # `usage_sink` is accepted and ignored: the handlers now hand every
+    # streaming call a per-request `UsageSink` (T-streaming-ledger-row
+    # PR-A), and a double that refused it would fail on `TypeError`
+    # before reaching the behaviour under test here. Ignored, not
+    # filled, because nothing in this file is about the ledger.
+    def factory(_request: dict, usage_sink: Any = None) -> AsyncIterator[bytes]:
         async def gen() -> AsyncIterator[bytes]:
             raise exc
             yield b""  # pragma: no cover - unreachable, makes this a generator
