@@ -23,7 +23,7 @@ class TestRequestStats:
 
     def test_duration_without_end_time(self) -> None:
         """Test duration calculation without end_time (ongoing request)."""
-        start = time.time()
+        start = time.monotonic()
         stats = RequestStats(
             endpoint="/v1/chat/completions",
             model="test-model",
@@ -44,16 +44,27 @@ class TestStatsCollector:
 
     def test_start_request(self, collector: StatsCollector) -> None:
         """Test starting a request creates proper stats."""
+        before = time.monotonic()
         stats = collector.start_request(
             endpoint="/v1/chat/completions",
             model="gpt-4",
             user_id="user-123",
         )
+        after = time.monotonic()
 
         assert stats.endpoint == "/v1/chat/completions"
         assert stats.model == "gpt-4"
         assert stats.user_id == "user-123"
-        assert stats.start_time > 0
+        # Was `start_time > 0`. That assertion did not fail when the clock
+        # moved -- it went hollow. Against `time.time()` it said "a real
+        # timestamp was taken"; against `time.monotonic()`, whose reference
+        # point the language leaves *undefined*, it asserts only that this
+        # platform happens to count from boot. Bracketing between two readings
+        # the test takes itself is derivation-local (the standard msg-153 §7
+        # sets), strictly stronger, and unlike `> 0` it is a live epoch
+        # detector: were `start_request` still on the wall clock, `before <=
+        # start_time` would miss by ~1.76e9.
+        assert before <= stats.start_time <= after
         assert stats.end_time is None
         assert stats.success is False
 
