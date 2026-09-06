@@ -154,7 +154,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _model_not_found_handler(
         request: Request, exc: ModelNotFoundError
     ) -> JSONResponse:
-        if request.url.path == "/v1/messages":
+        # Which endpoint the request landed on is answered by the route
+        # that matched, not by the request URL.
+        #
+        # ``request.url.path`` is ``scope["path"]`` verbatim (Starlette
+        # 0.50.0, ``URL.__init__``), and ``scope["path"]`` is whatever the
+        # ASGI server was handed. A server run with a ``root_path`` behind
+        # a proxy that forwards the prefix rather than stripping it hands
+        # over ``path="/api/v1/messages"`` with ``root_path="/api"``.
+        # Starlette strips the prefix for routing only
+        # (``starlette.routing.get_route_path``), so the request matches
+        # this endpoint while the URL string does not equal its path — and
+        # an Anthropic client would get the OpenAI envelope, the one
+        # response shape its SDK cannot typecheck.
+        #
+        # ``scope["route"]`` is the route the router matched, set by
+        # FastAPI's ``APIRoute.matches``. Reading it answers the question
+        # instead of re-deriving it from a string the deployment is
+        # allowed to rewrite. It is absent only when no route matched, and
+        # for those the OpenAI envelope below is the right default.
+        matched_route = request.scope.get("route")
+        if getattr(matched_route, "path", None) == "/v1/messages":
             return JSONResponse(
                 status_code=404,
                 content=anthropic_error_body("not_found_error", str(exc)),

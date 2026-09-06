@@ -48,14 +48,25 @@ introduces (msg-078 through msg-083):
   Anthropic ``{"type": "error", ...}`` envelope. The distinction between
   "unknown" and "ambiguous" is a server-side concern (log event names)
   and does not appear in the API code.
+* R-8 — the duplicate-key check reads the keys the file writes, before a
+  merge key is resolved. Inheriting a block with ``<<: *anchor`` and then
+  overriding one field is a legal file whose text and loaded value agree,
+  so it must load; only a mapping that writes a key twice is the R-5
+  failure.
+* R-9 — which dialect a 404 body is written in follows the route that
+  matched, not the request URL string. An ASGI ``root_path`` deployment
+  whose proxy forwards the prefix leaves the prefix in ``scope["path"]``
+  while the router still matches ``/v1/messages``.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock
 
@@ -133,6 +144,146 @@ class TestStrictYamlLoader:
         path.write_text("a: 1\nb: 2\nc:\n  d: 3\n  e: 4\n")
         result = load_yaml_config(path)
         assert result == {"a": 1, "b": 2, "c": {"d": 3, "e": 4}}
+
+
+# --------------------------------------------------------------------------
+# R-8 — the duplicate check reads what the file writes, not what a merge
+#       key resolved to
+# --------------------------------------------------------------------------
+
+
+def _duplicate_lines(message: str) -> tuple[int, int]:
+    """Pull ``(first_seen_line, repeated_line)`` out of the error message.
+
+    The message is the operator-facing artefact, so the test reads it the
+    way an operator would rather than reaching into the exception.
+    """
+    match = re.search(
+        r"first seen at line (\d+), column \d+; repeated at line (\d+)", message
+    )
+    assert match is not None, message
+    return int(match.group(1)), int(match.group(2))
+
+
+class TestStrictLoaderAcceptsMergeKeys:
+    """R-8: a merge key that is then overridden is not a duplicate.
+
+    ``<<: *anchor`` is how YAML expresses "inherit this block, then say
+    what is different about mine". PyYAML resolves it by prepending the
+    inherited pairs into the same mapping node, so after resolution the
+    overridden key genuinely appears twice at that level — but the file
+    does not write it twice, YAML defines which one wins, and the loaded
+    config is what the file says. R-5 is about the file and the loaded
+    config disagreeing; this is the case where they agree.
+
+    Refusing these files is a regression against ``origin/develop``,
+    which used the stock ``yaml.safe_load``. It is also the failure mode
+    this whole branch is against, pointed the other way: the loader
+    refuses to boot while naming a line that has nothing wrong with it
+    and instructing the operator to "fix the source file".
+    """
+
+    def test_merge_key_with_override_loads_and_matches_stock_loader(
+        self, tmp_path: Path
+    ) -> None:
+        """The ordinary anchor-and-override shape.
+
+        Asserting equality with ``yaml.safe_load`` rather than merely
+        "no exception": an implementation that dropped ``<<`` handling
+        would also not raise, and would silently lose the inherited
+        keys — which is the same class of bug R-5 exists to stop.
+        """
+        text = (
+            "defaults: &defaults\n"
+            "  type: vllm\n"
+            "  timeout: 60\n"
+            "backends:\n"
+            "  a:\n"
+            "    <<: *defaults\n"
+            "    timeout: 300\n"
+        )
+        path = tmp_path / "cfg.yaml"
+        path.write_text(text)
+        assert load_yaml_config(path) == yaml.safe_load(text)
+        assert load_yaml_config(path)["backends"]["a"] == {
+            "type": "vllm",
+            "timeout": 300,
+        }
+
+    def test_two_merged_anchors_overlapping_keys_load_with_the_first_winning(
+        self, tmp_path: Path
+    ) -> None:
+        """``<<: [*a, *b]`` — YAML defines the precedence, the loader keeps it.
+
+        This is the case where checking after the flatten reported the
+        "repeated" line *above* the "first seen" line, because PyYAML
+        prepends the merged pairs in reverse. The file is legal and the
+        earlier anchor wins.
+        """
+        text = (
+            "fast: &fast\n"
+            "  timeout: 60\n"
+            "slow: &slow\n"
+            "  timeout: 900\n"
+            "chosen:\n"
+            "  <<: [*fast, *slow]\n"
+        )
+        path = tmp_path / "cfg.yaml"
+        path.write_text(text)
+        loaded = load_yaml_config(path)
+        assert loaded == yaml.safe_load(text)
+        assert loaded["chosen"] == {"timeout": 60}
+
+    def test_explicit_duplicate_beside_a_merge_key_still_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """Narrowing the predicate must not narrow it past the real case.
+
+        The two lines the message names must be the two lines the
+        operator actually wrote the key on — both inside the same
+        mapping. Checking after the flatten names the anchor's line as
+        "first seen", which sends the operator to a mapping they did not
+        write a duplicate in.
+        """
+        text = (
+            "defaults: &defaults\n"  # line 1
+            "  timeout: 60\n"  # line 2
+            "backends:\n"  # line 3
+            "  a:\n"  # line 4
+            "    <<: *defaults\n"  # line 5
+            "    timeout: 300\n"  # line 6
+            "    timeout: 400\n"  # line 7
+        )
+        path = tmp_path / "cfg.yaml"
+        path.write_text(text)
+        with pytest.raises(DuplicateYamlKeyError) as exc_info:
+            load_yaml_config(path)
+        first, repeated = _duplicate_lines(str(exc_info.value))
+        assert (first, repeated) == (6, 7)
+        assert first < repeated
+
+    def test_duplicate_inside_an_anchor_block_still_raises(
+        self, tmp_path: Path
+    ) -> None:
+        """An anchor is not a hiding place.
+
+        The anchored mapping is built as part of the document tree, so
+        it is checked on its own terms even though the only place it is
+        read from is a merge key.
+        """
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            "defaults: &defaults\n"
+            "  timeout: 60\n"
+            "  timeout: 90\n"
+            "backends:\n"
+            "  a:\n"
+            "    <<: *defaults\n"
+        )
+        with pytest.raises(DuplicateYamlKeyError) as exc_info:
+            load_yaml_config(path)
+        first, repeated = _duplicate_lines(str(exc_info.value))
+        assert (first, repeated) == (2, 3)
 
 
 # --------------------------------------------------------------------------
@@ -1104,3 +1255,135 @@ class TestNotFoundResponseShape:
         assert body["type"] == "error"
         assert body["error"]["type"] == "not_found_error"
         assert "no-such-model" in body["error"]["message"]
+
+
+# --------------------------------------------------------------------------
+# R-9 — the 404 dialect is decided by the matched route, not the URL string
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def app_with_shared_model_router_app(monkeypatch: pytest.MonkeyPatch):
+    """The same app as ``app_with_shared_model_router``, un-wrapped.
+
+    The tests below need to build several clients with different ASGI
+    ``root_path`` / ``path`` combinations against one app, so the fixture
+    hands back the app rather than a single client.
+    """
+    from lexora import config as config_module
+
+    def _fake_settings() -> "config_module.Settings":  # type: ignore[name-defined]
+        return config_module.Settings(
+            routing=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(
+                        url="http://localhost:1", models=[{"name": "dup-model"}]
+                    ),
+                    "b2": BackendSettings(
+                        url="http://localhost:2", models=[{"name": "dup-model"}]
+                    ),
+                },
+                tiers={"light": TierSettings(backend="b1", model="dup-model")},
+            )
+        )
+
+    monkeypatch.setattr(config_module, "create_settings", _fake_settings)
+    return create_app(_fake_settings())
+
+
+def _anthropic_404(client: TestClient, path: str) -> dict:
+    response = client.post(
+        path,
+        json={
+            "model": "no-such-model",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 404, response.text
+    return response.json()
+
+
+def _openai_404(client: TestClient, path: str) -> dict:
+    response = client.post(
+        path,
+        json={
+            "model": "no-such-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 404, response.text
+    return response.json()
+
+
+class TestNotFoundShapeUnderAsgiRootPath:
+    """R-9: a prefix in ``scope["path"]`` must not change the body shape.
+
+    Three deployment shapes are reachable without a proxy in the test,
+    because the only thing a proxy changes is what the ASGI server puts
+    in ``scope``:
+
+    * A — no ``root_path``. ``scope["path"] == "/v1/messages"``.
+    * B — ``root_path="/api"`` and a proxy that strips the prefix before
+      forwarding. ``scope["path"]`` is still ``"/v1/messages"``.
+    * C — ``root_path="/api"`` and a proxy that forwards the prefix.
+      ``scope["path"] == "/api/v1/messages"``.
+
+    In all three the router matches the same endpoint, because Starlette
+    strips ``root_path`` for routing (``get_route_path``). Only the URL
+    string differs, and only in C. Deciding the dialect from the URL
+    string therefore answers C wrong — with the one 404 shape the
+    ``anthropic`` SDK cannot typecheck.
+
+    ``request.url.path`` is worth naming precisely: it does not prepend
+    ``root_path``. Starlette 0.50.0 builds it from ``scope["path"]``
+    verbatim. What puts the prefix there is the server, when the proxy
+    in front of it forwards the prefix rather than stripping it.
+    """
+
+    def test_prefix_forwarding_proxy_still_gets_the_anthropic_shape(
+        self, app_with_shared_model_router_app
+    ) -> None:
+        """Shape C on /v1/messages. The detector."""
+        with TestClient(app_with_shared_model_router_app, root_path="/api") as client:
+            body = _anthropic_404(client, "/api/v1/messages")
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "not_found_error"
+        assert "no-such-model" in body["error"]["message"]
+
+    def test_prefix_forwarding_proxy_keeps_the_openai_shape_elsewhere(
+        self, app_with_shared_model_router_app
+    ) -> None:
+        """Shape C on /v1/chat/completions.
+
+        The pin against over-matching. "Answer every 404 in the Anthropic
+        envelope" satisfies the test above; it fails this one. The two
+        together say the predicate must widen to reach /v1/messages under
+        a prefix without also reaching the OpenAI endpoints.
+        """
+        with TestClient(app_with_shared_model_router_app, root_path="/api") as client:
+            body = _openai_404(client, "/api/v1/chat/completions")
+        assert "type" not in body
+        assert body["error"]["code"] == "model_not_found"
+        assert body["error"]["type"] == "invalid_request_error"
+
+    def test_prefix_stripping_proxy_is_unchanged(
+        self, app_with_shared_model_router_app
+    ) -> None:
+        """Shape B — the deployment that was already correct stays correct."""
+        with TestClient(app_with_shared_model_router_app, root_path="/api") as client:
+            assert _anthropic_404(client, "/v1/messages")["type"] == "error"
+            assert "type" not in _openai_404(client, "/v1/chat/completions")
+
+    def test_no_root_path_is_unchanged(
+        self, app_with_shared_model_router_app
+    ) -> None:
+        """Shape A — the shipped deployment. ``deploy/lexora.service`` runs
+        ``python -m lexora.main``, whose ``uvicorn.run`` takes no
+        ``root_path``, so this is the shape in production today.
+        """
+        with TestClient(app_with_shared_model_router_app) as client:
+            assert _anthropic_404(client, "/v1/messages")["type"] == "error"
+            assert "type" not in _openai_404(client, "/v1/chat/completions")

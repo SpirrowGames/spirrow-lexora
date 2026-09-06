@@ -27,11 +27,17 @@ class DuplicateYamlKeyError(ValueError):
 
     The message names the key and every line it appears on so an operator
     diffing the file can find the collision without re-parsing.
+
+    The boundary is "written twice in one mapping in the file". A key that
+    a merge key (``<<``) brings in and the mapping then states explicitly
+    is *not* this error: YAML defines which of the two wins, so the file
+    and the loaded config agree and there is nothing for the operator to
+    fix. See ``_construct_strict_mapping``.
     """
 
 
 class _StrictSafeLoader(yaml.SafeLoader):
-    """SafeLoader that raises on duplicate keys in any mapping.
+    """SafeLoader that raises when a mapping in the file writes a key twice.
 
     Applied to *every* mapping in the file, not just ones the schema knows
     about. R-5 is intentionally wider than R-1a / R-1b: this loader also
@@ -41,13 +47,46 @@ class _StrictSafeLoader(yaml.SafeLoader):
     """
 
 
+#: The two keys PyYAML treats as instructions to the loader rather than as
+#: entries of the mapping: ``<<`` (the YAML 1.1 merge key) and ``=`` (the
+#: YAML 1.1 value key). Neither is a key the operator wrote as an entry of
+#: this mapping — ``<<`` may legally appear more than once in one mapping —
+#: and neither has a constructor registered on ``SafeLoader``, so
+#: ``construct_object`` cannot build them. The duplicate check below steps
+#: over both; ``construct_mapping`` handles them afterwards.
+_YAML_LOADER_DIRECTIVE_TAGS: frozenset[str] = frozenset(
+    {"tag:yaml.org,2002:merge", "tag:yaml.org,2002:value"}
+)
+
+
 def _construct_strict_mapping(
     loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
 ) -> dict[Any, Any]:
-    """Build a mapping, but raise when the same key appears twice."""
-    loader.flatten_mapping(node)
+    """Build a mapping, but raise when the file writes the same key twice.
+
+    The check reads ``node.value`` *as parsed*, before any merge key is
+    resolved. That ordering is the predicate, not an implementation
+    detail. PyYAML's ``SafeConstructor.flatten_mapping`` resolves
+    ``<<: *anchor`` by prepending the inherited pairs into ``node.value``
+    beside the explicit ones (6.0.3, verbatim: ``node.value = merge +
+    node.value``). So a mapping that inherits a block and then states one
+    field explicitly — the ordinary way to override an anchored default —
+    carries that field twice once flattened. Checking after the flatten
+    would reject it, and would do so naming two lines that belong to two
+    different mappings; with ``<<: [*a, *b]`` it would name the "repeated"
+    line *above* the "first seen" one, because the merged pairs are
+    prepended rather than appended. Neither of those files has anything
+    wrong with it, and the message tells the operator to fix it.
+
+    Merge resolution itself is not skipped, only postponed:
+    ``construct_mapping`` below calls ``flatten_mapping`` on its way to
+    building the dict, so ``<<`` resolves exactly as the stock
+    ``SafeLoader`` resolves it.
+    """
     seen: dict[Any, tuple[int, int]] = {}
     for key_node, _ in node.value:
+        if key_node.tag in _YAML_LOADER_DIRECTIVE_TAGS:
+            continue
         # ``construct_object`` is what SafeLoader would call for each key,
         # so scalar keys become the same Python objects the default loader
         # would produce (``"heavy"`` stays ``"heavy"``, not a ScalarNode).
