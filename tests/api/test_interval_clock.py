@@ -326,35 +326,58 @@ class TestPreflightDurationSurvivesABackwardsClock:
 def test_the_outer_clock_is_finer_than_the_slack() -> None:
     """`test_ledger_coverage.py`'s bracket budgets for ONE clock's quantum.
 
-    That bracket widens each end by `DURATION_SLACK`, and its derivation says
-    the outer reading `wall` -- taken off `time.perf_counter()` -- is "the true
-    elapsed of an interval that strictly contains the handler's, leaving the
-    inner clock's own quantum as the only error term". The word doing the work
-    is *only*. It holds because `perf_counter` is far finer than the slack; on
-    a platform where it is not, the outer reading carries a quantum of its own
-    that the bracket never budgets for, and the derivation stops being true
-    while the numbers still look reasonable.
+    That bracket widens each end by `DURATION_SLACK`, and it spends that width
+    on the handler's inner clock and on nothing else. So it treats the outer
+    reading `wall` -- taken off `time.perf_counter()` -- as exact. That is
+    legitimate only while `perf_counter`'s own quantum is small next to the
+    slack; where it is not, the outer reading carries a quantum the bracket
+    never budgets for, and the derivation stops being true while the numbers
+    still look reasonable. The derivation itself is stated once, at
+    `DURATION_SLACK` in `test_ledger_coverage.py`, and is not restated here.
 
     Nothing in the repository made that so. It is a property of whichever
     platform runs the suite, and it was stated only in a comment -- "resolution
     1e-07 here" -- which is precisely the unchecked-claim shape this suite
     keeps finding. So it is measured here instead of asserted there.
 
+    The derivation is not quoted here either, and that is deliberate rather
+    than terse. A verbatim sentence of it used to sit at the top of this
+    docstring, and it went stale inside the very commit that edited the
+    original: one file went on arguing from a word the other file had already
+    dropped, and the two disagreed from the moment they were written. Name the
+    other file and the claim, and let it speak for itself. A copy of another
+    file's prose is a second thing to keep true.
+
     This is the second of the derivation's two premises. The first -- that the
     slack is not finer than the handler's tick -- is fenced separately, by
     `test_the_slack_covers_the_handlers_tick_and_the_floor` below. Neither
-    stands in for the other, and they fail in different ways: a *platform* is
-    what reddens this one, whereas no platform can redden that one and only an
-    *edit* to the derivation can. Both are kept. Why the second survives
-    despite being unreddenable by any platform is measured in its own
-    docstring, not argued here.
+    stands in for the other, and they fail in different ways: a *platform*
+    reddens this one with no edit at all, whereas no platform can redden that
+    one and only an *edit* to the derivation can. Both are kept. Why the second
+    survives despite being unreddenable by any platform is measured in its own
+    docstring, not argued here. An edit can redden this one too, but only on a
+    platform where that edit actually moves `DURATION_SLACK` -- see the last
+    paragraph, which is an observation and not a symmetry argument.
 
     Measured where this was written: `perf_counter` reports 1e-07 against a
     slack of 15.625 ms, five orders of magnitude, so unlike the check it
-    replaces this one does not hold by a whisker. The Linux CI runner was not
-    measurable from there and is not assumed: this assertion going green on it
-    is itself the measurement that `perf_counter` is finer than `DURATION_SLACK`
-    there too, and a red one would be the finding.
+    replaces this one does not hold by a whisker. The Linux runner is no longer
+    an assumption either: on `ubuntu-latest` both `perf_counter` and `monotonic`
+    report 1e-09, read off the failure text of CI run 34053301337 rather than
+    assumed. What follows from those two readings is arithmetic, and is marked
+    as such: unmutated, `max(1e-09, 0.001)` makes the slack the floor, so there
+    this holds by six orders rather than five.
+
+    That run also reddened this assertion, which nothing here predicted. It was
+    a throwaway branch, never merged, carrying one edit: the 1 ms floor dropped
+    from `DURATION_SLACK`. On Linux the floor is what the slack IS, so dropping
+    it collapses the slack onto `m` = 1e-09, which is exactly `p`, and this
+    check fails with `assert 1e-09 < 1e-09`. On Windows the floor is a no-op --
+    the slack stays 15.625 ms whether it is there or not -- so the same edit
+    leaves this green. Margin width is not what decides it; whether the edit
+    moves `DURATION_SLACK` on that platform is. The check is therefore not
+    merely a platform detector: an edit to the line it guards reddens it too,
+    on a platform in the class this ships to.
     """
     outer = time.get_clock_info("perf_counter").resolution
     assert outer < DURATION_SLACK, (
@@ -421,15 +444,27 @@ def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
     it is an independent statement of design intent, which is what lets it
     survive an edit that rewrites the derivation entirely.
 
-    So the floor half is a **prediction on this platform, not a measurement**.
-    It reddens nothing in the table above, because `m` is 15.625 ms here and
-    the floor is a no-op; and the 1e-09 column is arithmetic on these two
-    expressions, not an observation of Linux. What CI settles is the weaker
-    claim that both conjuncts *hold* on the Linux runner -- where
-    `DURATION_SLACK` is the floor, so this conjunct should bind there with
-    equality, `0.001 >= 0.001`, and a red would be the finding. CI does not
-    settle that the floor conjunct catches the floor-dropped edit on Linux:
-    that needs the mutation pushed, and it is deliberately not.
+    The floor half shipped as a **prediction, not a measurement**: it reddens
+    nothing in the table above, because `m` is 15.625 ms here and the floor is
+    a no-op, and the 1e-09 column was arithmetic on these two expressions
+    rather than an observation of Linux. The observation has since been made.
+    The floor-dropped cell was pushed on a throwaway branch that was never
+    merged and CI ran it on `ubuntu-latest`: run 34053301337, **2 failed, 615
+    passed**, this test among the two, failing on the second conjunct. Verbatim
+    from that run's log, and dated by the run id rather than kept in step with
+    the lines below --
+
+        AssertionError: DURATION_SLACK 1e-09 is below the 1 ms floor ...
+        assert 1e-09 >= 0.001
+
+    -- while the first conjunct passed in that same run. Two things follow, and
+    the second was not predicted. `monotonic` on that runner does report 1e-09:
+    the premise the whole 1e-09 column rested on is now read off a failure
+    message instead of assumed. And the floor conjunct does catch the
+    floor-dropped edit there, so the two conjuncts are complementary by
+    measurement on both platform classes rather than by arithmetic on one.
+    The unpredicted part was the other failure in that run, in
+    `test_the_outer_clock_is_finer_than_the_slack`; it is recorded there.
 
     The ceiling, so that no more is claimed for this than it gives: it guards
     the *value* of `DURATION_SLACK` and never its *provenance*. The drift this
