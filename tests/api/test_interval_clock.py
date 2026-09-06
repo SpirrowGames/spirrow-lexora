@@ -323,23 +323,43 @@ class TestPreflightDurationSurvivesABackwardsClock:
         _assert_bracketed(metrics.durations)
 
 
-def test_duration_slack_still_covers_the_handlers_clock() -> None:
-    """`DURATION_SLACK` must not be finer than the tick of the handler's clock.
+def test_the_outer_clock_is_finer_than_the_slack() -> None:
+    """`test_ledger_coverage.py`'s bracket budgets for ONE clock's quantum.
 
-    Moving the handler to `time.monotonic()` left `test_ledger_coverage.py`'s
-    `DURATION_SLACK` derived from `get_clock_info("time")` -- a clock the
-    handler no longer reads. Re-deriving it is deliberately deferred to its own
-    change, so what makes the deferral safe rather than lucky is this one
-    inequality, and it is measured on whichever platform runs the suite instead
-    of being argued from the two this was written on. Were monotonic's tick
-    ever coarser than both `time`'s tick and the 1 ms floor, that bracket would
-    be tighter than the clock feeding it and would flake on a true reading.
+    That bracket widens each end by `DURATION_SLACK`, and its derivation says
+    the outer reading `wall` -- taken off `time.perf_counter()` -- is "the true
+    elapsed of an interval that strictly contains the handler's, leaving the
+    inner clock's own quantum as the only error term". The word doing the work
+    is *only*. It holds because `perf_counter` is far finer than the slack; on
+    a platform where it is not, the outer reading carries a quantum of its own
+    that the bracket never budgets for, and the derivation stops being true
+    while the numbers still look reasonable.
 
-    Measured where this was written: both clocks report 15.625 ms, so the
-    inequality holds with equality -- which is exactly why it is worth a
-    check rather than a sentence.
+    Nothing in the repository made that so. It is a property of whichever
+    platform runs the suite, and it was stated only in a comment -- "resolution
+    1e-07 here" -- which is precisely the unchecked-claim shape this suite
+    keeps finding. So it is measured here instead of asserted there.
+
+    This replaces `test_duration_slack_still_covers_the_handlers_clock`, which
+    checked the derivation's *other* premise: that the slack is not finer than
+    the handler's tick. Now that `DURATION_SLACK` is read off the handler's own
+    clock that premise is `max(m, 0.001) >= m` -- true for every `m`, so no
+    platform can redden it. Keeping it would have been a tautology wearing a
+    fence's name, so the check moved to the premise that can still fail.
+
+    Measured where this was written: `perf_counter` reports 1e-07 against a
+    slack of 15.625 ms, five orders of magnitude, so unlike the check it
+    replaces this one does not hold by a whisker. The Linux CI runner was not
+    measurable from there and is not assumed: this assertion going green on it
+    is itself the measurement that `perf_counter` is finer than `DURATION_SLACK`
+    there too, and a red one would be the finding.
     """
-    assert DURATION_SLACK >= time.get_clock_info("monotonic").resolution
+    outer = time.get_clock_info("perf_counter").resolution
+    assert outer < DURATION_SLACK, (
+        f"perf_counter resolution {outer!r} is not finer than DURATION_SLACK "
+        f"{DURATION_SLACK!r}: `wall` in test_ledger_coverage.py carries a "
+        f"quantum of its own that the duration bracket does not budget for"
+    )
 
 
 class TestHandlerDurationSurvivesABackwardsClock:

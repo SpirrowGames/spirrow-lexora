@@ -127,7 +127,7 @@ USER_ID = "user-42"
 
 # Real seconds each backend call is made to take, so `duration` has something
 # to measure. Without it every one of the four routes records exactly 0.0
-# (measured on this runner: `time.get_clock_info("time").resolution` is
+# (measured on this runner: `time.get_clock_info("monotonic").resolution` is
 # 15.625 ms and the handler finishes inside one tick), and asserting
 # "duration > 0" would be asserting the clock rather than the column. With
 # the delay the recorded value was 0.0528..0.0597 across the four routes.
@@ -167,19 +167,32 @@ SLOW = 0.05
 # margin (500 ppm over 50 ms is 25 us) and costs no detection power: every
 # constant this bracket has to reject misses it by three orders of magnitude.
 #
-# ★ One thing below is deliberately stale, deferred rather than missed. The
-# term is still read off `get_clock_info("time")` while the handler now reads
-# `time.monotonic()`, so it is taken from a clock the handler no longer uses;
-# and the floor's original justification -- that `time` is `adjustable`
-# (measured: True) and so may be slewed mid-window -- no longer applies to the
-# handler's clock at all. What keeps that safe is a single inequality: the
-# slack must not be finer than the tick of the clock the handler actually
-# reads. That is not asserted here on faith -- it is checked at runtime, on
-# whatever platform runs the suite, by
-# `test_interval_clock.py::test_duration_slack_still_covers_the_handlers_clock`.
-# Re-deriving the term off that clock belongs to its own change, not to the
-# one that moved the clock (see msg-131 §4 / msg-146 §4).
-DURATION_SLACK = max(time.get_clock_info("time").resolution, 0.001)
+# The term is now read off the clock the handler actually reads. That closes
+# the drift, and it also spends the runtime check that used to guard it, so
+# note what happened to the guard rather than leaving it to be rediscovered.
+#
+# The derivation above leans on two things. One is that the slack is not finer
+# than the handler's tick; with the term taken off that same clock it is
+# `max(m, 0.001) >= m`, true for every `m`, and an assertion restating it
+# could not be reddened by any platform -- a tautology, not a fence. It is
+# therefore not restated. The cost is real and is recorded here rather than
+# papered over: an edit that rewrites this line to something finer than the
+# handler's tick is no longer caught by an assertion. Measured on this tree,
+# pinning this to `0.001` reds the four detectors below in 10 runs out of 10
+# -- but only 1 or 2 of the four in any one run, on a varying route id -- so
+# what remains is a flake, which is the shape this file's own docstring warns
+# is not evidence.
+#
+# The other thing it leans on is contingent, is what the runtime check has
+# moved onto, and until now was asserted nowhere: `wall` is only "the true
+# elapsed of a strictly containing interval" while the OUTER clock's quantum
+# is small next to this slack. Otherwise `perf_counter`'s own tick is a second
+# error term the bracket never budgets for, and "the inner clock's own
+# quantum as the only error term" above is false. Nothing makes that so -- it
+# is a fact about whichever platform runs the suite (here 1e-07 against
+# 15.625 ms, five orders of magnitude), so it is checked at runtime by
+# `test_interval_clock.py::test_the_outer_clock_is_finer_than_the_slack`.
+DURATION_SLACK = max(time.get_clock_info("monotonic").resolution, 0.001)
 
 USAGE = {"prompt_tokens": 11, "completion_tokens": 5}
 
