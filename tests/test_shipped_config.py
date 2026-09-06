@@ -24,10 +24,13 @@ generic config machinery.
 """
 
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
+from lexora.backends.base import ModelNotFoundError
 from lexora.config import create_settings
+from lexora.services.router import BackendRouter
 
 SHIPPED_CONFIG = (
     Path(__file__).resolve().parent.parent / "config" / "lexora_config.yaml"
@@ -108,3 +111,74 @@ def test_shipped_config_default_model_for_unknown_task_is_routable() -> None:
         f"are refused with 404 by R-1a; point this field at a tier alias "
         f"or a name only one backend declares."
     )
+
+
+def _shipped_router() -> BackendRouter:
+    """Router built from the shipped config, as production builds it."""
+    settings = create_settings(SHIPPED_CONFIG)
+    return BackendRouter(
+        routing_settings=settings.routing, vllm_settings=settings.vllm
+    )
+
+
+def test_shipped_ambiguous_refusal_still_names_the_three_qwen_tiers() -> None:
+    """R-6 regression pin: narrowing the remedy filter must not empty it here.
+
+    All three vLLM backends declare ``Qwen3.8-27B``, so the raw name is
+    refused, and the three tiers that reach them (``light`` / ``medium``
+    / ``heavy``) all resolve to that same name — every one of them is a
+    genuine remedy. Adding the "resolves to the requested model" half of
+    the R-6 predicate therefore has to leave this message unchanged. If
+    it shrinks, the predicate is stricter than R-6 asked for and the
+    shipped gateway stopped telling callers how to reach a model it
+    still serves.
+    """
+    router = _shipped_router()
+    # Measured through the request path, so what is pinned is the text a
+    # caller actually receives rather than an internal rendering of it.
+    with pytest.raises(ModelNotFoundError) as exc_info:
+        router.get_backend_for_model("Qwen3.8-27B")
+    message = str(exc_info.value)
+    assert "declared by multiple backends" in message, (
+        "Shipped config no longer collides on 'Qwen3.8-27B', so this pin "
+        f"is measuring the wrong refusal. Got: {message}"
+    )
+    for tier in ("light", "medium", "heavy"):
+        assert tier in message, (
+            f"Tier '{tier}' resolves to 'Qwen3.8-27B' and reaches a "
+            f"declaring backend, so it is a real remedy. Got: {message}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_shipped_listing_is_the_five_tier_aliases() -> None:
+    """R-7 regression pin: the advertised set of the shipped config.
+
+    Every upstream is stubbed to serve both Qwen names — the current one
+    and the pre-rename alias the vLLM servers keep — which is the widest
+    catalogue any backend here reports. ``Qwen3.8-27B`` is ambiguous and
+    ``Qwen3-32B`` is declared by nobody, so both are refused by the
+    router and neither may be advertised; what is left is the five tier
+    aliases. Tightening the listing filter to a per-backend declaration
+    check must not disturb that.
+    """
+    router = _shipped_router()
+    upstream = {
+        "object": "list",
+        "data": [
+            {"id": "Qwen3.8-27B", "object": "model", "created": 1, "owned_by": "vllm"},
+            {"id": "Qwen3-32B", "object": "model", "created": 1, "owned_by": "vllm"},
+        ],
+    }
+    for backend in router.backends.values():
+        backend.list_models = AsyncMock(return_value=upstream)
+
+    listing = await router.list_all_models()
+    ids = [m["id"] for m in listing["data"]]
+    assert ids == ["light", "medium", "heavy", "naysayer", "frontier"], (
+        f"Advertised ids changed. Got: {ids}"
+    )
+    # And the invariant the ids alone do not carry: every advertised
+    # name routes, and to the backend the row names.
+    for row in listing["data"]:
+        assert row["backend"] == router.get_backend_name_for_model(row["id"])

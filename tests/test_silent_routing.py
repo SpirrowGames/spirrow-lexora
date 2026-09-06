@@ -28,12 +28,21 @@ introduces (msg-078 through msg-083):
   ``INFO``-level log filter that runs in production.
 * W-2 — a refusal message may only offer remedies that exist in the
   config being served. "Use a tier name" is generated from the tiers
-  that actually reach the colliding backends; when no tier does, the
-  message says the name is not routable instead of inventing one.
+  the loaded config actually offers (which ones qualify is R-6); when
+  none do, the message says the name is not routable instead of
+  inventing one.
 * W-3 — ``/v1/models`` never enumerates a name the router will 404. The
   listing is narrowed to the by-name routable set, which drops both
   ambiguous names and names only the upstream knows about, so the
   advertised set is a subset of the routable set.
+* R-6 — a tier offered as the remedy for an ambiguous name must
+  resolve to the name that was asked for, not merely reach one of the
+  backends that declared it. A tier that reaches the right backend and
+  serves a different model turns the refusal into a redirect.
+* R-7 — the ``backend`` field on a concrete ``/v1/models`` row names
+  the backend that declares the model, not whichever backend's upstream
+  reported it first. Backends sharing one upstream each see the whole
+  catalogue, so "routable somewhere" cannot decide whose row it is.
 * 404 body shape — clients see the OpenAI standard ``model_not_found``
   code; the anthropic-shaped ``/v1/messages`` endpoint sees the
   Anthropic ``{"type": "error", ...}`` envelope. The distinction between
@@ -557,6 +566,111 @@ class TestRefusalMessageOffersOnlyRealRemedies:
 
 
 # --------------------------------------------------------------------------
+# R-6 — a suggested tier must resolve to the model that was requested
+# --------------------------------------------------------------------------
+
+
+class TestRemedyTiersResolveToTheRequestedModel:
+    """R-6: selecting remedy tiers on the backend alone is not enough.
+
+    A backend can declare the ambiguous name *and* a second, unambiguous
+    name that is exposed as a tier. Such a tier reaches a colliding
+    backend, so a backend-only filter offers it — but it resolves to the
+    other model. A caller who follows the advice is answered by a model
+    they did not ask for, and this time the substitution is the one the
+    gateway named. That is the same class as the fall-through this branch
+    removed, one step further along: the refusal stops being a refusal
+    and becomes a redirect.
+
+    The retained predicate is therefore twofold — the tier reaches one of
+    the declaring backends *and* resolves to the requested model. Keeping
+    the backend half matters: a tier may name the requested model
+    explicitly while pointing at a backend that never declared it, and
+    telling a caller to send the name to a backend the config does not
+    say serves it is a remedy invented rather than found.
+    """
+
+    @staticmethod
+    def _router(tiers: dict[str, TierSettings]) -> BackendRouter:
+        """Two backends collide on ``shared``; ``b1`` also serves ``other``."""
+        return BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="b1",
+                backends={
+                    "b1": BackendSettings(
+                        url="http://localhost:1",
+                        models=[{"name": "shared"}, {"name": "other"}],
+                    ),
+                    "b2": BackendSettings(
+                        url="http://localhost:2", models=[{"name": "shared"}]
+                    ),
+                },
+                tiers=tiers,
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+
+    def test_tier_resolving_to_a_different_model_is_not_offered(self) -> None:
+        router = self._router({"vision": TierSettings(backend="b1", model="other")})
+        # The tier is a live route -- to the wrong model. That is what
+        # makes offering it worse than offering nothing.
+        assert router.resolve_model("vision") == "other"
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            router.get_backend_for_model("shared")
+        message = str(exc_info.value)
+        assert "vision" not in message, (
+            "'vision' reaches a colliding backend but resolves to 'other'. "
+            "Naming it as the remedy for a 'shared' request tells the "
+            f"caller to accept a different model. Got: {message}"
+        )
+
+    def test_tier_resolving_to_the_requested_model_is_still_offered(self) -> None:
+        """The pin against over-narrowing: "offer nothing" is not the fix."""
+        router = self._router(
+            {
+                "vision": TierSettings(backend="b1", model="other"),
+                "big": TierSettings(backend="b2", model="shared"),
+            }
+        )
+        assert router.resolve_model("big") == "shared"
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            router.get_backend_for_model("shared")
+        message = str(exc_info.value)
+        assert "big" in message, (
+            "'big' reaches a declaring backend and resolves to the "
+            f"requested model, so it is a real remedy. Got: {message}"
+        )
+        assert "vision" not in message
+
+    def test_fallback_does_not_deny_a_tier_that_does_reach_the_backends(
+        self,
+    ) -> None:
+        """The sentence has to be about what the filter actually tests.
+
+        Narrowing the filter from "reaches those backends" to "resolves to
+        this model" without moving the sentence with it replaces a wrong
+        remedy with a correctly-shaped false statement: here a tier
+        *does* reach a colliding backend, so any message denying that is
+        untrue even though the remedy list is now right.
+        """
+        router = self._router({"vision": TierSettings(backend="b1", model="other")})
+        # Stated through the public lookup so the precondition is not a
+        # restatement of the implementation: 'vision' routes to 'b1',
+        # and 'b1' is one of the backends the message itself names.
+        assert router.get_backend_name_for_model("vision") == "b1"
+        with pytest.raises(ModelNotFoundError) as exc_info:
+            router.get_backend_for_model("shared")
+        message = str(exc_info.value)
+        assert "b1" in message
+        assert "No tier routes to any of those backends" not in message, (
+            "A tier does route to 'b1'. The message may say no tier "
+            f"resolves to 'shared'; it may not deny reachability. Got: {message}"
+        )
+        assert "shared" in message
+
+
+# --------------------------------------------------------------------------
 # W-3 — /v1/models never enumerates a name the router will 404
 # --------------------------------------------------------------------------
 
@@ -762,6 +876,127 @@ class TestListModelsMatchesRoutableSet:
         assert router.get_backend_for_model("whatever-upstream-serves") is (
             router.backends["default"]
         )
+
+
+# --------------------------------------------------------------------------
+# R-7 — /v1/models attributes a row to the backend that declares it
+# --------------------------------------------------------------------------
+
+
+class TestListingAttributionMatchesDeclaration:
+    """R-7: ``backend`` on a concrete row names the declaring backend.
+
+    W-3's filter asks whether a name is routable *anywhere*. That is the
+    right question for "should this row exist" and the wrong one for
+    "whose row is this". When two backends proxy one upstream, both
+    upstreams report both names, so the first backend in iteration order
+    passes the global check for a name the *second* one declares, stamps
+    its own name onto the row, and the dedupe guard then drops the
+    authoritative row as a repeat. The listing ends up asserting a
+    routing decision the router does not make.
+
+    Narrowing that check to "does this backend declare it" answers both
+    questions with one test, and makes the dedupe redundant across
+    backends rather than load-bearing.
+
+    The invariant is written as a sweep over every concrete row rather
+    than as an assertion about a chosen id: a single-row assertion goes
+    stale the moment the fixture or the iteration order is rearranged,
+    while "each row agrees with the router" keeps measuring the same
+    thing whatever the listing contains.
+    """
+
+    @staticmethod
+    def _shared_upstream_router() -> BackendRouter:
+        """Two backends at one URL, each declaring a different model.
+
+        This is the shape the shipped config already has (three vLLM
+        backends pointing at one server), minus the ambiguity that hides
+        the defect there by dropping both names before attribution runs.
+        """
+        router = BackendRouter(
+            routing_settings=RoutingSettings(
+                enabled=True,
+                default_backend="alpha",
+                backends={
+                    "alpha": BackendSettings(
+                        url="http://localhost:1", models=[{"name": "ModelA"}]
+                    ),
+                    "beta": BackendSettings(
+                        url="http://localhost:1", models=[{"name": "ModelB"}]
+                    ),
+                },
+                tiers={
+                    "fast": TierSettings(backend="alpha"),
+                    "slow": TierSettings(backend="beta"),
+                },
+            ),
+            vllm_settings=VLLMSettings(url="http://localhost:8000"),
+        )
+        # One upstream, so both backends report the whole catalogue.
+        upstream = {
+            "object": "list",
+            "data": [
+                {"id": "ModelA", "object": "model", "created": 1, "owned_by": "vllm"},
+                {"id": "ModelB", "object": "model", "created": 1, "owned_by": "vllm"},
+            ],
+        }
+        for name in ("alpha", "beta"):
+            router.backends[name].list_models = AsyncMock(return_value=upstream)
+        return router
+
+    @pytest.mark.asyncio
+    async def test_every_concrete_row_agrees_with_the_router(self) -> None:
+        router = self._shared_upstream_router()
+        listing = await router.list_all_models()
+        concrete = [m for m in listing["data"] if m.get("type") != "tier"]
+        assert concrete, "fixture produced no concrete rows to check"
+        for row in concrete:
+            assert row["backend"] == router.get_backend_name_for_model(row["id"]), (
+                f"/v1/models says '{row['id']}' is served by "
+                f"'{row['backend']}', but the router sends it to "
+                f"'{router.get_backend_name_for_model(row['id'])}'."
+            )
+
+    @pytest.mark.asyncio
+    async def test_declaring_backends_row_is_not_dropped_as_a_duplicate(self) -> None:
+        """The dedupe must not be able to keep the wrong copy.
+
+        Collapsing the four rows a shared upstream produces down to two
+        is only an improvement if the two that survive are the true ones;
+        keeping one arbitrary row per id trades an ambiguous listing for
+        a confidently wrong one.
+        """
+        router = self._shared_upstream_router()
+        listing = await router.list_all_models()
+        rows = [m for m in listing["data"] if m["id"] == "ModelB"]
+        assert len(rows) == 1, f"expected one row for ModelB, got {rows}"
+        assert rows[0]["backend"] == "beta"
+
+    @pytest.mark.asyncio
+    async def test_unroutable_log_is_not_used_for_a_name_that_is_listed(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Skipping another backend's copy is dedupe, not an unroutable filter.
+
+        ``list_models_unroutable_filtered`` means "no backend can serve
+        this name". Emitting it for a name that appears in the same
+        response would make the log state something about the gateway
+        that the response contradicts -- the defect this branch is
+        against, relocated from the API surface to the log surface.
+        """
+        router = self._shared_upstream_router()
+        with caplog.at_level(logging.DEBUG):
+            listing = await router.list_all_models()
+        listed = {m["id"] for m in listing["data"]}
+        for record in caplog.records:
+            if "list_models_unroutable_filtered" not in record.message:
+                continue
+            for model_id in listed:
+                assert model_id not in record.message, (
+                    f"'{model_id}' is in the response and also logged as "
+                    f"unroutable: {record.message}"
+                )
 
 
 # --------------------------------------------------------------------------

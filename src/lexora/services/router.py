@@ -152,8 +152,8 @@ class BackendRouter:
                 url=vllm_settings.url,
             )
 
-    def _tiers_reaching(self, backend_names: list[str]) -> list[str]:
-        """Tier aliases that route to any of ``backend_names``.
+    def _tiers_reaching(self, backend_names: list[str], model: str) -> list[str]:
+        """Tier aliases that serve ``model`` on one of ``backend_names``.
 
         The remedy half of a refusal message has to be built from the
         config that is loaded right now (T-silent-routing W-2). Telling a
@@ -166,13 +166,34 @@ class BackendRouter:
         silently — the gateway would be stating something about itself
         that is not so.
 
+        Reaching a declaring backend is necessary and not sufficient
+        (T-silent-routing R-6). A backend that declares the contested
+        name can also serve other models, and one of those may be the
+        model its tier resolves to; that tier reaches the right backend
+        and answers with the wrong model. Offering it converts a refusal
+        into a redirect, and unlike the fall-through this branch removed,
+        the substitution is the one the gateway named. Both halves are
+        therefore required:
+
+        * the tier's backend is one of the backends that declared
+          ``model`` — a tier may point ``model:`` at the contested name
+          while routing to a backend whose ``models:`` never listed it,
+          and sending a caller there is a remedy invented rather than
+          found; and
+        * the tier resolves to ``model`` itself.
+
+        A tier absent from ``_tier_to_model`` (its backend declares no
+        models and the tier sets no ``model:``) drops out on the second
+        condition, correctly: ``resolve_model`` passes such a tier name
+        upstream unchanged, so it is not a route to ``model`` either.
+
         Returns the tier names in declaration order, deduplicated.
         """
         wanted = set(backend_names)
         return [
             tier
             for tier, backend in self._tier_to_backend.items()
-            if backend in wanted
+            if backend in wanted and self._tier_to_model.get(tier) == model
         ]
 
     def _ambiguous_model_message(self, model: str) -> str:
@@ -180,11 +201,23 @@ class BackendRouter:
 
         Names every backend that declares ``model`` (the operator needs to
         know which declarations collided, not which one would have won),
-        then either lists the tier aliases that actually reach those
-        backends or says plainly that the name cannot be routed.
+        then either lists the tier aliases that actually serve ``model``
+        on those backends or says plainly that the name cannot be routed.
+
+        The closing sentence of each branch states exactly the condition
+        ``_tiers_reaching`` tests, because the two move together. When
+        that filter was "reaches one of these backends", saying "no tier
+        routes to any of those backends" was a true report of an empty
+        result. Now that the filter also requires the tier to resolve to
+        ``model``, the same sentence would be false in the case the
+        narrowing was made for: a tier reaches the backends and is
+        withheld because it serves something else. The predicate that
+        decides what is listed and the claim made when nothing is has to
+        be the same predicate, or the message trades a wrong remedy for a
+        well-formed falsehood.
         """
         declared = self._ambiguous_models[model]
-        alternatives = self._tiers_reaching(declared)
+        alternatives = self._tiers_reaching(declared, model)
         head = (
             f"Model '{model}' is declared by multiple backends "
             f"({', '.join(declared)}); the router cannot pick one without "
@@ -192,13 +225,13 @@ class BackendRouter:
         )
         if alternatives:
             return (
-                f"{head} Use one of these tier names instead: "
-                f"{', '.join(alternatives)}."
+                f"{head} Use one of these tier names instead, each of which "
+                f"resolves to '{model}': {', '.join(alternatives)}."
             )
         return (
-            f"{head} No tier routes to any of those backends, so this name "
-            f"is not routable through this gateway. See GET /v1/models for "
-            f"the names it does accept."
+            f"{head} No tier routes to '{model}' on any of those backends, "
+            f"so this name is not routable through this gateway. See GET "
+            f"/v1/models for the names it does accept."
         )
 
     def get_backend_for_model(self, model: str) -> Backend:
@@ -499,6 +532,16 @@ class BackendRouter:
         gateway that does not exist. Concrete IDs therefore appear only when
         exactly one backend declares them; the rest of the upstream's
         catalogue is reachable through the tier alias that resolves to it.
+        The narrowing runs one way only: everything advertised is
+        routable, while a declared name whose own upstream does not report
+        it is routable without being advertised.
+
+        A concrete row's ``backend`` is the backend that declares the
+        model (T-silent-routing R-7), which is not the same as the backend
+        whose upstream reported it — backends sharing an upstream each
+        report the whole catalogue. ``backend`` is the field a client
+        would read to learn where a name goes, so it has to agree with
+        ``get_backend_name_for_model``.
 
         Returns:
             Combined models list in OpenAI format.
@@ -510,9 +553,17 @@ class BackendRouter:
         #: three backends proxying one upstream would otherwise report the
         #: same name three times.
         _filtered_unroutable: set[str] = set()
-        #: Track ids we have already emitted so a name declared by multiple
-        #: passthrough backends (three vllm backends all proxying the same
-        #: upstream /v1/models) is not returned three times.
+        #: Track ``(backend, model)`` pairs already reported as belonging
+        #: to another backend, so the DEBUG line is issued once per pair
+        #: even if an upstream repeats a row inside one payload.
+        _skipped_foreign: set[tuple[str, str]] = set()
+        #: Track ids we have already emitted so one id cannot produce two
+        #: rows. After the declaration check below, two *backends* can no
+        #: longer both emit an id — a row survives only for the single
+        #: backend ``_model_to_backend`` names — so what remains for this
+        #: guard is one upstream payload listing the same id twice, which
+        #: includes legacy single-backend mode, where that check does not
+        #: run at all.
         _seen_ids: set[str] = set()
 
         for name, backend in self._backends.items():
@@ -534,13 +585,27 @@ class BackendRouter:
                     # therefore covers all three refusal cases with one
                     # test rather than only the ambiguous one.
                     #
+                    # T-silent-routing R-7: membership answers "may this
+                    # row exist"; it does not answer "whose row is it".
+                    # Backends may share an upstream — the shipped config
+                    # points three at one vLLM server — and then each of
+                    # them reports the whole catalogue, including names
+                    # another backend declared. Accepting on membership
+                    # alone stamps ``backend`` with whichever backend the
+                    # iteration reached first, and the dedupe below then
+                    # discards the declaring backend's row as a repeat,
+                    # so the listing states a route the router does not
+                    # take. Comparing against the declaring backend
+                    # decides both questions with one lookup.
+                    #
                     # Only in multi-backend mode. Legacy single-backend
                     # mode routes every name to the one backend, so
                     # everything the upstream advertises is routable there
                     # and ``_model_to_backend`` is empty — filtering on it
                     # would empty the listing instead of narrowing it.
                     if self._routing_enabled and isinstance(model_id, str):
-                        if model_id not in self._model_to_backend:
+                        declaring_backend = self._model_to_backend.get(model_id)
+                        if declaring_backend is None:
                             if model_id not in _filtered_unroutable:
                                 _filtered_unroutable.add(model_id)
                                 if model_id in self._ambiguous_models:
@@ -566,14 +631,38 @@ class BackendRouter:
                                         backend=name,
                                     )
                             continue
-                    # Deduplicate by id. Three vllm backends pointing at the
-                    # same upstream URL each return an identical row for the
-                    # concrete model — carrying all three past this point
-                    # gives clients three "same model, different backend"
-                    # entries that only differ in the additive ``backend``
-                    # field, which is worse than one canonical entry: it
-                    # implies a choice of backend that raw-name routing
-                    # does not actually support.
+                        if declaring_backend != name:
+                            # Reachable, just not through this backend.
+                            # This is a duplicate suppressed, not a name
+                            # filtered out: the row is emitted when the
+                            # loop reaches ``declaring_backend``. It must
+                            # not be recorded as ``unroutable``, because
+                            # that event name asserts no backend serves
+                            # the model while the same response carries
+                            # it — the failure this branch removes from
+                            # the API surface, re-created on the log
+                            # surface.
+                            if (name, model_id) not in _skipped_foreign:
+                                _skipped_foreign.add((name, model_id))
+                                logger.debug(
+                                    "list_models_other_backend_declaration",
+                                    model=model_id,
+                                    reported_by=name,
+                                    declared_by=declaring_backend,
+                                )
+                            continue
+                    # Deduplicate by id. The cross-backend case this
+                    # started as — three vllm backends on one upstream all
+                    # returning the same row — no longer arrives here:
+                    # the declaration check above admits a row for exactly
+                    # one backend per id, so the copies are dropped there,
+                    # by the backend that does not own them rather than by
+                    # whichever copy happened to be second. What still
+                    # reaches this guard is a single upstream listing one
+                    # id twice in one payload, and legacy single-backend
+                    # mode, where the declaration check does not run. Both
+                    # would otherwise put two rows with the same ``id`` in
+                    # one response.
                     if isinstance(model_id, str) and model_id in _seen_ids:
                         continue
                     if isinstance(model_id, str):
