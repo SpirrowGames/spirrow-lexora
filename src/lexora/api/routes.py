@@ -115,7 +115,7 @@ def _fail_preflight(
             endpoint=endpoint,
             model=model,
             status="error",
-            duration=time.time() - start_time,
+            duration=time.monotonic() - start_time,
             streaming=True,
         )
 
@@ -359,7 +359,7 @@ async def chat_completions(
             model=request.model,
             user_id=request.user,
         )
-        start_time = time.time()
+        start_time = time.monotonic()
 
         # Record metrics start
         if metrics_collector:
@@ -458,7 +458,7 @@ async def chat_completions(
                         yield chunk
 
                 # Mark as successful on stream completion
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=True)
 
                 # Record metrics
@@ -477,7 +477,7 @@ async def chat_completions(
                     duration=duration,
                 )
             except BackendError as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -497,7 +497,7 @@ async def chat_completions(
                 )
                 raise
             except Exception as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -528,7 +528,7 @@ async def chat_completions(
             # to agree with `_fail_preflight` on the same exception class;
             # whether a disconnect is a *failure* is not settled here.
             except BaseException as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 if metrics_collector:
@@ -564,7 +564,7 @@ async def chat_completions(
         model=request.model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Record metrics start
     if metrics_collector:
@@ -591,7 +591,7 @@ async def chat_completions(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -652,7 +652,7 @@ async def chat_completions(
         return response
 
     except BackendUpstreamError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
         if metrics_collector:
             metrics_collector.record_request_end(
@@ -679,7 +679,7 @@ async def chat_completions(
         logger.error("chat_completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -694,7 +694,7 @@ async def chat_completions(
         logger.error("chat_completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -761,7 +761,7 @@ async def completions(
             model=request.model,
             user_id=request.user,
         )
-        start_time = time.time()
+        start_time = time.monotonic()
 
         # Record metrics start
         if metrics_collector:
@@ -857,7 +857,7 @@ async def completions(
                         yield chunk
 
                 # Mark as successful on stream completion
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=True)
 
                 # Record metrics
@@ -876,7 +876,7 @@ async def completions(
                     duration=duration,
                 )
             except BackendError as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -896,7 +896,7 @@ async def completions(
                 )
                 raise
             except Exception as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 # Record error metrics
@@ -918,7 +918,7 @@ async def completions(
             # ACTIVE_REQUESTS invariant. See the same clause in
             # `chat_completions` above for why.
             except BaseException as e:
-                duration = time.time() - start_time
+                duration = time.monotonic() - start_time
                 stats_collector.complete_request(stats, success=False, error=str(e))
 
                 if metrics_collector:
@@ -954,7 +954,7 @@ async def completions(
         model=request.model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Record metrics start
     if metrics_collector:
@@ -981,7 +981,7 @@ async def completions(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -1031,7 +1031,7 @@ async def completions(
         return response
 
     except BackendUpstreamError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
         if metrics_collector:
             metrics_collector.record_request_end(
@@ -1055,7 +1055,7 @@ async def completions(
         logger.error("completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1070,7 +1070,7 @@ async def completions(
         logger.error("completion_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1127,7 +1127,7 @@ async def embeddings(
         model=resolved_model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     # Record metrics start
     if metrics_collector:
@@ -1141,7 +1141,7 @@ async def embeddings(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = 0  # Embeddings don't have output tokens
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -1185,7 +1185,7 @@ async def embeddings(
         return response
 
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1200,7 +1200,7 @@ async def embeddings(
         logger.error("embeddings_error", model=request.model, error=str(e))
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         # Record error metrics
@@ -1535,7 +1535,7 @@ async def generate(
         model=model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     if metrics_collector:
         metrics_collector.record_request_start(endpoint)
@@ -1559,7 +1559,7 @@ async def generate(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -1606,7 +1606,7 @@ async def generate(
         return GenerateResponse(text=text)
 
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1622,7 +1622,7 @@ async def generate(
     except HTTPException:
         raise
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1719,7 +1719,7 @@ async def chat(
         model=model,
         user_id=request.user,
     )
-    start_time = time.time()
+    start_time = time.monotonic()
 
     if metrics_collector:
         metrics_collector.record_request_start(endpoint)
@@ -1744,7 +1744,7 @@ async def chat(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -1790,7 +1790,7 @@ async def chat(
         return ChatResponse(response=response_text)
 
     except BackendError as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1806,7 +1806,7 @@ async def chat(
     except HTTPException:
         raise
     except Exception as e:
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
         stats_collector.complete_request(stats, success=False, error=str(e))
 
         if metrics_collector:
@@ -1902,7 +1902,7 @@ async def messages(
         )
         if metrics_collector:
             metrics_collector.record_request_start(endpoint)
-        start_time = time.time()
+        start_time = time.monotonic()
 
         byte_iter = backend.chat_completions_stream(openai_request).__aiter__()
         try:
@@ -2019,7 +2019,7 @@ async def messages(
                         endpoint=endpoint,
                         model=request.model,
                         status="success",
-                        duration=time.time() - start_time,
+                        duration=time.monotonic() - start_time,
                         streaming=True,
                     )
             except Exception as e:  # noqa: BLE001
@@ -2029,7 +2029,7 @@ async def messages(
                         endpoint=endpoint,
                         model=request.model,
                         status="error",
-                        duration=time.time() - start_time,
+                        duration=time.monotonic() - start_time,
                         streaming=True,
                     )
                 logger.exception("messages_stream_unexpected_error", model=request.model)
@@ -2044,7 +2044,7 @@ async def messages(
                         endpoint=endpoint,
                         model=request.model,
                         status="error",
-                        duration=time.time() - start_time,
+                        duration=time.monotonic() - start_time,
                         streaming=True,
                     )
                 logger.error(
@@ -2069,7 +2069,7 @@ async def messages(
     stats = stats_collector.start_request(
         endpoint=endpoint, model=request.model, user_id=user_id
     )
-    start_time = time.time()
+    start_time = time.monotonic()
     if metrics_collector:
         metrics_collector.record_request_start(endpoint)
 
@@ -2091,7 +2091,7 @@ async def messages(
         usage = response.get("usage", {})
         tokens_input = usage.get("prompt_tokens", 0)
         tokens_output = usage.get("completion_tokens", 0)
-        duration = time.time() - start_time
+        duration = time.monotonic() - start_time
 
         stats_collector.complete_request(
             stats,
@@ -2140,7 +2140,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         logger.warning("messages_governance_refused", model=request.model, error=str(e))
         return JSONResponse(
@@ -2154,7 +2154,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         if passthrough:
             logger.warning(
@@ -2180,7 +2180,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         logger.error("messages_error", model=request.model, error=str(e))
         return JSONResponse(
@@ -2194,7 +2194,7 @@ async def messages(
                 endpoint=endpoint,
                 model=request.model,
                 status="error",
-                duration=time.time() - start_time,
+                duration=time.monotonic() - start_time,
             )
         logger.exception("messages_unexpected_error", model=request.model)
         return JSONResponse(
