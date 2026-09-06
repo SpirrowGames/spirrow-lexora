@@ -85,47 +85,11 @@ evidence, because each runs the suite exactly once. This is the timing form of
 R-11's lesson -- there, a fence existed without working; here, a fence worked
 without staying working.
 
-The rule that episode owes to `T-unchecked-comment-claims`, stated here
-because this is the file that keeps wanting to break it. A RUN-COUNT IN A
-COMMENT IS ADMISSIBLE ONLY IF either (a) the quantity it reports is
-DETERMINISTIC, so that a single contrary run refutes it, or (b) the number is
-used solely as evidence that the quantity is UNSTABLE, and the text says so.
-A rate offered as a property of the tree is inadmissible however carefully it
-was measured -- three ten-run measurements of one unchanged tree came back 10,
-9 and 7, which is not error bars but the absence of a quantity to measure. The
-discriminator is determinism, not who took the reading or how recently.
-
-Three run-counts appear in this file, and the sentence above is one of them.
-Two sit in prose -- one in the paragraph above, one at the tolerance below --
-and both report the same superseded `time.monotonic()` bracket, each now
-saying which bracket it measured. The third is the 10/9/7 just quoted. All
-three are use (b): every one is cited to show that a quantity was unstable,
-and every one says so. A count of failing test NODES within a single run,
-such as the 4-of-16 above, is not a run-count at all, and this rule does not
-reach it.
-
-KNOWN DEFECT in that rule, recorded here because the rule is stated here and
-the repair is still open. Its text is universal, so its extension is the
-repository and not this file. Enumerated 2026-09-07 over every comment and
-docstring block in `src/` and `tests/`: outside this file the rule reaches four
-run-counts its author did not have in hand, and it condemns two of them --
-the tolerance note at `tests/services/test_rate_limiter.py` and the sampling
-note in `_tokens_from_result` at `backends/claude_code.py`. Both cite how much
-evidence stands behind a fact that observation found steady but did not prove
-deterministic, so limb (a) is unavailable, and neither is offered as
-evidence of instability, so (b) is unavailable too. Deleting either number
-leaves the surviving claim with no recorded basis, which is worse than the
-text that is there. Both should stand. The gap is structural rather than a
-matter of wording: the rule has a limb for a quantity proven fixed and a limb
-for a quantity shown to move, and none for bounded evidence about a quantity
-that is neither -- which is the case where saying how many runs there were
-carries the most information, because it is the reader's only handle on how
-far to trust it. Note which of the neighbours pass: that same docstring
-carries a second run-count the rule admits, and so does its test file, and
-both are admitted only because what they happened to observe turned out to be
-unstable. The verdict tracks what the measurement found, not whether citing it
-was sound practice. Until this is repaired, do not apply the rule to delete
-either site.
+What that episode owes to `T-unchecked-comment-claims` is stated here because
+this is the file that keeps wanting to break it. A rate offered as a property
+of the tree is inadmissible however carefully it was measured -- three ten-run
+measurements of one unchanged tree came back 10, 9 and 7, which is not error
+bars but the absence of a quantity to measure.
 """
 
 import asyncio
