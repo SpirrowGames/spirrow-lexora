@@ -397,15 +397,17 @@ def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
 
     And it reddens them *deterministically*, which is the property that decides
     this and the one the alternative did not have. The six cells above were run
-    three separate times and every cell gave the same answer all three times.
-    Compare what covered the hardcode edit while this check was absent: nothing
-    but incidental flake in the bracket detectors of `test_ledger_coverage.py`,
-    and three independent ten-run measurements of that same tree disagreed with
+    five separate times -- the two assertions below byte-identical throughout --
+    and every cell gave the same answer every time. Compare
+    what covered the hardcode edit while this check was absent: nothing but
+    incidental flake in the bracket detectors of `test_ledger_coverage.py`, and
+    three independent ten-run measurements of that same tree disagreed with
     each other -- 10, 9 and 7 runs red out of 10, with anywhere from 0 to 3 of
-    the four detectors failing in a single run. A residual whose own rate moves
-    that much between measurements is not coverage, and no figure for it is
-    quoted anywhere in this change, because any figure quoted would be the next
-    unchecked claim.
+    the four detectors failing in a single run. Those three numbers are quoted
+    only against each other, as evidence that the rate moves. None of them is
+    this file's estimate of how much that residual covers, and no such estimate
+    is given anywhere in this change, because it would be the next unchecked
+    claim.
 
     Two conjuncts rather than one `>= max(m, 0.001)`, and the reason is not
     just that they fail with different messages. Evaluating the two expressions
