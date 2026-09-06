@@ -41,6 +41,7 @@ from lexora.backends.base import (
     BackendRateLimitError,
     BackendTimeoutError,
     BackendUnavailableError,
+    UsageSink,
 )
 from lexora.utils.logging import get_logger
 
@@ -481,7 +482,7 @@ class GeminiBackend(Backend):
             raise BackendError(f"Gemini API request failed: {e}") from e
 
     async def chat_completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send a streaming chat completion via ``streamGenerateContent``.
 
@@ -491,6 +492,10 @@ class GeminiBackend(Backend):
 
         Args:
             request: OpenAI-compatible chat completion request.
+            usage_sink: Accepted, not filled here. ``usageMetadata`` is in
+                the SSE payload and ``_to_openai_response`` already reads it;
+                wiring the stream loop is PR-B. Until then the sink stays at
+                zero and the guard turns that into "no row".
 
         Yields:
             SSE data chunks in OpenAI format.
@@ -666,7 +671,7 @@ class GeminiBackend(Backend):
         )
 
     async def completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Not supported: the naysayer surface is chat-only."""
         raise GeminiGovernanceError(

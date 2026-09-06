@@ -18,10 +18,14 @@ the reason. None carried a comment explaining the omission, and none even took
 `cost_tracker` as a dependency. `/stats/costs` and `/stats/costs/recent` served
 the sum of the two recorded routes without saying so anywhere.
 
-Still not covered after this file, deliberately: the three streaming paths
-(`stream_generator` at `00eafd5`'s `routes.py:428` / `:812` / `:1883`), which
-relay the bytes `backend.*_stream` yields without decoding them. See
-`get_cost_tracker`'s docstring.
+Not covered after this file: the three streaming paths (`stream_generator` at
+`00eafd5`'s `routes.py:428` / `:812` / `:1883`). That was recorded here as
+deliberate, over a reason that turned out to be false -- that those handlers
+relay the bytes `backend.*_stream` yields without decoding them, so a count
+would have to be parsed back out mid-relay. Only two of the five backends
+relay. The gap is closed by T-streaming-ledger-row and its detectors live in
+`test_streaming_ledger_row.py`; the four routes below are unaffected and this
+file is still only about them.
 
 Why these detectors drive the routes instead of calling a helper: R-11 shipped
 five green unit detectors over the token parser while the ledger itself stayed

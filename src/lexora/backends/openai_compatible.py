@@ -12,6 +12,7 @@ from lexora.backends.base import (
     BackendRateLimitError,
     BackendTimeoutError,
     BackendUnavailableError,
+    UsageSink,
 )
 from lexora.utils.logging import get_logger
 
@@ -190,12 +191,19 @@ class OpenAICompatibleBackend(Backend):
         await self._client.aclose()
 
     async def chat_completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send streaming chat completion request.
 
         Args:
             request: OpenAI-compatible chat completion request.
+            usage_sink: Accepted and never filled. ``_post_stream`` relays
+                the upstream bytes verbatim and those bytes carry no usage
+                chunk, because this tree never asks for one --
+                ``stream_options`` / ``include_usage`` have zero occurrences
+                in it, measured. The sink stays at zero and no row is opened:
+                "we cannot say", not "this request was free". See the coverage
+                table on ``api/routes.py``'s ``get_cost_tracker``.
 
         Yields:
             SSE data chunks.
@@ -208,12 +216,14 @@ class OpenAICompatibleBackend(Backend):
             yield chunk
 
     async def completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send streaming completion request.
 
         Args:
             request: OpenAI-compatible completion request.
+            usage_sink: Accepted and never filled; see
+                ``chat_completions_stream``.
 
         Yields:
             SSE data chunks.

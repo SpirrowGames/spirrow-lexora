@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -138,6 +139,30 @@ class BackendUpstreamError(BackendError):
         self.backend_name = backend_name
 
 
+@dataclass
+class UsageSink:
+    """Per-request carrier for the token counts a streaming call observed.
+
+    ``*_stream`` is an ``AsyncIterator[bytes]`` and cannot return a value, so a
+    backend that already parses upstream usage writes it here and the handler
+    reads it after the relay terminates.
+
+    **Per request, never as state on the backend.** Backend instances are
+    created once (``services/router.py``) and held on ``app.state``, so one
+    instance serves concurrent requests: an attribute would let two
+    overlapping streams overwrite each other's count -- a number landing on
+    the wrong bill.
+
+    Left at zero by any backend that does not fill it, and the handler's guard
+    (``tokens_input > 0 or tokens_output > 0``, the predicate the six
+    non-streaming sites use) then opens no row. That is why the verbatim-relay
+    backends, whose bytes do not carry the number, need no special case.
+    """
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
 class Backend(ABC):
     """Abstract base class for LLM backends."""
 
@@ -201,12 +226,16 @@ class Backend(ABC):
 
     @abstractmethod
     async def chat_completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send streaming chat completion request to the backend.
 
         Args:
             request: OpenAI-compatible chat completion request.
+            usage_sink: Optional per-request carrier the backend fills with
+                the upstream token counts if it has them. Defaults to None so
+                every existing caller keeps working unchanged. A backend that
+                leaves it untouched bills nothing; see ``UsageSink``.
 
         Yields:
             SSE data chunks.
@@ -219,12 +248,14 @@ class Backend(ABC):
 
     @abstractmethod
     async def completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send streaming completion request to the backend.
 
         Args:
             request: OpenAI-compatible completion request.
+            usage_sink: Optional per-request carrier; see
+                ``chat_completions_stream``.
 
         Yields:
             SSE data chunks.
