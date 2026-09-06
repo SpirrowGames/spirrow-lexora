@@ -135,12 +135,12 @@ SLOW = 0.05
 
 # The tolerance the bracket on `duration` needs, and why it is this.
 #
-# `routes.py` measures `duration` with `time.time()` (`:1523`/`:1547` and the
-# other record sites). A difference of two readings off a clock quantised to
+# `routes.py` measures `duration` with `time.monotonic()` at every record
+# site. A difference of two readings off a clock quantised to
 # `tick` differs from the true interval by strictly less than `tick` in either
 # direction, so a recorded value can overshoot the interval it measures. On
 # this runner `time.time()` and `time.monotonic()` BOTH report a resolution of
-# 15.625 ms, which is why bracketing a `time.time()` delta between
+# 15.625 ms, which is why bracketing the handler's delta between
 # `time.monotonic()` deltas did not hold: measured bare, 300 samples over a
 # 50 ms sleep put the inner value above the outer one 234 times (78%), median
 # +3.3 ms, max +4.9 ms. That bracket survived only on the few ms of slack the
@@ -162,13 +162,23 @@ SLOW = 0.05
 # reach it.
 #
 # The floor exists so this does not merely relocate the same mistake. Where
-# `time.time()` is fine-grained the resolution term is ~0 (1e-09 on Linux CI),
-# which would put the bound back to exactly tight -- and that clock is
-# `adjustable` (measured: `get_clock_info("time").adjustable` is True), so NTP
-# may slew it while the window is open while `asyncio.sleep` is timing `SLOW`
-# off the monotonic clock instead. 1 ms covers that by a wide margin (500 ppm
-# over 50 ms is 25 us) and costs no detection power: every constant this
-# bracket has to reject misses it by three orders of magnitude.
+# the clock is fine-grained the resolution term is ~0 (1e-09 on Linux CI),
+# which would put the bound back to exactly tight. 1 ms covers that by a wide
+# margin (500 ppm over 50 ms is 25 us) and costs no detection power: every
+# constant this bracket has to reject misses it by three orders of magnitude.
+#
+# ★ One thing below is deliberately stale, deferred rather than missed. The
+# term is still read off `get_clock_info("time")` while the handler now reads
+# `time.monotonic()`, so it is taken from a clock the handler no longer uses;
+# and the floor's original justification -- that `time` is `adjustable`
+# (measured: True) and so may be slewed mid-window -- no longer applies to the
+# handler's clock at all. What keeps that safe is a single inequality: the
+# slack must not be finer than the tick of the clock the handler actually
+# reads. That is not asserted here on faith -- it is checked at runtime, on
+# whatever platform runs the suite, by
+# `test_interval_clock.py::test_duration_slack_still_covers_the_handlers_clock`.
+# Re-deriving the term off that clock belongs to its own change, not to the
+# one that moved the clock (see msg-131 §4 / msg-146 §4).
 DURATION_SLACK = max(time.get_clock_info("time").resolution, 0.001)
 
 USAGE = {"prompt_tokens": 11, "completion_tokens": 5}
