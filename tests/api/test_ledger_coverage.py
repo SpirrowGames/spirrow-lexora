@@ -84,6 +84,25 @@ assertion that reads a clock, and neither the gate nor CI can supply that
 evidence, because each runs the suite exactly once. This is the timing form of
 R-11's lesson -- there, a fence existed without working; here, a fence worked
 without staying working.
+
+The rule that episode owes to `T-unchecked-comment-claims`, stated here
+because this is the file that keeps wanting to break it. A RUN-COUNT IN A
+COMMENT IS ADMISSIBLE ONLY IF either (a) the quantity it reports is
+DETERMINISTIC, so that a single contrary run refutes it, or (b) the number is
+used solely as evidence that the quantity is UNSTABLE, and the text says so.
+A rate offered as a property of the tree is inadmissible however carefully it
+was measured -- three ten-run measurements of one unchanged tree came back 10,
+9 and 7, which is not error bars but the absence of a quantity to measure. The
+discriminator is determinism, not who took the reading or how recently.
+
+Three run-counts appear in this file, and the sentence above is one of them.
+Two sit in prose -- one in the paragraph above, one at the tolerance below --
+and both report the same superseded `time.monotonic()` bracket, each now
+saying which bracket it measured. The third is the 10/9/7 just quoted. All
+three are use (b): every one is cited to show that a quantity was unstable,
+and every one says so. A count of failing test NODES within a single run,
+such as the 4-of-16 above, is not a run-count at all, and this rule does not
+reach it.
 """
 
 import asyncio
@@ -145,8 +164,9 @@ SLOW = 0.05
 # 50 ms sleep put the inner value above the outer one 234 times (78%), median
 # +3.3 ms, max +4.9 ms. That bracket survived only on the few ms of slack the
 # TestClient round trip adds outside the handler's own window, and lost the
-# toss often -- the four detectors below red 10 runs in 15 on an unmodified
-# tree.
+# toss often: with THAT bracket in the tree, the four detectors below red 10
+# runs in 15. The count measures the superseded bracket, not the one shipped
+# here, and it is quoted for one purpose -- to show the bracket was unstable.
 #
 # `wall` is therefore read off `time.perf_counter()` (resolution 1e-07 here),
 # which makes it the true elapsed of an interval that strictly contains the
@@ -158,11 +178,21 @@ SLOW = 0.05
 # inequality; it rests on the containment margin, the milliseconds of
 # TestClient round trip that sit outside the handler's own window. Widening
 # the slack to `max(m + p, 0.001)` to close the 1e-07 was considered and
-# declined, and not because 1e-07 is small: it would make
-# `test_the_outer_clock_is_finer_than_the_slack` -- the check that keeps `p`
-# small enough for this paragraph to mean anything -- true by construction,
-# since `p < m + p` reduces to `m > 0`. The repair would manufacture a
-# tautology one level up, and would make this term depend on a third clock.
+# declined, and the reason is detection power, measured, not the 1e-07 being
+# small. `m + p` lets this bracket's half-width track `p` without bound. Worked
+# with `m` = 15.625 ms and `SLOW` = 0.05, the lower end `SLOW - slack` goes
+# non-positive once `p` >= 0.034375, and from there up -- `p` = 0.1, say -- the
+# bracket ADMITS a recorded `duration` of exactly 0.0, the placeholder it
+# exists to reject.
+# The shipped `max(m, 0.001)` holds the half-width at 0.015625 for every `p`,
+# rejects 0.0 in all of those cases, and instead fails loudly, at
+# `test_the_outer_clock_is_finer_than_the_slack`, as soon as `p` reaches the
+# slack. So `m + p` trades a loud failure for a silent loss of detection power
+# on precisely the coarse-`p` platforms these checks exist to catch, and the
+# criterion that rejects it is the one the floor paragraph below already uses:
+# costs no detection power. Secondary, and never the reason: it would also
+# disarm that check, `p < max(m + p, 0.001)` being vacuous whenever
+# `m + p` >= 0.001, and would make this term depend on a third clock.
 # Hence one tick of the handler's clock at each end, with a floor (below):
 # since the backend is held open for `SLOW` inside a window the outer reading
 # strictly contains,
@@ -174,7 +204,8 @@ SLOW = 0.05
 # reach it.
 #
 # The floor exists so this does not merely relocate the same mistake. Where
-# the clock is fine-grained the resolution term is ~0 (1e-09 on Linux CI),
+# the clock is fine-grained the resolution term is ~0 (1e-09 on Linux CI --
+# measured, off CI run 34053301337, not assumed),
 # which would put the bound back to exactly tight. 1 ms covers that by a wide
 # margin (500 ppm over 50 ms is 25 us) and costs no detection power: every
 # constant this bracket has to reject misses it by three orders of magnitude.
