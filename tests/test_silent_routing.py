@@ -285,6 +285,27 @@ class TestStrictLoaderAcceptsMergeKeys:
         first, repeated = _duplicate_lines(str(exc_info.value))
         assert (first, repeated) == (2, 3)
 
+    def test_repeated_value_key_still_raises(self, tmp_path: Path) -> None:
+        """``=`` is an entry of the mapping, not an instruction to the loader.
+
+        PyYAML gives ``=`` its own tag, which is why it needs handling
+        alongside ``<<`` — but the resemblance stops there.
+        ``flatten_mapping`` retags it to a plain string and the built
+        mapping carries the key ``"="``, so ``yaml.safe_load`` on this
+        file returns ``{'a': {'=': 2}}``: the first value is gone and
+        nothing said so. Stepping over it the way ``<<`` is stepped over
+        would leave that last-writer-wins inside the one check whose
+        whole purpose is to stop it.
+        """
+        path = tmp_path / "cfg.yaml"
+        path.write_text("a:\n  =: 1\n  =: 2\n")
+        assert yaml.safe_load("a:\n  =: 1\n  =: 2\n") == {"a": {"=": 2}}
+        with pytest.raises(DuplicateYamlKeyError) as exc_info:
+            load_yaml_config(path)
+        assert "'='" in str(exc_info.value)
+        first, repeated = _duplicate_lines(str(exc_info.value))
+        assert (first, repeated) == (2, 3)
+
 
 # --------------------------------------------------------------------------
 # R-1b — tier / model name collision

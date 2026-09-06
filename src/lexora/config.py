@@ -47,16 +47,20 @@ class _StrictSafeLoader(yaml.SafeLoader):
     """
 
 
-#: The two keys PyYAML treats as instructions to the loader rather than as
-#: entries of the mapping: ``<<`` (the YAML 1.1 merge key) and ``=`` (the
-#: YAML 1.1 value key). Neither is a key the operator wrote as an entry of
-#: this mapping — ``<<`` may legally appear more than once in one mapping —
-#: and neither has a constructor registered on ``SafeLoader``, so
-#: ``construct_object`` cannot build them. The duplicate check below steps
-#: over both; ``construct_mapping`` handles them afterwards.
-_YAML_LOADER_DIRECTIVE_TAGS: frozenset[str] = frozenset(
-    {"tag:yaml.org,2002:merge", "tag:yaml.org,2002:value"}
-)
+#: ``<<``, the YAML 1.1 merge key. It is an instruction to the loader, not
+#: an entry of the mapping: it contributes the anchor's pairs and then
+#: disappears, it may legally appear more than once in one mapping, and
+#: ``SafeLoader`` registers no constructor for it, so ``construct_object``
+#: cannot build it. The duplicate check steps over it.
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+#: ``=``, the YAML 1.1 value key. Unlike ``<<`` this one *is* an entry:
+#: ``flatten_mapping`` retags it to a plain string on its way past, so the
+#: built mapping carries the key ``"="`` and two of them would be a
+#: last-writer-wins exactly like any other repeated key. The check retags
+#: it the same way rather than stepping over it (``flatten_mapping`` then
+#: takes the already-str branch, so the outcome is unchanged).
+_YAML_VALUE_TAG = "tag:yaml.org,2002:value"
 
 
 def _construct_strict_mapping(
@@ -85,8 +89,10 @@ def _construct_strict_mapping(
     """
     seen: dict[Any, tuple[int, int]] = {}
     for key_node, _ in node.value:
-        if key_node.tag in _YAML_LOADER_DIRECTIVE_TAGS:
+        if key_node.tag == _YAML_MERGE_TAG:
             continue
+        if key_node.tag == _YAML_VALUE_TAG:
+            key_node.tag = "tag:yaml.org,2002:str"
         # ``construct_object`` is what SafeLoader would call for each key,
         # so scalar keys become the same Python objects the default loader
         # would produce (``"heavy"`` stays ``"heavy"``, not a ScalarNode).
