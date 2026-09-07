@@ -173,6 +173,32 @@ class Backend(ABC):
     #: Set by subclasses whose config carries ``error_passthrough: true``.
     error_passthrough: bool = False
 
+    #: When True, this backend parses the upstream's token counts itself and
+    #: writes them into the per-request ``UsageSink`` it is handed, so a
+    #: stream of its that reaches normal completion is *expected* to leave a
+    #: non-empty sink.
+    #:
+    #: **A claim about the backend, never about the wire format.** It says
+    #: only "this implementation fills the sink"; it names no upstream, no
+    #: field and no frame, so a handler that reads it learns nothing about
+    #: what the upstream sends and the router still holds no upstream format.
+    #: That is the whole reason it is a bit here rather than a format hint.
+    #:
+    #: Off by default, so a backend that relays bytes verbatim -- and
+    #: therefore holds no parsed count -- needs no special case, exactly as
+    #: with the sink itself. Set True on ``anthropic``, ``claude_code`` and
+    #: ``gemini``, the three that write the sink; left False on
+    #: ``openai_compatible`` and ``vllm``, whose ``*_stream`` docstrings say
+    #: "accepted and never filled" and point at this attribute so the prose
+    #: and the value sit together.
+    #:
+    #: NOT ``error_passthrough``, and the two must never be confused: that
+    #: one is an error-shape flag and it is set on ``anthropic``
+    #: (``config.ERROR_PASSTHROUGH_TYPES`` is ``{"anthropic"}``), which is
+    #: one of the three backends that *do* fill the sink. As a stand-in for
+    #: this bit it is not merely different, it is anti-correlated.
+    fills_usage_sink: bool = False
+
     @abstractmethod
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
         """Send chat completion request to the backend.

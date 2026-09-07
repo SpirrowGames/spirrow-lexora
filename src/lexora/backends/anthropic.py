@@ -74,6 +74,12 @@ class AnthropicBackend(Backend):
         name: Optional backend name for error messages.
     """
 
+    #: This backend decodes `message_start` / `message_delta` itself and
+    #: writes the counts into the sink (see `chat_completions_stream`), so a
+    #: stream of its that completes normally and leaves the sink at zero is
+    #: the defect the handler counts, not one of the legitimate silences.
+    fills_usage_sink: bool = True
+
     def __init__(
         self,
         base_url: str = "https://api.anthropic.com",
