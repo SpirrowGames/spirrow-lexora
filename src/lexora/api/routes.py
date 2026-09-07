@@ -82,8 +82,10 @@ def _record_missing_stream_usage(
     """Count a stream that should have opened a ledger row and did not.
 
     The gap this closes is *indistinguishability*, not silence. An empty
-    sink at a terminal exit has four causes and the ``finally`` guard above
-    treats all four the same way, because after the fact they look the same:
+    sink at a terminal exit has four causes and the row-opening guard in
+    each ``stream_generator``'s ``finally`` (below, not above -- this
+    function is defined before its three callers) treats all four the same
+    way, because after the fact they look the same:
     a verbatim-relay backend, a client who cut the connection before the
     upstream's final frame, a stream where the count genuinely never
     arrived, and -- the defect -- a backend that parses the count but whose
