@@ -490,9 +490,12 @@ class _FrozenClock:
     """A stand-in for the `time` module whose `monotonic()` never advances.
 
     Installed into `routes`' globals by the fence below, which is the only
-    thing that uses it. It is the fourth clock double in this suite and the
-    only one outside `test_interval_clock.py`; the other three are named from
-    there and the reason this one is not with them is recorded at both ends.
+    thing that uses it. It is the fourth clock double in this suite and it was
+    the only one outside `test_interval_clock.py` until `_SteppingClock` was
+    added as the fifth, in `test_streaming_ledger_row.py`, under the same rule
+    -- a double is filed next to its subject. The other three are named from
+    `test_interval_clock.py`, and the reason this one is not with them is
+    recorded at both ends.
 
     **Only `monotonic()` is faked**, and `__getattr__` delegates the rest, in
     the same shape as `_BackwardsWallClock`, `_TickSkippingClock` and

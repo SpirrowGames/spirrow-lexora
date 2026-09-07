@@ -94,10 +94,67 @@ the backend's parsing:
   entire difference between "covers every terminal exit" and "covers the happy
   one", which is why it exists as its own case rather than as an extra
   assertion on one of the others.
+
+EVERY LINE ABOVE THAT NAMES `test_duration_tracks_the_call_and_not_a_constant`
+IS HISTORY, NOT THIS FILE. That case has been REPLACED, and not because a run
+was unlucky. It drove the route twice and asserted `slow > fast` across two
+DISJOINT wall-clock intervals, so its real premise was "no pause of at least
+`SLOW` lands inside the second one" -- a bound on the execution environment,
+measured nowhere. It turned `origin/develop` RED at `21637ea`
+(`assert 0.051075674 > 0.069269409`, and `assert 0.050877193 > 0.053628683`
+three seconds later, both `[completions]`, same sha: ONE disturbance observed
+twice, not two independent failures). The rows above are kept because they are
+measurements that were really taken against the file as it then stood; they are
+not claims about the file as it stands. `SLOW`'s comment carries the cause and
+why the premise was removed rather than tuned.
+
+Its replacement is `test_duration_is_the_handlers_own_interval_and_not_a
+_constant`, which installs `_SteppingClock` into `routes`' globals and asserts
+EQUALITY against the double's own script. Receipts, same discipline as the
+table above, single-site edits against the finished tree, restored byte-
+identically before the next (`filecmp.cmp(shallow=False)` against a pre-edit
+snapshot taken in this worktree, `git status` clean after each). The mutated
+pattern is the `duration=` argument of the ledger `cost_tracker.record(...)`
+call in all three streaming handlers, anchored on the `user_id=` line above it:
+pattern found 3, expected 3, replaced 3, each time.
+
+- `duration=0.0` -- the constant the old case existed to reject: 3 red /
+  13 green, exactly the three new cases (-78 bytes).
+- `duration=0.05`, i.e. `SLOW` itself: 3 red / 13 green, the same three
+  (-75 bytes).
+- `duration=4.75`, i.e. `ADVANCE_A` -- a constant equal to one of the two
+  scripted advances, which is the shape a single-advance version could not
+  see: 3 red / 13 green, the same three (-75 bytes).
+
+THE THIRD ROW IS THE ONE THAT EARNS THE SECOND ADVANCE, and it was measured as
+a counterfactual rather than argued: with the case cut down to
+`for advance in (ADVANCE_A,)` / `assert recorded == [ADVANCE_A]` -- two
+single-site edits, both restored byte-identically -- the SAME `duration=4.75`
+mutation is **16 passed, 0 failed**. One advance is satisfied by the constant
+equal to it. Two are not. That is the same "a constant inside the band" the
+`SLOW` comment records against a bracket, one level up.
+
+AND THE TRAP, checked first-hand before the case was written rather than taken
+on trust, and then measured as red/green rather than argued. `msg-230` F-1
+states it: reaching for the nearest existing double, `_FrozenClock`, yields
+`duration == 0.0` by construction -- which is the very value `duration=0.0`
+produces -- so a frozen double is GREEN under the mutation the case exists to
+reject. Setting BOTH advances to `0.0` turns `_SteppingClock` into exactly that
+frozen clock (one edit, pattern found 1, expected 1, -2 bytes), and this case
+alone then runs:
+
+  frozen double, unmutated tree                       3 passed
+  frozen double  + `duration=0.0`                     3 passed  <- BLIND
+  stepping double + `duration=0.0`                    3 failed  <- the fix
+
+Both files restored byte-identically afterwards. `_SteppingClock`'s docstring
+records why per-read stepping was rejected in turn, which is the other double
+this case could have reached for and the other way it could have gone wrong.
 """
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock
@@ -106,6 +163,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lexora.api import routes
 from lexora.api.routes import (
     get_backend,
     get_backend_router,
@@ -151,10 +209,54 @@ COMPLETION_TOKENS = 42
 # recorded number therefore sits up to two ticks above the interval it
 # measures, so a one-tick bound cannot hold against anything.
 #
-# Widening to two ticks would be a number picked to fit the failure. `duration`
-# is fenced below by comparison instead -- a delayed call against an undelayed
-# one -- which rests on no resolution premise and additionally catches the one
-# thing a bracket cannot: a constant inside the band.
+# Widening to two ticks would be a number picked to fit the failure. That half
+# of the decision stands. What replaced the bracket did not.
+#
+# THIS PARAGRAPH USED TO SAY that `duration` is "fenced below by comparison
+# instead -- a delayed call against an undelayed one -- which rests on no
+# resolution premise". The comparison shipped and the claim was false, in the
+# way the sentence itself hid: `assert slow > fast` reads the clock in TWO
+# DISJOINT INTERVALS, so what it rests on is not a resolution premise but a
+# SCHEDULING one -- "no pause of at least 0.05 s lands inside the second
+# interval". That is a bound on the execution environment, and it was measured
+# nowhere. Denominating the margin in ticks of a 15..16 ms clock is precisely
+# what made a scheduling question read as a resolution question, which is how
+# an unmeasured platform premise passed review here.
+#
+# It failed. `origin/develop` `21637ea`, CI red twice on `[completions]`:
+# `assert 0.051075674 > 0.069269409` and `assert 0.050877193 > 0.053628683`.
+# It is NOT a property of the CI platform. Holding the platform fixed and
+# rebinding `monotonic` to `perf_counter`, the UNDELAYED call costs 0.0003 s
+# over 42 pairs per route with 0 inversions -- a finer clock reveals a SMALLER
+# reading, not a larger one, so "the fine Linux clock exposes the real cost of
+# the undelayed call" is refuted rather than untested. What does invert it is
+# a pause inside the measured window: injecting one on win32 gives PASS at
+# 30 ms, PASS by 4.9 ms at 55 ms, and FAIL at 70 ms with
+# `slow=0.047608 / fast=0.070551` -- the same shape and the same magnitudes as
+# the two CI samples, which straddle that boundary. What produced the pause on
+# the runner was not identified, and is deliberately not named here: the fix
+# does not need the cause, because it removes the premise the cause acts on.
+#
+# The premise is therefore REMOVED and not tuned. `duration` is fenced below by
+# `test_duration_is_the_handlers_own_interval_and_not_a_constant`, which
+# installs a stepping clock double and asserts EQUALITY against the double's
+# own script. That is an identity over
+# `duration = routes.time.monotonic() - start_time` with both reads taken from
+# the double, so it rests on nothing about resolution, platform, scheduling or
+# load, and two different scripted advances are what kill a constant INSIDE a
+# plausible band -- no single constant satisfies both.
+#
+# WHAT THAT FENCE DOES NOT BUY, written here rather than left to be discovered
+# from a green run: it cannot show the handler reads a REAL clock. Under a
+# scripted double every reading is scripted, by construction. That half is
+# already held, by identity and not by margin, in `test_ledger_coverage.py` --
+# `test_route_records_exactly_one_row`'s `backend_delta <= duration <= wall`,
+# whose ends are read through `read_outer_clock` off the handler's own clock,
+# and `test_the_lower_end_is_read_off_the_handlers_own_clock`'s frozen-clock
+# provenance fence -- with the premises of both guarded by
+# `test_interval_clock.py`. THE TWO TOGETHER ARE WHAT `assert slow > fast` WAS
+# TRYING TO BUY IN ONE MOVE, and the premise is what one move cost. No single
+# assertion buys both.
 #
 # Two corrections to the paragraphs above, neither of which changes the
 # decision they record.
@@ -175,6 +277,13 @@ COMPLETION_TOKENS = 42
 # load the step reaches 31 and 32 ms, not merely 15 or 16. A measurement that
 # falsifies another file's premise is not filed by writing it down next to the
 # code that already worked around it.
+#
+# F-4, checked rather than assumed. After the replacement above, `SLOW`'s only
+# remaining reader is `test_streamed_request_records_exactly_one_row`, which
+# holds the stream open so that `duration` is a real interval for the type and
+# sign assertion rather than a tick of zero. It is KEPT for that one reader,
+# and this sentence is the reason it was not deleted: a constant whose last
+# reader goes away is exactly what `DURATION_SLACK` was.
 SLOW = 0.05
 
 # One well-formed OpenAI SSE chunk. `/v1/chat/completions` and `/v1/completions`
@@ -224,6 +333,94 @@ ROUTES = [
 ]
 ROUTE_IDS = ["chat_completions", "completions", "messages"]
 
+# The two scripted advances the stepping double below is driven with. They are
+# not durations of anything: no call in this file takes four or eight seconds,
+# and that is the point -- a value the machine could not have produced is the
+# cleanest possible evidence that the recorded number came off the clock the
+# handler was given.
+#
+# TWO of them, not one, and DIFFERENT. One advance is satisfied by the constant
+# equal to it, which is the failure mode `SLOW` above records against a bracket
+# ("a constant inside the band"). No single constant satisfies both.
+#
+# Neither equals any constant in this tree, checked and not assumed: not `0.0`,
+# not `SLOW`, not `SLOW` plus or minus a tick, and `grep -rn -- 4.75 src tests`
+# = 0 and `grep -rn -- 8.25 src tests` = 0 at `21637ea`. Both are exactly
+# representable in binary floating point, so the literal here and the double's
+# reading are the same value and `==` needs no tolerance to be honest.
+ADVANCE_A = 4.75
+ADVANCE_B = 8.25
+
+
+class _SteppingClock:
+    """A stand-in for the `time` module whose `monotonic()` steps ONCE, on cue.
+
+    THE FIFTH CLOCK DOUBLE IN THIS SUITE, and the second outside
+    `test_interval_clock.py` -- whose inventory comment and
+    `test_ledger_coverage.py`'s `_FrozenClock` docstring are the other two ends
+    of that register and were corrected in the same commit that added this.
+
+    **Only `monotonic()` is faked**, and `__getattr__` delegates the rest, in
+    the same shape as `_BackwardsWallClock`, `_TickSkippingClock` and
+    `_ClockAttributeRecorder` in `test_interval_clock.py` and `_FrozenClock` in
+    `test_ledger_coverage.py`.
+
+    WHY STEPPING AND NOT FROZEN, stated first because reaching for the nearest
+    existing double is the trap here. `_FrozenClock` makes the handler's
+    interval `0.0` by construction, and `0.0` is indistinguishable from the
+    `duration=0.0` constant the case below exists to reject -- so a frozen
+    double produces a case that the very mutation it targets passes GREEN.
+    Measured, not predicted, and measured BEFORE this class was written: the
+    TRAP paragraph at the end of this module's docstring carries the reading,
+    and the `duration=0.0` row above it carries the 3 red this double gets
+    where a frozen one would get 0.
+
+    READ-COUNT INVARIANT, which is the property `_FrozenClock`'s docstring
+    argues for and the reason this does not advance per read. `monotonic()`
+    returns `self._reading`; `step()` ASSIGNS rather than accumulates. Every
+    read before the cue returns `0.0` and every read after returns `advance`,
+    no matter how many reads there are and no matter how many times the cue
+    fires. A double that moved per read would make this case's verdict depend
+    on how often `routes.py` happens to call `time.monotonic()`, i.e. on an
+    implementation detail of the code under test.
+
+    EXACT, and not merely close. The base reading is `0.0`, so the handler's
+    `time.monotonic() - start_time` is `advance - 0.0`, which is `advance`
+    itself in IEEE 754 with no rounding to absorb. That is why the assertion
+    below can be `==` with no tolerance rather than a bracket, and a bracket is
+    the shape that needed a premise.
+
+    The cue is pulled by the backend double (`_backend(clock=...)`) rather than
+    by counting reads, for `_TickSkippingClock`'s reason: it then lands
+    strictly between the handler's two endpoints -- `start_time` is read before
+    the response is consumed, the generator body runs after it, and the ledger
+    row's `duration` is computed in the `finally` after that.
+
+    ONE INSTANCE PER REQUEST. The step is one-way, so a second request served
+    by the same instance reads `advance` at BOTH of its endpoints and records
+    `0.0`. Measured out of tree rather than reasoned about: reusing one
+    instance gives `duration=4.75` then `duration=0.0`, `steps` 1 then 2. The
+    case below builds a fresh one per (route, advance) pair, which is what
+    makes the `>= 1` step guard sufficient; a reset knob is deliberately not
+    offered, because an instance that can be rewound is one a future case can
+    silently reuse into the `0.0` above.
+    """
+
+    def __init__(self, advance: float) -> None:
+        self._advance = advance
+        self._reading = 0.0
+        self.steps = 0
+
+    def step(self) -> None:
+        self._reading = self._advance
+        self.steps += 1
+
+    def monotonic(self) -> float:
+        return self._reading
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
 
 def _backend(
     *,
@@ -231,6 +428,7 @@ def _backend(
     passthrough: bool = False,
     delay: float = 0.0,
     raise_after_first_chunk: bool = False,
+    clock: _SteppingClock | None = None,
 ) -> MagicMock:
     """A backend whose streams optionally fill the sink they are handed.
 
@@ -246,10 +444,19 @@ def _backend(
     *required* the argument would red on `TypeError` rather than on the
     assertion, and a `TypeError` red says nothing about whether a row was
     opened.
+
+    `clock` is the cue for `_SteppingClock`. The generator's body runs only
+    once the response is consumed, which is after the handler read
+    `start_time` and before its `finally` computes `duration`, so stepping
+    from in here lands the advance strictly inside the interval being
+    measured -- without the double having to count the handler's reads. See
+    `_SteppingClock` for why that independence is the point.
     """
 
     def _factory(_request: dict, usage_sink: Any = None) -> AsyncIterator[bytes]:
         async def gen() -> AsyncIterator[bytes]:
+            if clock is not None:
+                clock.step()
             if delay:
                 await asyncio.sleep(delay)
             yield CHUNK
@@ -319,42 +526,73 @@ class TestStreamingRoutesOpenARow:
         assert kwargs["user_id"] == USER_ID
         # Type and sign only. The magnitude is not asserted here -- see `SLOW`
         # for why a bracket cannot be honestly written against this clock --
-        # and is fenced instead by
-        # `test_duration_tracks_the_call_and_not_a_constant`. A negative
-        # duration needs no clock premise to reject, so it is rejected here.
+        # and is fenced instead by `test_duration_is_the_handlers_own_interval
+        # _and_not_a_constant`. A negative duration needs no clock premise to
+        # reject, so it is rejected here.
         assert isinstance(kwargs["duration"], float)
         assert kwargs["duration"] >= 0.0
 
     @pytest.mark.parametrize(("endpoint", "body"), ROUTES, ids=ROUTE_IDS)
-    def test_duration_tracks_the_call_and_not_a_constant(
-        self, endpoint: str, body: dict
+    def test_duration_is_the_handlers_own_interval_and_not_a_constant(
+        self, endpoint: str, body: dict, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The same route twice: backend held open for `SLOW`, then not at all.
+        """The same route twice, under a clock whose step this test writes.
 
-        The recorded numbers must differ in the right direction. That is a
-        statement about *provenance* -- the value came from timing this call --
-        and it needs nothing to be true about the clock's resolution, only that
-        a longer call does not read shorter. Every constant fails it, including
-        one inside a plausible band, which is the case a bracket cannot reach.
+        `routes.time` is replaced by `_SteppingClock`, which reads `0.0` until
+        the backend double pulls its cue and `advance` from then on. The
+        handler computes `duration = time.monotonic() - start_time` with BOTH
+        reads off that double, and the cue lands strictly between them, so the
+        recorded number IS the scripted advance -- an identity, asserted with
+        `==` and no tolerance.
 
-        The separation is wide, and measured rather than assumed: over 30 pairs
-        per route on this runner the delayed call recorded 0.047..0.078 and the
-        undelayed one 0.000 (0.000..0.016 on `/v1/messages`), a minimum margin
-        of 0.046 -- about three ticks of a clock that steps 15..16 ms -- with
-        0 inversions in 90 pairs. Repeating a run is not evidence about an
-        assertion that reads a clock (that is this project's own hard-won
-        lesson), so what carries this is the margin, not the repetitions: the
-        two populations are separated by three quanta of the only clock
-        involved.
+        Driven with TWO different advances. One would be satisfied by the
+        constant equal to it; the pair cannot be, which is the case a bracket
+        cannot reach and the reason `ADVANCE_A != ADVANCE_B`.
+
+        WHAT THIS REPLACED, and why the replacement is not a tuning. This case
+        used to be `test_duration_tracks_the_call_and_not_a_constant`: two
+        calls, one delayed by `SLOW` and one not, `assert slow > fast`. Those
+        are two DISJOINT wall-clock intervals, so the assertion's real premise
+        was "no pause of at least `SLOW` lands inside the second one" -- a
+        bound on the execution environment that was never measured. It turned
+        `develop` red at `21637ea`. The premise is gone here rather than
+        loosened: no resolution, platform, scheduling or load property has to
+        hold for an identity over a scripted double.
+
+        WHAT THIS DOES NOT BUY. It cannot show the handler reads a real clock;
+        under a scripted double every reading is scripted. `SLOW`'s comment
+        above carries the full statement and names the two cases in
+        `test_ledger_coverage.py` that hold that half by identity. The two
+        together are what `assert slow > fast` was trying to buy in one move.
         """
-        slow_tracker = MagicMock()
-        _client(_backend(delay=SLOW), slow_tracker).post(endpoint, json=body)
-        fast_tracker = MagicMock()
-        _client(_backend(delay=0.0), fast_tracker).post(endpoint, json=body)
+        recorded = []
+        for advance in (ADVANCE_A, ADVANCE_B):
+            clock = _SteppingClock(advance)
+            monkeypatch.setattr(routes, "time", clock)
+            tracker = MagicMock()
+            response = _client(_backend(clock=clock), tracker).post(
+                endpoint, json=body
+            )
 
-        slow = slow_tracker.record.call_args.kwargs["duration"]
-        fast = fast_tracker.record.call_args.kwargs["duration"]
-        assert slow > fast
+            assert response.status_code == 200
+            # Vacuity guard, first, so a double that never fired reds with the
+            # diagnosis that names it rather than as a bare `0.0 != 4.75`.
+            # `>= 1` and not `== 1` on purpose: `step()` assigns, so the
+            # reading is invariant under repeats, and pinning the count would
+            # make this case depend on how many times `routes.py` builds the
+            # stream -- the read-count coupling `_SteppingClock` exists to
+            # avoid.
+            assert clock.steps >= 1, (
+                f"the clock double never stepped for {endpoint} -- the "
+                f"advance asserted below was never placed inside the "
+                f"handler's interval"
+            )
+            assert tracker.record.call_count == 1
+            recorded.append(tracker.record.call_args.kwargs["duration"])
+
+        # Exact, both of them, in one assertion so the failure message carries
+        # the pair rather than only the first half of it.
+        assert recorded == [ADVANCE_A, ADVANCE_B]
 
 
 class TestThePassthroughBranchIsWiredToo:

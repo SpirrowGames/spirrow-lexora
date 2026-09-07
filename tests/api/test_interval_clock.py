@@ -211,9 +211,22 @@ class _ClockAttributeRecorder:
 # fence gets orphaned, not an aesthetic complaint about it. Twice in one
 # thread is enough.
 #
+# NOR IS THE FIFTH. `_SteppingClock` lives in `test_streaming_ledger_row.py`,
+# next to `TestStreamingRoutesOpenARow::test_duration_is_the_handlers_own
+# _interval_and_not_a_constant` -- the only thing that installs it -- by the
+# same rule and for the same reason. It fakes `monotonic()` by reading `0.0`
+# until the backend double pulls its cue and the scripted advance from then
+# on, which is what lets that case assert the recorded `duration` by EQUALITY
+# rather than by a comparison carrying an unmeasured premise about the machine.
+# `_FrozenClock` was deliberately NOT reused for it: a frozen double makes the
+# handler's interval `0.0`, which is the value produced by the very mutation
+# that case exists to reject.
+#
 # The cost of the rule is this comment: the double family is no longer
 # readable in one place. Paid explicitly, because a stale pointer is a cheap
-# failure and an orphaned fence is not.
+# failure and an orphaned fence is not. This register IS that payment, so it
+# is kept complete: a sixth double belongs in this list on the day it is
+# written.
 
 
 class _RecordingMetrics(MetricsCollector):
