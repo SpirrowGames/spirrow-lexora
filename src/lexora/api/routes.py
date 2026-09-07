@@ -240,7 +240,7 @@ def get_task_classifier(request: Request) -> TaskClassifier | None:
 def get_cost_tracker(request: Request) -> CostTracker | None:
     """Get cost tracker from app state.
 
-    Ledger coverage, measured 2026-09-07 at `c8a97dc`. Every row in
+    Ledger coverage, measured 2026-09-07 at `d8b9698`. Every row in
     `request_costs` is written through this dependency, so the table below is
     what `/stats/costs` and `/stats/costs/recent` are summing over.
 
@@ -260,8 +260,10 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
         backend             fills the sink   why
         anthropic           yes              already parses `message_start`
                                              and `message_delta`
-        claude_code         not yet          has the count; PR-B
-        gemini              not yet          has the count; PR-B
+        claude_code         yes              the CLI's `result` event, read
+                                             with `_tokens_from_result`
+        gemini              yes              `usageMetadata` on the events it
+                                             already decodes
         openai_compatible   no               relays bytes verbatim, and the
         vllm                no               number is not in those bytes
 
@@ -288,11 +290,20 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
     SSE frames mid-relay. Only two of the five backends relay. The other three
     parse the upstream themselves and build the OpenAI frames out of dicts
     they have already decoded, so in those the count is a live Python object
-    one scope from the `yield` -- there was no parser to place. Each backend
-    now fills a per-request `UsageSink` (`backends/base.py`) with what it
+    one scope from the `yield` -- there was no parser to place. Each of those
+    three fills a per-request `UsageSink` (`backends/base.py`) with what it
     already holds, and each `stream_generator` opens the row from that sink in
     a `finally`, so every terminal exit is covered without the router learning
     a single upstream format.
+
+    On 2026-09-07 that sentence said "each backend" while this table's own
+    `claude_code` and `gemini` cells four lines above read "not yet": the
+    prose described the design and the table described the tree, and they were
+    two paragraphs apart in one docstring. `anthropic` was wired first
+    deliberately (its count is split across two events, the hardest shape),
+    the other two followed here, and the sentence is now scoped to the three
+    it is true of. The relay pair is not among them and no wording should
+    imply otherwise.
     """
     return getattr(request.app.state, "cost_tracker", None)
 
