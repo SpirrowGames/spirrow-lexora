@@ -34,7 +34,7 @@ from lexora.api.models import (
     ModelCapabilityInfo,
     StatsResponse,
 )
-from lexora.backends.base import BackendError, BackendUpstreamError
+from lexora.backends.base import BackendError, BackendUpstreamError, UsageSink
 from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
 from lexora.services.metrics import MetricsCollector
@@ -240,17 +240,41 @@ def get_task_classifier(request: Request) -> TaskClassifier | None:
 def get_cost_tracker(request: Request) -> CostTracker | None:
     """Get cost tracker from app state.
 
-    Ledger coverage, measured 2026-09-06 at `05f6827`. Every row in
+    Ledger coverage, measured 2026-09-07 at `d8b9698`. Every row in
     `request_costs` is written through this dependency, so the table below is
-    what `/stats/costs` and `/stats/costs/recent` are summing over:
+    what `/stats/costs` and `/stats/costs/recent` are summing over.
+
+    The streaming column is per-backend and conditional, so it says *when* a
+    row appears rather than whether one does. `if filled` means the routed
+    backend wrote a count into the request's `UsageSink`, judged by the same
+    `tokens_input > 0 or tokens_output > 0` guard the non-streaming sites use.
 
         endpoint               non-streaming     streaming
-        /v1/chat/completions   records a row     no row
-        /v1/completions        records a row     no row
+        /v1/chat/completions   records a row     records a row if filled
+        /v1/completions        records a row     records a row if filled
         /v1/embeddings         records a row     (no streaming form)
         /generate              records a row     (no streaming form)
         /chat                  records a row     (no streaming form)
-        /v1/messages           records a row     no row
+        /v1/messages           records a row     records a row if filled
+
+        backend             fills the sink   why
+        anthropic           yes              already parses `message_start`
+                                             and `message_delta`
+        claude_code         yes              the CLI's `result` event, read
+                                             with `_tokens_from_result`
+        gemini              yes              `usageMetadata` on the events it
+                                             already decodes
+        openai_compatible   no               relays bytes verbatim, and the
+        vllm                no               number is not in those bytes
+
+    Two cases therefore still open no row: a stream through either relay
+    backend, and a stream the client cuts before the upstream's final frame
+    (usage arrives in that frame). Both mean "no count was observed", never
+    "the request was free" -- nothing here estimates. The only route to a
+    number for the relay backends is `stream_options.include_usage` upstream,
+    which appears nowhere in this tree; asking for it changes what a
+    third-party upstream is sent and, the relay being verbatim, what our own
+    clients receive, so it is a decision of its own and is not taken here.
 
     Until 2026-09-06 the four middle non-streaming cells read "no row" too.
     Those handlers computed `tokens_input` / `tokens_output` for the stats
@@ -261,12 +285,25 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
     added coverage, not double counting -- the two pre-existing call sites are
     untouched and no past row was rewritten.
 
-    The three streaming paths still open no row, and that one *is* a decision.
-    Each `stream_generator` relays the bytes `backend.*_stream` yields without
-    decoding them, in both the passthrough and non-passthrough branches, so a
-    token count there would have to come from reading SSE frames mid-relay.
-    Where that parsing belongs is left open here, and written down rather than
-    left as a silent asymmetry.
+    Until 2026-09-07 the three streaming cells read "no row" too, over a
+    reason that was wrong: that a count there would have to come from reading
+    SSE frames mid-relay. Only two of the five backends relay. The other three
+    parse the upstream themselves and build the OpenAI frames out of dicts
+    they have already decoded, so in those the count is a live Python object
+    one scope from the `yield` -- there was no parser to place. Each of those
+    three fills a per-request `UsageSink` (`backends/base.py`) with what it
+    already holds, and each `stream_generator` opens the row from that sink in
+    a `finally`, so every terminal exit is covered without the router learning
+    a single upstream format.
+
+    On 2026-09-07 that sentence said "each backend" while this table's own
+    `claude_code` and `gemini` cells four lines above read "not yet": the
+    prose described the design and the table described the tree, and they were
+    two paragraphs apart in one docstring. `anthropic` was wired first
+    deliberately (its count is split across two events, the hardest shape),
+    the other two followed here, and the sentence is now scoped to the three
+    it is true of. The relay pair is not among them and no wording should
+    imply otherwise.
     """
     return getattr(request.app.state, "cost_tracker", None)
 
@@ -365,6 +402,17 @@ async def chat_completions(
         if metrics_collector:
             metrics_collector.record_request_start(endpoint)
 
+        # The ledger's carrier for this request, and the reason it is a local
+        # rather than an attribute on `backend`: backend instances are built
+        # once by `BackendRouter.__init__` and held on `app.state`, so one
+        # instance serves every concurrent request through it. A count parked
+        # on the instance would be overwritten by whichever overlapping stream
+        # finished last -- the same shape as R-13's `user_id` defect, a number
+        # landing on the wrong bill. A local passed into the call cannot be
+        # shared by construction. Backends that do not fill it leave it at
+        # zero, and the guard below then opens no row.
+        usage_sink = UsageSink()
+
         # Pre-flight the first chunk for passthrough backends so an upstream
         # refusal / auth failure surfaces as a proper HTTP status code
         # (matching /v1/messages, routes.py in the anthropic-compat path)
@@ -375,7 +423,9 @@ async def chat_completions(
         byte_iter = None
         passthrough = getattr(backend, "error_passthrough", False)
         if passthrough:
-            byte_iter = backend.chat_completions_stream(request_dict).__aiter__()
+            byte_iter = backend.chat_completions_stream(
+                request_dict, usage_sink=usage_sink
+            ).__aiter__()
             try:
                 first_chunk = await byte_iter.__anext__()
             except StopAsyncIteration:
@@ -454,7 +504,9 @@ async def chat_completions(
                     async for chunk in byte_iter:
                         yield chunk
                 else:
-                    async for chunk in backend.chat_completions_stream(request_dict):
+                    async for chunk in backend.chat_completions_stream(
+                        request_dict, usage_sink=usage_sink
+                    ):
                         yield chunk
 
                 # Mark as successful on stream completion
@@ -547,6 +599,46 @@ async def chat_completions(
                     error_type=type(e).__name__,
                 )
                 raise
+            # ★ `finally`, not a fifth `except`. The row is owed at EVERY
+            # terminal exit of the relay -- success, `BackendError`,
+            # `Exception`, and the `BaseException` a mid-stream disconnect
+            # arrives as -- and one `finally` covers all four by construction,
+            # where four copies would have to be kept in step by hand and the
+            # next clause anyone adds would silently miss the ledger. It runs
+            # once per generator, so it cannot double-count, and
+            # `CostTracker.record` swallows its own exceptions, so accounting
+            # cannot turn a delivered stream into a 500. Inside the generator
+            # and not after the `return StreamingResponse(...)` below, because
+            # that `return` happens before a single byte is sent.
+            #
+            # Guard: the same predicate the six non-streaming sites use. A
+            # backend that filled nothing leaves the sink at zero and no row is
+            # opened -- which is why the two verbatim-relay backends need no
+            # special case, and why an early disconnect usually bills nothing
+            # (usage arrives in the upstream's final frame). A known limit,
+            # stated: bill what was observed, never estimate. The metrics side
+            # of a disconnect is a different collector --
+            # `tests/api/test_stream_disconnect_accounting.py`.
+            finally:
+                if cost_tracker and (
+                    usage_sink.prompt_tokens > 0 or usage_sink.completion_tokens > 0
+                ):
+                    cost_tracker.record(
+                        model=resolved_model,
+                        endpoint=endpoint,
+                        tokens_input=usage_sink.prompt_tokens,
+                        tokens_output=usage_sink.completion_tokens,
+                        backend=backend_router.get_backend_name_for_model(
+                            request.model
+                        ),
+                        user_id=request.user,
+                        duration=time.monotonic() - start_time,
+                        tier=(
+                            request.model
+                            if backend_router.is_tier(request.model)
+                            else None
+                        ),
+                    )
 
         return StreamingResponse(
             stream_generator(),
@@ -767,6 +859,10 @@ async def completions(
         if metrics_collector:
             metrics_collector.record_request_start(endpoint)
 
+        # Per-request, never on the backend instance. See the comment on the
+        # same line in `chat_completions` above.
+        usage_sink = UsageSink()
+
         # D-4′: mirror the /v1/chat/completions streaming pre-flight for
         # passthrough backends so a refusal / auth failure yields the real
         # HTTP status instead of a 200 SSE that closes with an error frame.
@@ -774,7 +870,9 @@ async def completions(
         byte_iter = None
         passthrough = getattr(backend, "error_passthrough", False)
         if passthrough:
-            byte_iter = backend.completions_stream(request_dict).__aiter__()
+            byte_iter = backend.completions_stream(
+                request_dict, usage_sink=usage_sink
+            ).__aiter__()
             try:
                 first_chunk = await byte_iter.__anext__()
             except StopAsyncIteration:
@@ -853,7 +951,9 @@ async def completions(
                     async for chunk in byte_iter:
                         yield chunk
                 else:
-                    async for chunk in backend.completions_stream(request_dict):
+                    async for chunk in backend.completions_stream(
+                        request_dict, usage_sink=usage_sink
+                    ):
                         yield chunk
 
                 # Mark as successful on stream completion
@@ -937,6 +1037,30 @@ async def completions(
                     error_type=type(e).__name__,
                 )
                 raise
+            # ★ `finally`, not a fifth `except`: the ledger half of the same
+            # every-exit rule. See the identical clause in `chat_completions`
+            # above for why it is a `finally`, why it is inside the generator
+            # rather than after the `return`, and what the guard's zero means.
+            finally:
+                if cost_tracker and (
+                    usage_sink.prompt_tokens > 0 or usage_sink.completion_tokens > 0
+                ):
+                    cost_tracker.record(
+                        model=resolved_model,
+                        endpoint=endpoint,
+                        tokens_input=usage_sink.prompt_tokens,
+                        tokens_output=usage_sink.completion_tokens,
+                        backend=backend_router.get_backend_name_for_model(
+                            request.model
+                        ),
+                        user_id=request.user,
+                        duration=time.monotonic() - start_time,
+                        tier=(
+                            request.model
+                            if backend_router.is_tier(request.model)
+                            else None
+                        ),
+                    )
 
         return StreamingResponse(
             stream_generator(),
@@ -1904,7 +2028,13 @@ async def messages(
             metrics_collector.record_request_start(endpoint)
         start_time = time.monotonic()
 
-        byte_iter = backend.chat_completions_stream(openai_request).__aiter__()
+        # Per-request, never on the backend instance. See the comment on the
+        # same line in `chat_completions` above.
+        usage_sink = UsageSink()
+
+        byte_iter = backend.chat_completions_stream(
+            openai_request, usage_sink=usage_sink
+        ).__aiter__()
         try:
             first_chunk = await byte_iter.__anext__()
         except StopAsyncIteration:
@@ -2054,6 +2184,38 @@ async def messages(
                     error_type=type(e).__name__,
                 )
                 raise
+            # ★ `finally`, not a third `except`: the ledger half of the same
+            # every-exit rule. See the identical clause in `chat_completions`
+            # above. `user_id` comes from `extract_user_id`, matching this
+            # endpoint's own non-streaming record site rather than the
+            # OpenAI-family `request.user`.
+            #
+            # The sink is filled by the OpenAI-format backend stream, upstream
+            # of `anthropic_stream_from_openai`. It is NOT read back out of the
+            # Anthropic events this endpoint emits: those carry
+            # `usage: {input_tokens: 0, output_tokens: 0}` by construction
+            # (`anthropic_compat.py`), which is a separate, already-recorded
+            # gap and not a source of truth for billing.
+            finally:
+                if cost_tracker and (
+                    usage_sink.prompt_tokens > 0 or usage_sink.completion_tokens > 0
+                ):
+                    cost_tracker.record(
+                        model=resolved_model,
+                        endpoint=endpoint,
+                        tokens_input=usage_sink.prompt_tokens,
+                        tokens_output=usage_sink.completion_tokens,
+                        backend=backend_router.get_backend_name_for_model(
+                            request.model
+                        ),
+                        user_id=user_id,
+                        duration=time.monotonic() - start_time,
+                        tier=(
+                            request.model
+                            if backend_router.is_tier(request.model)
+                            else None
+                        ),
+                    )
 
         return StreamingResponse(
             stream_generator(),

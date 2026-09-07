@@ -18,10 +18,14 @@ the reason. None carried a comment explaining the omission, and none even took
 `cost_tracker` as a dependency. `/stats/costs` and `/stats/costs/recent` served
 the sum of the two recorded routes without saying so anywhere.
 
-Still not covered after this file, deliberately: the three streaming paths
-(`stream_generator` at `00eafd5`'s `routes.py:428` / `:812` / `:1883`), which
-relay the bytes `backend.*_stream` yields without decoding them. See
-`get_cost_tracker`'s docstring.
+Not covered after this file: the three streaming paths (`stream_generator` at
+`00eafd5`'s `routes.py:428` / `:812` / `:1883`). That was recorded here as
+deliberate, over a reason that turned out to be false -- that those handlers
+relay the bytes `backend.*_stream` yields without decoding them, so a count
+would have to be parsed back out mid-relay. Only two of the five backends
+relay. The gap is closed by T-streaming-ledger-row and its detectors live in
+`test_streaming_ledger_row.py`; the four routes below are unaffected and this
+file is still only about them.
 
 Why these detectors drive the routes instead of calling a helper: R-11 shipped
 five green unit detectors over the token parser while the ledger itself stayed
@@ -84,6 +88,12 @@ assertion that reads a clock, and neither the gate nor CI can supply that
 evidence, because each runs the suite exactly once. This is the timing form of
 R-11's lesson -- there, a fence existed without working; here, a fence worked
 without staying working.
+
+What that episode owes to `T-unchecked-comment-claims` is stated here because
+this is the file that keeps wanting to break it. A rate offered as a property
+of the tree is inadmissible however carefully it was measured -- three ten-run
+measurements of one unchanged tree came back 10, 9 and 7, which is not error
+bars but the absence of a quantity to measure.
 """
 
 import asyncio
@@ -97,6 +107,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lexora.api import routes
 from lexora.api.routes import (
     get_backend,
     get_backend_router,
@@ -127,59 +138,167 @@ USER_ID = "user-42"
 
 # Real seconds each backend call is made to take, so `duration` has something
 # to measure. Without it every one of the four routes records exactly 0.0
-# (measured on this runner: `time.get_clock_info("time").resolution` is
+# (measured on this runner: `time.get_clock_info("monotonic").resolution` is
 # 15.625 ms and the handler finishes inside one tick), and asserting
 # "duration > 0" would be asserting the clock rather than the column. With
 # the delay the recorded value was 0.0528..0.0597 across the four routes.
 SLOW = 0.05
 
-# The tolerance the bracket on `duration` needs, and why it is this.
+# The duration bracket below is
 #
-# `routes.py` measures `duration` with `time.monotonic()` at every record
-# site. A difference of two readings off a clock quantised to
-# `tick` differs from the true interval by strictly less than `tick` in either
-# direction, so a recorded value can overshoot the interval it measures. On
-# this runner `time.time()` and `time.monotonic()` BOTH report a resolution of
-# 15.625 ms, which is why bracketing the handler's delta between
-# `time.monotonic()` deltas did not hold: measured bare, 300 samples over a
-# 50 ms sleep put the inner value above the outer one 234 times (78%), median
-# +3.3 ms, max +4.9 ms. That bracket survived only on the few ms of slack the
-# TestClient round trip adds outside the handler's own window, and lost the
-# toss often -- the four detectors below red 10 runs in 15 on an unmodified
-# tree.
+#     SLOW - DURATION_SLACK  <=  duration  <=  wall
 #
-# `wall` is therefore read off `time.perf_counter()` (resolution 1e-07 here),
-# which makes it the true elapsed of an interval that strictly contains the
-# handler's, leaving the inner clock's own quantum as the only error term.
-# Hence one tick of the handler's clock at each end, with a floor (below):
-# since the backend is held open for `SLOW` inside a window the outer reading
-# strictly contains,
+# and its two ends are not symmetric. The upper end carries no tolerance and
+# is exact. The lower end carries one and is not. Both halves of that are
+# written out here, because the shape this replaced looked more careful than
+# the shape that replaced it and was wrong anyway.
 #
-#     SLOW - slack  <  duration  <  wall + slack
+# `routes.py` measures `duration` with `time.monotonic()` at every record site
+# -- 46 occurrences, zero `time.time()`, zero `time.perf_counter()`, counted
+# rather than assumed.
 #
-# holds by construction rather than by luck. Moving only the outer clock would
-# not have been enough: the coarse clock is the inner one, and the test cannot
-# reach it.
+# WHY THE UPPER END CARRIES NO TOLERANCE: IT DOES NOT NEED ONE.
 #
-# The floor exists so this does not merely relocate the same mistake. Where
-# the clock is fine-grained the resolution term is ~0 (1e-09 on Linux CI),
-# which would put the bound back to exactly tight. 1 ms covers that by a wide
-# margin (500 ppm over 50 ms is 25 us) and costs no detection power: every
-# constant this bracket has to reject misses it by three orders of magnitude.
+# Until `703e545` `wall` was read off `time.perf_counter()` and the upper end
+# was `duration <= wall + DURATION_SLACK` -- one tick of the handler's clock,
+# budgeted for that clock's quantum. That bound is FALSIFIED, not merely
+# unproven at load. Measured on this runner (win32) while the full suite ran
+# in another process, i.e. under the load the failure needs:
 #
-# ★ One thing below is deliberately stale, deferred rather than missed. The
-# term is still read off `get_clock_info("time")` while the handler now reads
-# `time.monotonic()`, so it is taken from a clock the handler no longer uses;
-# and the floor's original justification -- that `time` is `adjustable`
-# (measured: True) and so may be slewed mid-window -- no longer applies to the
-# handler's clock at all. What keeps that safe is a single inequality: the
-# slack must not be finer than the tick of the clock the handler actually
-# reads. That is not asserted here on faith -- it is checked at runtime, on
-# whatever platform runs the suite, by
-# `test_interval_clock.py::test_duration_slack_still_covers_the_handlers_clock`.
-# Re-deriving the term off that clock belongs to its own change, not to the
-# one that moved the clock (see msg-131 §4 / msg-146 §4).
-DURATION_SLACK = max(time.get_clock_info("time").resolution, 0.001)
+#     reported monotonic resolution     0.015625
+#     observed monotonic steps (ms)     {15: 475, 16: 791, 31: 5, 32: 2}
+#     largest observed step             0.032         <- 2.05x the report
+#
+# `time.monotonic()` here is `GetTickCount64()`, advanced by the system timer
+# interrupt. When that interrupt is delayed the clock does not advance late,
+# it advances by TWO ticks at once, while `time.get_clock_info("monotonic")`
+# goes on reporting 0.015625 -- that field is a nominal figure, not an
+# observation. So the error of a `monotonic` delta is NOT bounded by the
+# reported resolution, and a bound that budgets one reported tick is unsound
+# by roughly a factor of two.
+#
+# It lost accordingly. Instrumented so that every run yields samples instead
+# of waiting for a rare traceback -- 8 full-suite runs, 32 samples, one red:
+#
+#     endpoint    duration              wall (perf_counter)   upper margin
+#     /generate   0.0779999999795109    0.06230009999126196   -0.0000749
+#
+# over an old-upper-margin distribution of min -0.0000749 / median +0.016530 /
+# max +0.032192. One negative in 32 samples is the one-run-in-eight full-suite
+# red that had been carried as a known flake.
+#
+# Reading `wall` off the handler's own clock removes the error term rather
+# than widening the budget for it. Let `m` be that clock. The outer window
+# strictly contains the inner one -- checked against `routes.py` and against
+# the code below, not against a comment: `started` is read before the request
+# is dispatched and `wall` after the response returns, while `start_time` and
+# `duration` are both read inside the handler. So in real time
+#
+#     t_outer_start < t_inner_start <= t_inner_end < t_outer_end
+#
+# and `m` is non-decreasing, hence
+#
+#     m(outer_start) <= m(inner_start) <= m(inner_end) <= m(outer_end)
+#     => duration = m(inner_end) - m(inner_start)
+#                <= m(outer_end) - m(outer_start) = wall
+#
+# No quantum appears anywhere in that. It holds for a clock of ANY coarseness
+# and it holds for a clock that SKIPS ticks, which is the whole point: a skip
+# moves both readings along one shared timeline, and the outer difference
+# contains the inner one term by term. Measured twice, and the two are
+# different measurements rather than one repeated:
+#
+#     on the 32 samples above, paired -- the monotonic window read strictly
+#     INSIDE the perf_counter one, the pairing that cannot flatter this bound:
+#     min +0.000000 / median +0.000000 / max +0.016000, zero negatives, and on
+#     the very sample that reddened the old bound it was exactly 0.0, `wall`
+#     and `duration` having landed on the same tick;
+#
+#     on 32 fresh samples of the shape actually shipped below, 8 more
+#     full-suite runs under load: min +0.000000 / median +0.015000 /
+#     max +0.016000, zero negatives.
+#
+# A margin of zero is the expected reading and not a near miss: this bound is
+# an identity between two readings of one coarse clock, not a tolerance that
+# happens to hold.
+#
+# Hence no slack on the upper end. Adding one to a bound that holds
+# identically only admits wrong values. What that costs and gains, measured on
+# the same samples rather than asserted: `(wall_perf + DURATION_SLACK) -
+# wall_monotonic` ran min -0.005198 / median +0.014921 / max +0.028292. The
+# new bound is typically ~15 ms tighter and is occasionally up to 5.2 ms
+# looser. It is not uniformly tighter and is not claimed to be.
+#
+# The premise the upper end DOES rest on is that both ends read one clock.
+# That is a fact about two files agreeing, which is the exact shape this suite
+# keeps finding unfenced, so it is not left to this comment:
+# `test_interval_clock.py::test_a_skipped_tick_cannot_break_the_upper_bound`
+# drives a real request through a clock that skips forward mid-request and
+# asserts both halves -- that the bound below survives it, and that the
+# superseded `perf_counter`-plus-one-tick bound is RED on the very same
+# request. It reads `read_outer_clock` from this module, so reverting the
+# outer clock reddens it deterministically instead of one run in eight.
+#
+# WHY THE LOWER END STILL CARRIES ONE, AND WHAT IT DOES NOT REST ON.
+#
+# `DURATION_SLACK` widens the LOWER end only. Its derivation is unchanged: one
+# tick of the handler's clock, with a 1 ms floor. Where the clock is
+# fine-grained the resolution term is ~0 (1e-09 on Linux CI -- measured, off
+# CI run 34053301337, not assumed), which would put that end back to exactly
+# tight; 1 ms covers it by a wide margin (500 ppm over 50 ms is 25 us) and
+# costs no detection power, every constant this bracket has to reject missing
+# it by three orders of magnitude.
+#
+# What has changed is what may be CLAIMED for it. The measurement above
+# falsifies this end's premise too: a skipped tick can make a delta under-read
+# as well as over-read, and 32 ms of skip is not covered by a 15.625 ms
+# tolerance. So the lower bound is not sound by construction either. It is
+# sound by margin, and the margin is measured rather than assumed -- on the
+# shipped shape, min +0.011625 / median +0.027625 over 32 samples, and
+# min +0.012625 / median +0.028125 over the 32 taken before the change. Never
+# within 11 ms of failing in 64 samples across both shapes.
+#
+# It is left as it is deliberately: widening a tolerance that is not failing
+# is how tolerances stop detecting. What is NOT left implicit is the residual.
+# This end still carries a clock-quantum premise, that premise is measurably
+# false on this runner, and it survives on margin rather than on the
+# derivation. The repair that would remove the premise instead of widening the
+# budget for it -- have the backend double record its own `monotonic` readings
+# around its sleep and assert `backend_delta <= duration`, exact by the same
+# nesting argument and with no constant in it at all -- changes a bound that
+# was deliberately placed out of scope for this change, so it is returned to
+# `T-duration-slack-underestimates-the-tick` rather than taken here.
+#
+# The value of the line below is fenced against edits, and against edits only,
+# by `test_interval_clock.py::
+# test_the_lower_bound_slack_keeps_its_derivation_and_its_floor`, which
+# carries the mutation table naming the platform each cell was run on. That
+# check guards this line's VALUE and never its PROVENANCE, and it cannot see
+# the falsification above -- both sides of its first conjunct read the same
+# nominal constant. That ceiling is written into its own docstring rather than
+# left for the next reader to find from a red run.
+DURATION_SLACK = max(time.get_clock_info("monotonic").resolution, 0.001)
+
+
+def read_outer_clock() -> float:
+    """Read the bracket's outer end off the handler's own clock.
+
+    `routes.time.monotonic` and not a local `time.monotonic`. The two are the
+    identical function object today, and the indirection is the point: the
+    upper bound is exact only while ONE clock reads both ends, and a local
+    reference would be value-identical while decoupling silently the day
+    `routes` changed clocks. This file has already been bitten by that exact
+    shape -- deriving `DURATION_SLACK` off `time` instead of `monotonic` was
+    value-invariant on both platforms this project runs on, and no value
+    assertion could see it.
+
+    Resolving through `routes.time` also makes the premise testable instead of
+    merely stated. `test_interval_clock.py` installs a clock that skips
+    forward into `routes.time`, and because this function resolves there the
+    skip reaches BOTH ends of the bracket, which is what a real skipped tick
+    does and what a locally-held clock reference would have hidden.
+    """
+    return routes.time.monotonic()
 
 USAGE = {"prompt_tokens": 11, "completion_tokens": 5}
 
@@ -317,9 +436,13 @@ class TestLedgerCoversEveryNonStreamingRoute:
         self, endpoint: str, body: dict, tokens_input: int, tokens_output: int
     ) -> None:
         tracker = MagicMock()
-        started = time.perf_counter()
+        # Read before the request is dispatched and after the response
+        # returns, off the handler's own clock -- see `read_outer_clock`. The
+        # containment this relies on is visible in these three lines and
+        # nowhere else, which is why they are kept adjacent.
+        started = read_outer_clock()
         response = _client(_backend(delay=SLOW), tracker).post(endpoint, json=body)
-        wall = time.perf_counter() - started
+        wall = read_outer_clock() - started
 
         assert response.status_code == 200
         assert tracker.record.call_count == 1
@@ -338,23 +461,39 @@ class TestLedgerCoversEveryNonStreamingRoute:
         # sites left 582 tests passing.
         assert kwargs["user_id"] == USER_ID
         # `duration` cannot be pinned to a number, so it is bracketed instead:
-        # at least the delay the backend was held open for, at most the wall
-        # time of the whole call measured from out here -- each end widened by
-        # the slack the handler's clock needs, which is the entire reason
-        # this is not `SLOW <= duration <= wall`. See `DURATION_SLACK`.
+        # at least the delay the backend was held open for, at most the
+        # elapsed of the whole call measured from out here. The two ends are
+        # NOT symmetric and the asymmetry is the content of
+        # `T-duration-slack-underestimates-the-tick`:
+        #
+        #   upper   `duration <= wall`                  exact, no tolerance.
+        #           One non-decreasing clock reads both ends and the outer
+        #           window contains the inner one, so it holds identically --
+        #           for a clock of any coarseness, including one that skips
+        #           ticks. Measured margin, this shape, 32 samples: min
+        #           +0.000000, median +0.015000. Zero is the expected
+        #           reading, not a near miss.
+        #   lower   `SLOW - DURATION_SLACK <= duration` tolerant, and the
+        #           tolerance rests on a premise measured FALSE on this
+        #           runner. It holds on margin (min +0.011625 over the same
+        #           32 samples), not by construction.
+        #
+        # Both are derived at `DURATION_SLACK` above; neither is re-argued
+        # here.
         #
         # What the bracket catches is a constant *outside* the band: 0.0
         # and -999.0 undershoot the lower bound, 999.0 overshoots the
-        # upper one -- each measured red at all four params. What it does
-        # not catch is a constant *inside* the band, and one always
-        # exists: `SLOW` itself clears both ends on every platform,
-        # because the lower bound is `SLOW - DURATION_SLACK` and `wall`
-        # is an outer reading of a call the backend holds open for `SLOW`
-        # (measured green at all four params). So this brackets the
-        # magnitude, not the provenance -- it says the recorded number is
-        # the right size, not that it came from a clock.
+        # upper one -- each measured red at all four params, re-measured at
+        # all four after the upper end lost its slack. What it does not catch
+        # is a constant *inside* the band, and one always exists: `SLOW`
+        # itself clears both ends on every platform, because the lower bound
+        # is `SLOW - DURATION_SLACK` and `wall` is an outer reading of a call
+        # the backend holds open for `SLOW` (measured green at all four
+        # params). So this brackets the magnitude, not the provenance -- it
+        # says the recorded number is the right size, not that it came from a
+        # clock.
         assert isinstance(kwargs["duration"], float)
-        assert SLOW - DURATION_SLACK <= kwargs["duration"] <= wall + DURATION_SLACK
+        assert SLOW - DURATION_SLACK <= kwargs["duration"] <= wall
 
 
 class TestExistingRoutesAreUnchanged:

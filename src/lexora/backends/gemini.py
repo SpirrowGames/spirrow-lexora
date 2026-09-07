@@ -41,6 +41,7 @@ from lexora.backends.base import (
     BackendRateLimitError,
     BackendTimeoutError,
     BackendUnavailableError,
+    UsageSink,
 )
 from lexora.utils.logging import get_logger
 
@@ -481,7 +482,7 @@ class GeminiBackend(Backend):
             raise BackendError(f"Gemini API request failed: {e}") from e
 
     async def chat_completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send a streaming chat completion via ``streamGenerateContent``.
 
@@ -491,6 +492,11 @@ class GeminiBackend(Backend):
 
         Args:
             request: OpenAI-compatible chat completion request.
+            usage_sink: Filled, when supplied, from the ``usageMetadata`` the
+                upstream events carry. Nothing this method yields changes --
+                the sink is written beside the existing translation, never
+                into it -- so a caller that passes None gets byte-for-byte
+                the stream it got before.
 
         Yields:
             SSE data chunks in OpenAI format.
@@ -571,6 +577,52 @@ class GeminiBackend(Backend):
                         event = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
+
+                    # The bill, read beside the translation rather than out of
+                    # it. `usageMetadata` rides the same decoded events the
+                    # text does, so the number is a live object one scope from
+                    # the `yield` and no byte this method emits changes.
+                    #
+                    # ABOVE the `candidates` check on purpose: the branch below
+                    # `continue`s on a prompt-level block, and a blocked prompt
+                    # is still a prompt that was sent and billed. Reading after
+                    # that `continue` would drop exactly the case where the
+                    # client got nothing back.
+                    #
+                    # ASSIGNED, never accumulated: `usageMetadata` is a running
+                    # total for the response so far, so summing the events
+                    # would multiply the bill on any stream that reports more
+                    # than once.
+                    #
+                    # PER FIELD, and only when the key is present: an event
+                    # that carries no `usageMetadata`, or carries only one of
+                    # the two counts, must leave the other side standing. An
+                    # unconditional `.get(key, 0)` would let a later partial
+                    # event silently zero a count that had already arrived.
+                    # That is the weakest premise this can rest on -- it holds
+                    # whether the upstream reports usage on every event or only
+                    # on the last one, which is the part of the wire shape this
+                    # repo cannot measure (no Gemini key reaches this tree; see
+                    # `tests/backends/test_gemini_stream_usage.py`).
+                    #
+                    # The field names are the same two `_to_openai_response`
+                    # reads. They are not factored into a shared helper: the
+                    # non-streaming path sees one whole response, where a
+                    # missing key genuinely means zero, so the presence check
+                    # above would be wrong there. Two different propositions,
+                    # so two reads -- and a case in that test file drives both
+                    # sites off one fixture so the names cannot drift apart.
+                    if usage_sink is not None:
+                        metadata = event.get("usageMetadata")
+                        if isinstance(metadata, dict):
+                            if "promptTokenCount" in metadata:
+                                usage_sink.prompt_tokens = int(
+                                    metadata.get("promptTokenCount") or 0
+                                )
+                            if "candidatesTokenCount" in metadata:
+                                usage_sink.completion_tokens = int(
+                                    metadata.get("candidatesTokenCount") or 0
+                                )
 
                     candidates = event.get("candidates", [])
                     if not candidates:
@@ -666,7 +718,7 @@ class GeminiBackend(Backend):
         )
 
     async def completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Not supported: the naysayer surface is chat-only."""
         raise GeminiGovernanceError(

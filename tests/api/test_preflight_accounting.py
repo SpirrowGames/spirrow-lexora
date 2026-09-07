@@ -24,6 +24,7 @@ metrics へ登録する。PR-B が新設した passthrough の pre-flight は
 import asyncio
 import concurrent.futures
 from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -72,7 +73,12 @@ def _raising_stream(exc: BaseException):
     `Exception` hierarchy.
     """
 
-    def factory(_request: dict) -> AsyncIterator[bytes]:
+    # `usage_sink` is accepted and ignored: the handlers now hand every
+    # streaming call a per-request `UsageSink` (T-streaming-ledger-row
+    # PR-A), and a double that refused it would fail on `TypeError`
+    # before reaching the behaviour under test here. Ignored, not
+    # filled, because nothing in this file is about the ledger.
+    def factory(_request: dict, usage_sink: Any = None) -> AsyncIterator[bytes]:
         async def gen() -> AsyncIterator[bytes]:
             raise exc
             yield b""  # pragma: no cover - unreachable, makes this a generator

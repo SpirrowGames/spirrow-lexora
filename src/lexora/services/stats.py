@@ -7,7 +7,20 @@ from typing import Any
 
 @dataclass
 class RequestStats:
-    """Statistics for a single request."""
+    """Statistics for a single request.
+
+    `start_time` and `end_time` are readings off `time.monotonic()`. Only
+    their *difference* carries meaning: the reference point of that clock is
+    undefined, so neither field is a timestamp and neither may be serialised,
+    rendered as a date, or compared against a wall-clock value.
+
+    They are deliberately not `time.time()`. That clock is adjustable
+    (`time.get_clock_info("time").adjustable` is True), so an NTP step
+    backwards between the two readings makes `duration` negative -- and
+    `StatsCollector._record_stats` adds `duration` to a running accumulator
+    that is only ever reset wholesale, so one such request skews the reported
+    `average_duration_seconds` for the rest of the process lifetime.
+    """
 
     endpoint: str
     model: str
@@ -22,9 +35,15 @@ class RequestStats:
 
     @property
     def duration(self) -> float:
-        """Get request duration in seconds."""
+        """Get request duration in seconds.
+
+        Both branches subtract two readings of the same clock. Whoever
+        supplies `start_time` therefore has to read the clock named in the
+        class docstring: mixing the two epochs does not fail loudly, it
+        returns roughly +/- 1.76e9 seconds.
+        """
         if self.end_time is None:
-            return time.time() - self.start_time
+            return time.monotonic() - self.start_time
         return self.end_time - self.start_time
 
 
@@ -81,7 +100,7 @@ class StatsCollector:
             endpoint=endpoint,
             model=model,
             user_id=user_id,
-            start_time=time.time(),
+            start_time=time.monotonic(),
         )
 
     def complete_request(
@@ -103,7 +122,7 @@ class StatsCollector:
             tokens_output: Number of output tokens.
             retries: Number of retry attempts.
         """
-        stats.end_time = time.time()
+        stats.end_time = time.monotonic()
         stats.success = success
         stats.error = error
         stats.tokens_input = tokens_input

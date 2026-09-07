@@ -16,6 +16,7 @@ from lexora.backends.base import (
     Backend,
     BackendError,
     BackendTimeoutError,
+    UsageSink,
 )
 from lexora.utils.logging import get_logger
 
@@ -336,7 +337,7 @@ class ClaudeCodeBackend(Backend):
             raise BackendError(f"Claude Code request failed: {e}") from e
 
     async def chat_completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Send streaming chat completion request via Claude Code CLI.
 
@@ -345,6 +346,11 @@ class ClaudeCodeBackend(Backend):
 
         Args:
             request: OpenAI-compatible chat completion request.
+            usage_sink: Filled, when supplied, from the ``result`` event --
+                the same object ``_tokens_from_result`` reads on the
+                non-streaming path, and read with that same function. Nothing
+                this method yields changes, so a caller that passes None gets
+                byte-for-byte the stream it got before.
 
         Yields:
             SSE data chunks in OpenAI format.
@@ -450,6 +456,38 @@ class ClaudeCodeBackend(Backend):
                                 yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
 
                 elif event_type == "result":
+                    # The bill, read off the event the finish chunk is built
+                    # from. `_tokens_from_result` is called UNCHANGED and is
+                    # not re-implemented here: its three-field input-side sum
+                    # is measured and documented at its own definition, and a
+                    # second copy of that arithmetic is how the two would
+                    # drift. The stream and non-streaming paths must not
+                    # disagree about what a prompt cost.
+                    #
+                    # Measured, not assumed, on CLI 2.1.263 (2026-09-07) with
+                    # the command `_build_command` builds for this path: the
+                    # `result` event of `--output-format stream-json` carries
+                    # the same top-level `usage` object as `--output-format
+                    # json` -- `input_tokens` 2, `cache_creation_input_tokens`
+                    # 14495, `cache_read_input_tokens` 23732, `output_tokens`
+                    # 4 -- so the object this reads is the object that
+                    # function was written for.
+                    #
+                    # NOT the `assistant` events, which the same run showed
+                    # also carry a `message.usage` of their own. On a
+                    # single-turn call they agree; on a multi-turn one there
+                    # is an assistant event per turn and only this event
+                    # carries the invocation's total, so filling from those
+                    # would be the second summation this must not have.
+                    #
+                    # ASSIGNED, never accumulated: a second `result` event
+                    # states the total again, it does not add to it.
+                    if usage_sink is not None:
+                        (
+                            usage_sink.prompt_tokens,
+                            usage_sink.completion_tokens,
+                        ) = self._tokens_from_result(event)
+
                     # Final result — send finish chunk
                     stop_reason = event.get("stop_reason", "end_turn")
                     finish_reason = "stop" if stop_reason == "end_turn" else "length"
@@ -486,7 +524,7 @@ class ClaudeCodeBackend(Backend):
         raise BackendError("Text completions are not supported by Claude Code backend")
 
     async def completions_stream(
-        self, request: dict[str, Any]
+        self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
         """Not supported — use chat_completions_stream instead."""
         raise BackendError("Text completions are not supported by Claude Code backend")
