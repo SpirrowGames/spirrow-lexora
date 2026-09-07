@@ -204,6 +204,11 @@ class VLLMBackend(Backend):
                 ``stream_options.include_usage``, so the number is not in the
                 bytes. Zero means no row -- "we cannot say", not "free".
 
+                Carried as a value too: ``Backend.fills_usage_sink`` stays
+                ``False`` on this class, so an empty sink here is one of the
+                legitimate silences and not the counted defect. Prose and
+                attribute change together.
+
         Yields:
             SSE data chunks.
 

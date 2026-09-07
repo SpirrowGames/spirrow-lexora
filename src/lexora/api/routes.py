@@ -37,7 +37,7 @@ from lexora.api.models import (
 from lexora.backends.base import BackendError, BackendUpstreamError, UsageSink
 from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
-from lexora.services.metrics import MetricsCollector
+from lexora.services.metrics import STREAM_USAGE_MISSING_TOTAL, MetricsCollector
 from lexora.services.model_registry import ModelRegistry
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
@@ -69,6 +69,74 @@ def _passthrough_headers(e: BackendUpstreamError) -> dict[str, str] | None:
     if e.retry_after is None:
         return None
     return {"Retry-After": str(max(0, math.ceil(e.retry_after)))}
+
+
+def _record_missing_stream_usage(
+    *,
+    backend: Any,
+    usage_sink: UsageSink,
+    completed_normally: bool,
+    endpoint: str,
+    backend_name: str,
+) -> None:
+    """Count a stream that should have opened a ledger row and did not.
+
+    The gap this closes is *indistinguishability*, not silence. An empty
+    sink at a terminal exit has four causes and the row-opening guard in
+    each ``stream_generator``'s ``finally`` (below, not above -- this
+    function is defined before its three callers) treats all four the same
+    way, because after the fact they look the same:
+    a verbatim-relay backend, a client who cut the connection before the
+    upstream's final frame, a stream where the count genuinely never
+    arrived, and -- the defect -- a backend that parses the count but whose
+    parser has stopped matching what the upstream sends.
+
+    The separating fact is one the generator already holds: whether the
+    stream reached normal completion, versus arriving in one of the
+    ``except`` clauses. Three conjuncts exclude the three legitimate causes
+    by construction, and each is written as its own early return so that a
+    mutation can drop exactly one of them:
+
+    1. ``backend.fills_usage_sink`` -- the relays do not declare, so they are
+       out. A claim about the backend, never about the wire format; the
+       router still learns no upstream format from reading it. Do NOT reach
+       for ``error_passthrough`` instead: it is an error-shape flag, it is
+       set on ``anthropic``, and ``anthropic`` is one of the three that *do*
+       fill the sink, so it is anti-correlated with the property wanted here.
+    2. ``completed_normally`` -- a disconnect is not a normal completion, so
+       a hang-up is out. This is the conjunct that keeps the observable from
+       becoming the "fail loudly" alarm that was rejected: turning a client
+       hang-up into an alarm is the failure mode, not the defect.
+    3. an empty sink -- the exact complement of the row-opening guard
+       (``prompt_tokens > 0 or completion_tokens > 0``), written as its
+       negation so the two cannot both fire and cannot both stay silent.
+       The guard is still inline at three sites; that duplication predates
+       this change and unifying it is a separate decision, deliberately not
+       taken in a diff about something else.
+
+    One function called from all three sites, not a fourth inline copy: a
+    drift between copies of *this* predicate would change behaviour rather
+    than names.
+
+    Counted, not raised, and counted rather than only logged -- a log nobody
+    reads is the same silence in a different font. The log line beside it
+    carries the same two labels for a reader who is already in the logs.
+    """
+    if not getattr(backend, "fills_usage_sink", False):
+        return
+    if not completed_normally:
+        return
+    if usage_sink.prompt_tokens > 0 or usage_sink.completion_tokens > 0:
+        return
+
+    STREAM_USAGE_MISSING_TOTAL.labels(
+        backend=backend_name, endpoint=endpoint
+    ).inc()
+    logger.warning(
+        "stream_usage_missing",
+        backend=backend_name,
+        endpoint=endpoint,
+    )
 
 
 def _fail_preflight(
@@ -267,6 +335,14 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
         openai_compatible   no               relays bytes verbatim, and the
         vllm                no               number is not in those bytes
 
+    That second column is now carried by a value as well as by this prose:
+    ``Backend.fills_usage_sink``, True on the three and False on the two.
+    The value is what lets a handler tell the *defect* -- a declaring
+    backend whose stream completed normally and still left the sink empty
+    -- from the legitimate silences below, and count it
+    (``lexora_stream_usage_missing_total``). The two must be changed
+    together; nothing yet checks that they agree.
+
     Two cases therefore still open no row: a stream through either relay
     backend, and a stream the client cuts before the upstream's final frame
     (usage arrives in that frame). Both mean "no count was observed", never
@@ -423,6 +499,8 @@ async def chat_completions(
         byte_iter = None
         passthrough = getattr(backend, "error_passthrough", False)
         if passthrough:
+            # ★ The sink is passed HERE, on the passthrough path too. Read
+            # the next three lines before reading `stream_generator` below.
             byte_iter = backend.chat_completions_stream(
                 request_dict, usage_sink=usage_sink
             ).__aiter__()
@@ -497,7 +575,37 @@ async def chat_completions(
                 raise
 
         async def stream_generator() -> AsyncIterator[bytes]:
+            # ★ Initialised before the `try` on purpose: the `finally` reads
+            # it on every exit including the ones that never enter the body,
+            # and a name bound only inside the `try` would raise
+            # `UnboundLocalError` out of the `finally` on exactly the paths
+            # this is here to describe. False is also the right answer for
+            # them -- none of them is a normal completion.
+            #
+            # A local flag set where the body already marks success, NOT a
+            # fifth code path and not a new `except`: the `finally` below
+            # covers four exits by construction and that is its whole
+            # rationale, which this must not erode.
+            completed_normally = False
             try:
+                # ★ THIS BRANCH DOES NOT BYPASS THE PARSER -- it *is* the
+                # parser. `byte_iter` is
+                # `backend.chat_completions_stream(request_dict,
+                # usage_sink=usage_sink)`, built at line 504 above (:1001 in
+                # `completions`, :2186 in `messages`) -- the same generator
+                # the `else` calls, with the same sink. A passthrough stream
+                # therefore fills the sink and opens a ledger row exactly
+                # like a non-passthrough one does.
+                #
+                # ∴ do NOT exclude `passthrough` from
+                # `_record_missing_stream_usage`. `anthropic` is the only
+                # backend that carries the flag (`ERROR_PASSTHROUGH_TYPES`)
+                # and one of the three that DO fill the sink, so excluding
+                # it would blind the counter on the best-instrumented
+                # backend against real parser defects -- while an upstream
+                # 4xx/5xx is already excluded twice over, by the pre-flight
+                # above and by `completed_normally`. Detector:
+                # test_a_declaring_passthrough_backend_whose_parser_stopped_matching_IS_counted
                 if passthrough and byte_iter is not None:
                     if first_chunk is not None:
                         yield first_chunk
@@ -511,6 +619,7 @@ async def chat_completions(
 
                 # Mark as successful on stream completion
                 duration = time.monotonic() - start_time
+                completed_normally = True
                 stats_collector.complete_request(stats, success=True)
 
                 # Record metrics
@@ -639,6 +748,23 @@ async def chat_completions(
                             else None
                         ),
                     )
+                # ★ The other half of the same `finally`, and mutually
+                # exclusive with the block above by construction: this can
+                # only fire on an empty sink, which is exactly the case in
+                # which that guard opened no row. Silence that should have
+                # been a row, made countable. The predicate itself lives in
+                # `_record_missing_stream_usage` -- one copy, called from all
+                # three sites, because a drift between copies of *this* one
+                # would change behaviour and not merely names.
+                _record_missing_stream_usage(
+                    backend=backend,
+                    usage_sink=usage_sink,
+                    completed_normally=completed_normally,
+                    endpoint=endpoint,
+                    backend_name=backend_router.get_backend_name_for_model(
+                        request.model
+                    ),
+                )
 
         return StreamingResponse(
             stream_generator(),
@@ -870,6 +996,8 @@ async def completions(
         byte_iter = None
         passthrough = getattr(backend, "error_passthrough", False)
         if passthrough:
+            # ★ The sink is passed HERE, on the passthrough path too. Same
+            # construction as `chat_completions` above, same consequence.
             byte_iter = backend.completions_stream(
                 request_dict, usage_sink=usage_sink
             ).__aiter__()
@@ -944,7 +1072,14 @@ async def completions(
                 raise
 
         async def stream_generator() -> AsyncIterator[bytes]:
+            # ★ Before the `try`, and set where the body already marks
+            # success. See the identical pair in `chat_completions` above.
+            completed_normally = False
             try:
+                # ★ Not a parser bypass: `byte_iter` is
+                # `backend.completions_stream(..., usage_sink=usage_sink)`
+                # from line 1001 above. See the full note on the
+                # identical branch in `chat_completions`.
                 if passthrough and byte_iter is not None:
                     if first_chunk is not None:
                         yield first_chunk
@@ -958,6 +1093,7 @@ async def completions(
 
                 # Mark as successful on stream completion
                 duration = time.monotonic() - start_time
+                completed_normally = True
                 stats_collector.complete_request(stats, success=True)
 
                 # Record metrics
@@ -1061,6 +1197,18 @@ async def completions(
                             else None
                         ),
                     )
+                # ★ The observable half of the same `finally`. See the
+                # identical call in `chat_completions` above, and
+                # `_record_missing_stream_usage` for the predicate.
+                _record_missing_stream_usage(
+                    backend=backend,
+                    usage_sink=usage_sink,
+                    completed_normally=completed_normally,
+                    endpoint=endpoint,
+                    backend_name=backend_router.get_backend_name_for_model(
+                        request.model
+                    ),
+                )
 
         return StreamingResponse(
             stream_generator(),
@@ -2032,6 +2180,9 @@ async def messages(
         # same line in `chat_completions` above.
         usage_sink = UsageSink()
 
+        # ★ The sink is passed HERE, and unconditionally: this endpoint has
+        # no `if passthrough` branch at all -- the flag only picks the error
+        # body shape at the `BackendUpstreamError` clause below.
         byte_iter = backend.chat_completions_stream(
             openai_request, usage_sink=usage_sink
         ).__aiter__()
@@ -2138,11 +2289,15 @@ async def messages(
                 yield chunk
 
         async def stream_generator() -> AsyncIterator[bytes]:
+            # ★ Before the `try`, and set where the body already marks
+            # success. See the identical pair in `chat_completions` above.
+            completed_normally = False
             try:
                 async for event in anthropic_stream_from_openai(
                     replayed(), request.model
                 ):
                     yield event
+                completed_normally = True
                 stats_collector.complete_request(stats, success=True)
                 if metrics_collector:
                     metrics_collector.record_request_end(
@@ -2216,6 +2371,18 @@ async def messages(
                             else None
                         ),
                     )
+                # ★ The observable half of the same `finally`. See the
+                # identical call in `chat_completions` above, and
+                # `_record_missing_stream_usage` for the predicate.
+                _record_missing_stream_usage(
+                    backend=backend,
+                    usage_sink=usage_sink,
+                    completed_normally=completed_normally,
+                    endpoint=endpoint,
+                    backend_name=backend_router.get_backend_name_for_model(
+                        request.model
+                    ),
+                )
 
         return StreamingResponse(
             stream_generator(),

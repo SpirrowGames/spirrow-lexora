@@ -123,6 +123,14 @@ class GeminiBackend(Backend):
             paid_key_acknowledged.
     """
 
+    #: This backend reads `usageMetadata` off events it already decodes and
+    #: writes the counts into the sink (see `chat_completions_stream`), so a
+    #: stream of its that completes normally and leaves the sink at zero is
+    #: the defect the handler counts -- and this is the backend whose wire
+    #: shape is the *unmeasured* premise, so the observable matters most
+    #: here.
+    fills_usage_sink: bool = True
+
     def __init__(
         self,
         base_url: str = "https://generativelanguage.googleapis.com",

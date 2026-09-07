@@ -40,6 +40,12 @@ class ClaudeCodeBackend(Backend):
         name: Optional backend name for logging.
     """
 
+    #: This backend reads the CLI's `result` event with `_tokens_from_result`
+    #: and writes the counts into the sink (see `chat_completions_stream`), so
+    #: a stream of its that completes normally and leaves the sink at zero is
+    #: the defect the handler counts.
+    fills_usage_sink: bool = True
+
     def __init__(
         self,
         model: str = "sonnet",
