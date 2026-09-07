@@ -195,6 +195,27 @@ class _ClockAttributeRecorder:
         return getattr(time, name)
 
 
+# THE FOURTH CLOCK DOUBLE IS NOT HERE. `_FrozenClock` lives in
+# `test_ledger_coverage.py`, next to `TestLedgerCoversEveryNonStreamingRoute::
+# test_the_lower_end_is_read_off_the_handlers_own_clock` -- the only thing
+# that installs it. Same `__getattr__`-delegating shape as the three above;
+# it fakes `monotonic()` by never advancing it.
+#
+# It is filed there rather than here deliberately, and against the obvious
+# pull of keeping the clock doubles together, because that pull is how this
+# thread lost two fences already. `test_the_outer_clock_is_finer_than_the
+# _slack` and `test_the_lower_bound_slack_keeps_its_derivation_and_its_floor`
+# both lived in THIS file while their subject -- the duration bracket and its
+# since-deleted `DURATION_SLACK` -- lived in that one, and both outlived their
+# subject without anyone noticing. That distance is the mechanism by which a
+# fence gets orphaned, not an aesthetic complaint about it. Twice in one
+# thread is enough.
+#
+# The cost of the rule is this comment: the double family is no longer
+# readable in one place. Paid explicitly, because a stale pointer is a cheap
+# failure and an orphaned fence is not.
+
+
 class _RecordingMetrics(MetricsCollector):
     """A real `MetricsCollector` that also keeps every `duration` it is given.
 

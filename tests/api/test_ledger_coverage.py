@@ -100,6 +100,7 @@ bars but the absence of a quantity to measure.
 
 import asyncio
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -390,22 +391,40 @@ def _backend(usage: dict[str, int] | None = USAGE, delay: float = 0.0) -> MagicM
       clocks -- the exact shape this file was already bitten by once, recorded
       in `read_outer_clock`'s own docstring.
 
-      AND NOTHING CHECKS IT, which is stated here rather than left for the
-      next reader to discover from a green run. Measured, not predicted:
-      swapping both reads below for `__import__("time").monotonic()` -- the
-      same function object, so the swap isolates provenance alone -- leaves
-      all 48 cases in this file and `test_interval_clock.py` GREEN. This was
-      written as "reverting this to a local reddens it" and that was FALSE.
+      AND IT IS FENCED, by `test_the_lower_end_is_read_off_the_handlers_own_
+      clock` immediately below the bracket: it drives a request through a
+      FROZEN `routes.time` and asserts these readings come back exactly 0.0,
+      so swapping the two reads below for a local reference reds all four of
+      its params with the measured value in the message.
 
-      Why the fence that covers the UPPER end does not extend down here:
+      It was not always, and the sequence is the point rather than trivia.
+      That fence exists because the swap to `__import__("time").monotonic()`
+      -- the same function object, so it isolates provenance alone -- was
+      measured GREEN across EVERY case of this file and
+      `test_interval_clock.py`. That is 32 cases, re-counted at `5bfd428`
+      rather than carried forward: this docstring shipped the figure as "48",
+      which is the count for those two files PLUS
+      `test_streaming_ledger_row.py`. The measurement was sound and its
+      stated scope was not, so the scope is corrected here rather than the
+      number quietly reused.
+
+      The same docstring also said "reverting this to a local reddens it",
+      and that was FALSE when written -- nothing in the suite could see the
+      difference, which is the defect `read_outer_clock`'s docstring records
+      one level up. With the fence in place the swap now reds exactly its
+      four params and leaves the other 32 cases green, measured the same way
+      it was measured false.
+
+      Why the fence that covers the UPPER end does not reach down here, which
+      is why the lower end needed one of its own:
       `test_a_skipped_tick_cannot_break_the_upper_bound` catches the
       equivalent decoupling by making `routes.time` skip FORWARD, and a
       forward skip inflates the handler's `duration` -- which pushes
       `backend_delta <= duration` further from failing, not closer. Detecting
-      a decoupled lower end needs a clock that advances SLOWER than real
-      time, which is a different instrument and a design question, not an
-      implementation detail. It is returned to
-      `T-duration-slack-underestimates-the-tick` rather than invented here;
+      a decoupled lower end takes a clock that advances SLOWER than real
+      time; the frozen one is the read-count-invariant limiting case of that,
+      and `_FrozenClock`'s docstring records why the read-count property is
+      what decided the instrument;
     - the reading is taken whether or not `delay` is truthy, so every call
       records. The `len(...) == 1` guard at the assertion site is a real
       check rather than a coincidence of which double was constructed.
@@ -465,6 +484,46 @@ def _client(
     app.dependency_overrides[get_metrics_collector] = lambda: None
     app.dependency_overrides[get_cost_tracker] = lambda: cost_tracker
     return TestClient(app)
+
+
+class _FrozenClock:
+    """A stand-in for the `time` module whose `monotonic()` never advances.
+
+    Installed into `routes`' globals by the fence below, which is the only
+    thing that uses it. It is the fourth clock double in this suite and the
+    only one outside `test_interval_clock.py`; the other three are named from
+    there and the reason this one is not with them is recorded at both ends.
+
+    **Only `monotonic()` is faked**, and `__getattr__` delegates the rest, in
+    the same shape as `_BackwardsWallClock`, `_TickSkippingClock` and
+    `_ClockAttributeRecorder` over in `test_interval_clock.py`.
+
+    WHY FROZEN AND NOT MERELY SLOW. What the fence below has to detect is a
+    lower end whose two readings stop coming off the handler's clock, and the
+    general instrument for that is a clock running SLOWER than real time --
+    of which a decrementing or per-read-decelerating clock is the obvious
+    shape. It is the wrong one, and `_TickSkippingClock`'s docstring already
+    says why in as many words: a clock that moves per read makes the verdict
+    depend on HOW MANY TIMES `routes.py` reads it, i.e. on an implementation
+    detail of the code under test. A test whose meaning moves when a handler
+    gains or loses a `time.monotonic()` call is not a fence.
+
+    A frozen clock is the limiting case of "slower than real time", at rate
+    zero, and it is READ-COUNT-INVARIANT: every read returns the same value
+    no matter how many there are. So there is no trigger to place, no
+    interleaving to reason about, and no dependence on `routes.py`'s internals
+    -- the same properties `_TickSkippingClock` had to work for by tying its
+    jump to the backend double rather than to a read count.
+    """
+
+    def __init__(self) -> None:
+        self._frozen = time.monotonic()
+
+    def monotonic(self) -> float:
+        return self._frozen
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
 
 
 class TestLedgerCoversEveryNonStreamingRoute:
@@ -562,6 +621,96 @@ class TestLedgerCoversEveryNonStreamingRoute:
             f"call at all"
         )
         backend_delta = backend.intervals[0]
+        assert backend_delta <= kwargs["duration"] <= wall
+
+    @pytest.mark.parametrize(
+        ("endpoint", "body"),
+        [(e, b) for e, b, _, _ in NEW_ROUTES],
+        ids=["completions", "embeddings", "generate", "chat"],
+    )
+    def test_the_lower_end_is_read_off_the_handlers_own_clock(
+        self,
+        endpoint: str,
+        body: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The bracket's lower end reads the clock the handler reads.
+
+        The third leg of the nesting identity, and until this test the only
+        one with no fence. The handler's half is held by
+        `test_interval_clock.py::test_the_handler_measures_its_interval_off_
+        monotonic_alone`, the outer half by `::test_a_skipped_tick_cannot_
+        break_the_upper_bound`. The double's half was bare, and bare in a way
+        no value assertion could see: swapping both of `_backend`'s readings
+        for `__import__("time").monotonic()` -- the same function object, so
+        the swap isolates provenance alone -- was measured GREEN across every
+        case in this file and `test_interval_clock.py`.
+
+        That is not a hypothetical hazard, it is one this file has already
+        been bitten by once: `read_outer_clock`'s docstring records deriving
+        the since-deleted `DURATION_SLACK` off `time` instead of `monotonic`,
+        value-invariant on both platforms, invisible to every assertion in the
+        suite. Same shape, one level down.
+
+        The instrument is a FROZEN `routes.time.monotonic` -- see
+        `_FrozenClock` for why frozen rather than merely slow, which is a
+        question about read-count dependence and not a matter of taste. Under
+        it the handler's interval is 0.0 by construction, so a double reading
+        the same clock must report exactly 0.0, while a double reading any
+        clock that really advances reports the real elapsed of a call held
+        open for `SLOW` and this test reds with that number in the message.
+
+        WHAT THIS CANNOT SEE, stated here rather than left to be discovered
+        from a green run. A double that fabricates a constant `0.0` instead of
+        measuring anything passes this test and always will: under a frozen
+        clock the true reading IS 0.0, so no bound that must also hold on the
+        shipped tree can separate the fabricated value from the measured one.
+        Measured, not predicted -- appending a literal `0.0` to `intervals` in
+        place of the subtraction leaves this test GREEN on all four params.
+        That ceiling is INHERITED FROM THE BRACKET rather than introduced
+        here: it is the same "a constant inside the band always exists" the
+        bracket records against itself, where `SLOW` is such a value. The
+        vacuity guard below is what keeps the weaker version of that -- a
+        double that measures nothing at all -- from passing.
+        """
+        monkeypatch.setattr(routes, "time", _FrozenClock())
+
+        tracker = MagicMock()
+        backend = _backend(delay=SLOW)
+        started = read_outer_clock()
+        response = _client(backend, tracker).post(endpoint, json=body)
+        wall = read_outer_clock() - started
+
+        assert response.status_code == 200
+        # The row has to be opened for `duration` to exist at all; without
+        # this the two assertions below would fail on a missing call rather
+        # than on the premise they are here to fence.
+        assert tracker.record.call_count == 1
+        kwargs = tracker.record.call_args.kwargs
+        # Same guard as the bracket above and for the same reason: an
+        # un-instrumented double leaves `intervals` empty, and an `IndexError`
+        # is a worse red than a named one.
+        assert len(backend.intervals) == 1, (
+            f"the double recorded {len(backend.intervals)} intervals, not one "
+            f"-- the reading asserted below would be the wrong call or no "
+            f"call at all"
+        )
+        backend_delta = backend.intervals[0]
+        # FIRST, so the premise fails before the bracket does and with the
+        # diagnosis that names it. The bracket below would also red here, but
+        # it would red as "a bound was violated" rather than as "the lower
+        # end stopped reading the handler's clock", and those need different
+        # repairs.
+        assert backend_delta == 0.0, (
+            f"the double measured {backend_delta!r} across a call the "
+            f"handler's own clock says took no time -- its two readings are "
+            f"no longer resolving through `routes.time`, so the four-reading "
+            f"nesting identity that makes `backend_delta <= duration` exact "
+            f"no longer holds"
+        )
+        # Then the shipped bracket, unchanged, on the same request: under one
+        # frozen clock all four readings collapse to the same value and the
+        # identity is satisfied at its boundary, 0.0 <= 0.0 <= 0.0.
         assert backend_delta <= kwargs["duration"] <= wall
 
 
