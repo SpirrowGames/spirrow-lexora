@@ -143,14 +143,28 @@ file taken immediately before the edit -- never against `git show HEAD:` --
 and all six came back byte-identical. The reason for the snapshot rule, and
 a correction to how it was stated:
 
-Measured at the byte level in this clone at `bdfc185`, `src/lexora/api
-/routes.py` is LF in the worktree AND LF in the committed blob, while
-`tests/api/test_ledger_coverage.py` is CRLF in the worktree and LF in the
-blob. So the mismatch is real but it is per-file -- it is not "the blob is
-always LF and the worktree always CRLF", and a rule resting on that premise
-would be wrong on `routes.py`, which is the file mutated five times here. A
-same-worktree snapshot rests on no premise about line endings at all, which
-is why it is the rule rather than an application of one.
+The rule is usually justified by "the committed blob is LF and an
+editor-written worktree file is CRLF". Measured at the byte level in this
+clone at `bdfc185`, that premise is HALF true, and the false half is the one
+that would have been relied on here:
+
+    file                              blob        worktree
+    src/lexora/api/routes.py          LF  2419    LF   2555
+    tests/api/test_ledger_coverage.py LF   841    CRLF  841
+
+The blob half holds -- both are uniformly LF, `core.autocrlf` is `input`.
+The worktree half does not: `routes.py` was written repeatedly this turn and
+is still LF, because each writer preserved what `git checkout` had put
+there. So it is **per-write**, not per-file and not per-clone -- whichever
+tool last wrote the file decides, and `routes.py` is the file mutated five
+times here. Hard-coding CRLF in the mutation patterns is exactly the mistake
+that premise invites, and it was made: the first run of the driver found
+**0 occurrences** and stopped. It stopped because the driver asserts the
+pattern was found. A driver that had merely reported "green" would have
+reported a clean green over six edits that never happened.
+
+A same-worktree snapshot rests on no premise about line endings at all,
+which is why it is the rule rather than an application of one.
 
 Two instruments, both used and one discarded: `grep -c $'\\r$'` under Git
 Bash on this host reported every file as fully CRLF, including files that
