@@ -62,8 +62,10 @@ deliberately not the `"frontier"` other files use, so no other test in the
 session can move the sample these deltas are taken over.
 
 RED BEFORE GREEN. Reverting `src/` alone to `bdfc185` and leaving this file
-in place: **6 red / 15 green here, and 693 passed across the rest of the
-suite.** The 6 are the three
+in place: **6 red / 15 green here**, and the whole suite in that state is
+**6 failed / 693 passed** -- so the 693 is 15 of this file's own cases plus
+the 678 that existed before, and NOT ONE of those 678 moves. The 6 are the
+three
 `test_a_declaring_backend_that_completes_with_an_empty_sink_is_counted`
 cases, `test_a_messages_stream_error_with_an_empty_sink_IS_counted`, and
 both cases in `TestTheDeclarationIsNotAnExistingFlagInDisguise` that read
@@ -71,8 +73,8 @@ the new attribute. The 15 green are fences rather than detectors, and
 knowing WHY matters: with no counter registered,
 `REGISTRY.get_sample_value` returns `None` for every label set, so "is not
 counted" was vacuously true before this change and now has to stay true
-against a counter that actually exists. The 693 is the point of that run --
-nothing else in the suite could see any of this.
+against a counter that actually exists. That the other 678 all stay green is
+the point of the run: the suite was blind to this whole class.
 
 Full suite measured by me at both ends: **678 at `bdfc185`, 699 with this
 change**, i.e. +21, exactly this file's case count, so nothing else moved.
