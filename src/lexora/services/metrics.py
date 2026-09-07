@@ -68,6 +68,34 @@ STREAMING_REQUESTS_TOTAL = Counter(
     ["endpoint", "model", "status"],
 )
 
+# ★ The observable for a stream that should have billed and did not.
+#
+# An empty `UsageSink` at a terminal exit has four causes and three of them
+# are correct (`api/routes.py`'s `get_cost_tracker` table): a verbatim-relay
+# backend, a client who hangs up before the upstream's final frame, and a
+# stream where the count genuinely never arrived. The fourth -- a backend
+# that declares it parses the count, on a stream that reached normal
+# completion -- is the defect, and before this counter it was
+# indistinguishable from the other three after the fact: no row, no log,
+# nothing. This separates it, and it is a *counter* rather than a log line
+# because the requirement is countability; a log nobody reads is the same
+# silence in a different font.
+#
+# Not an alarm and deliberately not one: raising here would turn a client
+# disconnect into a 500, which this design has already refused.
+#
+# Labelled `backend` and `endpoint` so "which backend, which endpoint" is
+# answerable from the metric alone. Not `model`: the question this is asked
+# to answer is whether one backend's parser has stopped matching its
+# upstream, which is a property of the backend, and a per-model label would
+# spread one defect across an unbounded label set.
+STREAM_USAGE_MISSING_TOTAL = Counter(
+    "lexora_stream_usage_missing_total",
+    "Streams that completed normally on a backend declaring it fills the "
+    "usage sink, yet left it empty so no ledger row was opened",
+    ["backend", "endpoint"],
+)
+
 
 class MetricsCollector:
     """Collector for Prometheus metrics."""

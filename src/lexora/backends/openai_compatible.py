@@ -205,6 +205,12 @@ class OpenAICompatibleBackend(Backend):
                 "we cannot say", not "this request was free". See the coverage
                 table on ``api/routes.py``'s ``get_cost_tracker``.
 
+                That fact is now a value as well as prose:
+                ``Backend.fills_usage_sink`` stays ``False`` on this class,
+                which is what keeps an empty sink here from being counted as
+                the defect it would be on a backend that does parse. The
+                sentence above and that attribute must be changed together.
+
         Yields:
             SSE data chunks.
 
