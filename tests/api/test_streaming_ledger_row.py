@@ -137,8 +137,11 @@ COMPLETION_TOKENS = 42
 # measure rather than a tick of zero. Same role as `SLOW` in
 # `test_ledger_coverage.py`.
 #
-# That file's `DURATION_SLACK` bracket is deliberately NOT reused, and the
-# reason is measured. Written here as `SLOW - slack <= d <= wall + slack` with
+# That file's bracket is deliberately NOT reused, and the reason is measured.
+# (It carried a `DURATION_SLACK` constant when this was written; that constant
+# has since been deleted and both of its ends are now derived. The reason
+# below is unaffected -- it was never about the size of the slack.) Written
+# here as `SLOW - slack <= d <= wall + slack` with
 # one tick of slack, `[chat_completions]` failed twice on this runner at 0.0780
 # recorded against a 0.0778 bound. Probing says why: the reported
 # `monotonic` resolution of 0.015625 is nominal -- the observed step is 15 or

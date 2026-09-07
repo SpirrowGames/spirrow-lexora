@@ -82,8 +82,10 @@ unmodified tree. It was reported green on three consecutive local runs, a
 green CI gate and a 590-passed suite; re-measured on the same commit with
 nothing changed, the four detectors red 10 runs in 15, on a different route id
 each time. All of those greens were luck. The mechanism and the tolerance that
-removes it are recorded at `DURATION_SLACK` below. What the episode is worth
-keeping for is the general shape: repeating a run is not evidence about an
+removes it are recorded under "WHY THE UPPER END CARRIES NO TOLERANCE" below,
+along with the later change that removed the tolerance from the other end too.
+What the episode is worth keeping for is the general shape: repeating a run is
+not evidence about an
 assertion that reads a clock, and neither the gate nor CI can supply that
 evidence, because each runs the suite exactly once. This is the timing form of
 R-11's lesson -- there, a fence existed without working; here, a fence worked
@@ -98,7 +100,6 @@ bars but the absence of a quantity to measure.
 
 import asyncio
 import sqlite3
-import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -146,12 +147,13 @@ SLOW = 0.05
 
 # The duration bracket below is
 #
-#     SLOW - DURATION_SLACK  <=  duration  <=  wall
+#     backend_delta  <=  duration  <=  wall
 #
-# and its two ends are not symmetric. The upper end carries no tolerance and
-# is exact. The lower end carries one and is not. Both halves of that are
-# written out here, because the shape this replaced looked more careful than
-# the shape that replaced it and was wrong anyway.
+# and neither end carries a tolerance: both are exact, and both are the same
+# nesting identity read at a different depth. It reached that shape in two
+# steps, upper end first, and BOTH steps are written out here -- because each
+# replaced something that looked more careful than what replaced it and was
+# wrong anyway, and that is the transferable part.
 #
 # `routes.py` measures `duration` with `time.monotonic()` at every record site
 # -- 46 occurrences, zero `time.time()`, zero `time.perf_counter()`, counted
@@ -239,45 +241,47 @@ SLOW = 0.05
 # request. It reads `read_outer_clock` from this module, so reverting the
 # outer clock reddens it deterministically instead of one run in eight.
 #
-# WHY THE LOWER END STILL CARRIES ONE, AND WHAT IT DOES NOT REST ON.
+# WHY THE LOWER END NO LONGER CARRIES ONE EITHER.
 #
-# `DURATION_SLACK` widens the LOWER end only. Its derivation is unchanged: one
-# tick of the handler's clock, with a 1 ms floor. Where the clock is
-# fine-grained the resolution term is ~0 (1e-09 on Linux CI -- measured, off
-# CI run 34053301337, not assumed), which would put that end back to exactly
-# tight; 1 ms covers it by a wide margin (500 ppm over 50 ms is 25 us) and
-# costs no detection power, every constant this bracket has to reject missing
-# it by three orders of magnitude.
+# It used to. `DURATION_SLACK = max(time.get_clock_info("monotonic").resolution,
+# 0.001)` stood here and widened the lower end to `SLOW - DURATION_SLACK`, one
+# reported tick of the handler's clock with a 1 ms floor. The measurement above
+# falsifies that end's premise exactly as it falsifies the old upper one: a
+# skipped tick makes a delta under-read as well as over-read, and 32 ms of skip
+# is not covered by a 15.625 ms tolerance. It survived on a measured margin
+# (min +0.011625 / median +0.027625 over 32 samples) rather than on its
+# derivation, and a margin is not a proof.
 #
-# What has changed is what may be CLAIMED for it. The measurement above
-# falsifies this end's premise too: a skipped tick can make a delta under-read
-# as well as over-read, and 32 ms of skip is not covered by a 15.625 ms
-# tolerance. So the lower bound is not sound by construction either. It is
-# sound by margin, and the margin is measured rather than assumed -- on the
-# shipped shape, min +0.011625 / median +0.027625 over 32 samples, and
-# min +0.012625 / median +0.028125 over the 32 taken before the change. Never
-# within 11 ms of failing in 64 samples across both shapes.
+# It is now gone rather than widened, and the same move that fixed the upper
+# end fixed this one: REMOVE THE PREMISE INSTEAD OF BUDGETING FOR IT. The
+# backend double records its own readings around its sleep, off the same
+# clock, and the lower end became `backend_delta <= duration` -- a fourth
+# nesting level on the chain derived above, exact by the identical argument
+# and containing no constant at all. Deriving a tolerance from a better
+# measurement would have been strictly worse than not needing one.
 #
-# It is left as it is deliberately: widening a tolerance that is not failing
-# is how tolerances stop detecting. What is NOT left implicit is the residual.
-# This end still carries a clock-quantum premise, that premise is measurably
-# false on this runner, and it survives on margin rather than on the
-# derivation. The repair that would remove the premise instead of widening the
-# budget for it -- have the backend double record its own `monotonic` readings
-# around its sleep and assert `backend_delta <= duration`, exact by the same
-# nesting argument and with no constant in it at all -- changes a bound that
-# was deliberately placed out of scope for this change, so it is returned to
-# `T-duration-slack-underestimates-the-tick` rather than taken here.
+# ∴ NO CONSTANT REMAINS IN EITHER END OF THE BRACKET, and the two checks that
+# read the deleted one went with it in different ways, which is the part worth
+# recording:
 #
-# The value of the line below is fenced against edits, and against edits only,
-# by `test_interval_clock.py::
-# test_the_lower_bound_slack_keeps_its_derivation_and_its_floor`, which
-# carries the mutation table naming the platform each cell was run on. That
-# check guards this line's VALUE and never its PROVENANCE, and it cannot see
-# the falsification above -- both sides of its first conjunct read the same
-# nominal constant. That ceiling is written into its own docstring rather than
-# left for the next reader to find from a red run.
-DURATION_SLACK = max(time.get_clock_info("monotonic").resolution, 0.001)
+#   - `test_interval_clock.py::test_the_lower_bound_slack_keeps_its_derivation
+#     _and_its_floor` was a pure VALUE fence over the constant. Its entire
+#     subject was the constant, so when the constant went the check had no
+#     subject and was DELETED. A fence standing over a premise nothing rests
+#     on is the dead-premise defect that already cost this suite
+#     `test_the_outer_clock_is_finer_than_the_slack`; keeping it "just in
+#     case" would have been the same mistake a third time.
+#   - `test_interval_clock.py::test_a_skipped_tick_cannot_break_the_upper
+#     _bound` also read it, but NOT as a fence -- it reconstructs the
+#     SUPERSEDED bound to prove its own reproduction still bites. That is a
+#     negative control and it SURVIVES, on an inlined local. The invariant is
+#     zero constants in any bound that still SHIPS, not zero constants in the
+#     tree: a description of a historical shape may carry one where a live
+#     bound may not.
+#
+# The old constant's value is still recoverable from git history if the
+# arithmetic above ever needs re-deriving; it is not kept here as a variable
+# nothing reads.
 
 
 def read_outer_clock() -> float:
@@ -288,9 +292,11 @@ def read_outer_clock() -> float:
     upper bound is exact only while ONE clock reads both ends, and a local
     reference would be value-identical while decoupling silently the day
     `routes` changed clocks. This file has already been bitten by that exact
-    shape -- deriving `DURATION_SLACK` off `time` instead of `monotonic` was
-    value-invariant on both platforms this project runs on, and no value
-    assertion could see it.
+    shape -- deriving the since-deleted `DURATION_SLACK` off `time` instead
+    of `monotonic` was value-invariant on both platforms this project runs on,
+    and no value assertion could see it. It is also why the backend double
+    reads its own interval through this function rather than off a local
+    `time.monotonic`: the LOWER end has exactly the same premise.
 
     Resolving through `routes.time` also makes the premise testable instead of
     merely stated. `test_interval_clock.py` installs a clock that skips
@@ -370,7 +376,41 @@ def _backend(usage: dict[str, int] | None = USAGE, delay: float = 0.0) -> MagicM
 
     `delay` holds each call open for that many real seconds. See `SLOW`: it is
     what gives the `duration` column a value distinguishable from a constant.
+
+    Each call appends its own elapsed reading to `backend.intervals`. Those
+    readings are the bracket's LOWER end and the reason it carries no constant
+    -- the derivation is at the bracket itself. Two properties of the three
+    lines below are load-bearing and neither is incidental:
+
+    - they are read through `read_outer_clock`, i.e. `routes.time.monotonic`,
+      the same clock object the handler subtracts. This is REQUIRED for the
+      lower bound to be exact: the nesting identity holds only while one clock
+      reads all four points, and a local `time.monotonic` would be
+      value-identical today while decoupling silently the day `routes` changed
+      clocks -- the exact shape this file was already bitten by once, recorded
+      in `read_outer_clock`'s own docstring.
+
+      AND NOTHING CHECKS IT, which is stated here rather than left for the
+      next reader to discover from a green run. Measured, not predicted:
+      swapping both reads below for `__import__("time").monotonic()` -- the
+      same function object, so the swap isolates provenance alone -- leaves
+      all 48 cases in this file and `test_interval_clock.py` GREEN. This was
+      written as "reverting this to a local reddens it" and that was FALSE.
+
+      Why the fence that covers the UPPER end does not extend down here:
+      `test_a_skipped_tick_cannot_break_the_upper_bound` catches the
+      equivalent decoupling by making `routes.time` skip FORWARD, and a
+      forward skip inflates the handler's `duration` -- which pushes
+      `backend_delta <= duration` further from failing, not closer. Detecting
+      a decoupled lower end needs a clock that advances SLOWER than real
+      time, which is a different instrument and a design question, not an
+      implementation detail. It is returned to
+      `T-duration-slack-underestimates-the-tick` rather than invented here;
+    - the reading is taken whether or not `delay` is truthy, so every call
+      records. The `len(...) == 1` guard at the assertion site is a real
+      check rather than a coincidence of which double was constructed.
     """
+    intervals: list[float] = []
 
     def _with(payload: dict[str, Any]) -> dict[str, Any]:
         body = dict(payload)
@@ -384,8 +424,10 @@ def _backend(usage: dict[str, int] | None = USAGE, delay: float = 0.0) -> MagicM
         body = _with(payload)
 
         async def _respond(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            entered = read_outer_clock()
             if delay:
                 await asyncio.sleep(delay)
+            intervals.append(read_outer_clock() - entered)
             return body
 
         return _respond
@@ -395,6 +437,7 @@ def _backend(usage: dict[str, int] | None = USAGE, delay: float = 0.0) -> MagicM
     backend.chat_completions = AsyncMock(side_effect=_responder(CHAT_RESPONSE))
     backend.embeddings = AsyncMock(side_effect=_responder(EMBEDDINGS_RESPONSE))
     backend.error_passthrough = False
+    backend.intervals = intervals
     return backend
 
 
@@ -440,8 +483,9 @@ class TestLedgerCoversEveryNonStreamingRoute:
         # returns, off the handler's own clock -- see `read_outer_clock`. The
         # containment this relies on is visible in these three lines and
         # nowhere else, which is why they are kept adjacent.
+        backend = _backend(delay=SLOW)
         started = read_outer_clock()
-        response = _client(_backend(delay=SLOW), tracker).post(endpoint, json=body)
+        response = _client(backend, tracker).post(endpoint, json=body)
         wall = read_outer_clock() - started
 
         assert response.status_code == 200
@@ -461,39 +505,64 @@ class TestLedgerCoversEveryNonStreamingRoute:
         # sites left 582 tests passing.
         assert kwargs["user_id"] == USER_ID
         # `duration` cannot be pinned to a number, so it is bracketed instead:
-        # at least the delay the backend was held open for, at most the
-        # elapsed of the whole call measured from out here. The two ends are
-        # NOT symmetric and the asymmetry is the content of
+        # at least the interval the backend double measured for itself, at
+        # most the elapsed of the whole call measured from out here. The two
+        # ends are now SYMMETRIC, and that symmetry is the content of
         # `T-duration-slack-underestimates-the-tick`:
         #
-        #   upper   `duration <= wall`                  exact, no tolerance.
-        #           One non-decreasing clock reads both ends and the outer
-        #           window contains the inner one, so it holds identically --
-        #           for a clock of any coarseness, including one that skips
-        #           ticks. Measured margin, this shape, 32 samples: min
-        #           +0.000000, median +0.015000. Zero is the expected
-        #           reading, not a near miss.
-        #   lower   `SLOW - DURATION_SLACK <= duration` tolerant, and the
-        #           tolerance rests on a premise measured FALSE on this
-        #           runner. It holds on margin (min +0.011625 over the same
-        #           32 samples), not by construction.
+        #   upper   `duration <= wall`           exact, no tolerance.
+        #   lower   `backend_delta <= duration`  exact, no tolerance.
         #
-        # Both are derived at `DURATION_SLACK` above; neither is re-argued
-        # here.
+        # Both are the same identity read at different depths. Four readings
+        # of ONE non-decreasing clock, nested --
         #
-        # What the bracket catches is a constant *outside* the band: 0.0
-        # and -999.0 undershoot the lower bound, 999.0 overshoots the
-        # upper one -- each measured red at all four params, re-measured at
-        # all four after the upper end lost its slack. What it does not catch
-        # is a constant *inside* the band, and one always exists: `SLOW`
-        # itself clears both ends on every platform, because the lower bound
-        # is `SLOW - DURATION_SLACK` and `wall` is an outer reading of a call
-        # the backend holds open for `SLOW` (measured green at all four
-        # params). So this brackets the magnitude, not the provenance -- it
-        # says the recorded number is the right size, not that it came from a
-        # clock.
+        #     m(started) <= m(entered) <= m(left) <= m(wall)
+        #
+        # where the inner pair is taken by the double inside `_respond` and
+        # the middle pair by the handler either side of the backend call.
+        # `started`/`wall` are read out here through `read_outer_clock`,
+        # `entered`/`left` inside the double through the same function, and
+        # `start_time`/`duration` inside the handler off `routes.time`. From
+        # `a <= b <= c <= d` follows `c - b <= d - a` for a clock of ANY
+        # coarseness, including one that skips ticks: a skip moves every
+        # reading along one shared timeline. Neither end contains a constant,
+        # so neither can be falsified by a measurement of the clock -- which
+        # is exactly what happened to the tolerance both ends used to carry.
+        # The lower end was `SLOW - DURATION_SLACK <= duration` until that
+        # constant was deleted, and it survived on a measured margin over a
+        # premise measured FALSE on this runner (the reported 15.625 ms
+        # resolution against observed 31-32 ms steps). It no longer rests on
+        # anything that can be false.
+        #
+        # WHAT THAT COSTS. `backend_delta` fences the interval's PROVENANCE,
+        # not its MAGNITUDE against `SLOW`: nothing below says the double was
+        # held open for 50 ms rather than 50 us. Re-measured before the old
+        # end was removed rather than argued -- with both ends present and the
+        # new one placed first, `duration` replaced by `0.0` and by `-999.0`
+        # at all four new call sites each reddened all four params ON THIS
+        # ASSERTION, the old end never being reached (`0.062000 <= 0.0`).
+        # `999.0` still reds all four on the upper end. So the constants this
+        # bracket exists to reject are rejected by the derived end, three
+        # orders of magnitude clear, without a constant doing it.
+        #
+        # What it still does not catch is a value *inside* the band, and one
+        # always exists: `SLOW` itself clears both ends, `wall` being an outer
+        # reading of a call the backend holds open for `SLOW`. The vacuity
+        # guard below is what keeps the lower end from becoming a third such
+        # value -- an empty `intervals` is the shape in which this bound would
+        # stop measuring while still looking like a bound.
         assert isinstance(kwargs["duration"], float)
-        assert SLOW - DURATION_SLACK <= kwargs["duration"] <= wall
+        # Without this the lower bound is vacuous in the one way that matters:
+        # an un-instrumented double would leave `intervals` empty and an
+        # `IndexError` is a worse red than a named one, while a retried call
+        # would leave two and the bound would silently read the wrong one.
+        assert len(backend.intervals) == 1, (
+            f"the double recorded {len(backend.intervals)} intervals, not one "
+            f"-- the lower bound below would be reading the wrong call or no "
+            f"call at all"
+        )
+        backend_delta = backend.intervals[0]
+        assert backend_delta <= kwargs["duration"] <= wall
 
 
 class TestExistingRoutesAreUnchanged:
