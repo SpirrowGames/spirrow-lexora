@@ -200,7 +200,7 @@ from lexora.api.routes import (
     router,
 )
 from lexora.backends.anthropic import AnthropicBackend
-from lexora.backends.base import Backend, BackendError
+from lexora.backends.base import Backend, BackendError, BackendUpstreamError
 from lexora.backends.claude_code import ClaudeCodeBackend
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
@@ -284,12 +284,37 @@ def _missing_count(endpoint: str) -> float:
     return 0.0 if value is None else value
 
 
+#: The upstream 4xx a passthrough backend forwards verbatim. 429 with a
+#: `Retry-After` on purpose: it exercises `_passthrough_headers` as well as
+#: `_openai_passthrough_body` / `_anthropic_passthrough_body`, so a shape
+#: mistake in the double shows up as a wrong status rather than silently.
+UPSTREAM_STATUS = 429
+
+
+def _upstream_error() -> BackendUpstreamError:
+    """What `anthropic.py:488` raises, in miniature.
+
+    `BackendUpstreamError` and not a plain `BackendError`, because the
+    distinction is the whole of the passthrough path: the router forwards
+    this one's status and body and flattens every other `BackendError` to
+    502. Using the plain class would test a different route.
+    """
+    return BackendUpstreamError(
+        f"API error ({UPSTREAM_STATUS}): slow down",
+        status_code=UPSTREAM_STATUS,
+        body={"error": {"type": "rate_limit_error", "message": "slow down"}},
+        retry_after=42.0,
+        backend_name=BACKEND_NAME,
+    )
+
+
 def _backend(
     *,
     declares: bool,
     fills: bool,
     passthrough: bool = False,
     raise_after_first_chunk: bool = False,
+    upstream_error_at: str | None = None,
 ) -> MagicMock:
     """A backend double whose declaration and behaviour are set separately.
 
@@ -306,14 +331,29 @@ def _backend(
     The factory takes `usage_sink=None` by default so a wiring mistake reds
     on the assertion rather than on a `TypeError`, which would say nothing
     about what was counted.
+
+    `upstream_error_at` is the two shapes a forwarded upstream error can
+    take, and they land in two different places by construction:
+    `"first_chunk"` raises before yielding anything, so the raise arrives at
+    the router's PRE-FLIGHT `__anext__()`; `"mid_stream"` raises after a
+    chunk has already been yielded, so it arrives inside `stream_generator`.
+    It is a separate knob from `raise_after_first_chunk` because that one
+    raises a plain `BackendError` -- see `_upstream_error`.
     """
 
     def _factory(_request: dict, usage_sink: Any = None) -> AsyncIterator[bytes]:
         async def gen() -> AsyncIterator[bytes]:
+            # Before any `yield`: this is `anthropic.py:450`'s
+            # `status_code >= 400` check, which runs before a single byte
+            # leaves the backend.
+            if upstream_error_at == "first_chunk":
+                raise _upstream_error()
             yield CHUNK
             if fills and usage_sink is not None:
                 usage_sink.prompt_tokens = PROMPT_TOKENS
                 usage_sink.completion_tokens = COMPLETION_TOKENS
+            if upstream_error_at == "mid_stream":
+                raise _upstream_error()
             if raise_after_first_chunk:
                 raise BackendError("upstream went away mid-stream")
 
@@ -325,6 +365,20 @@ def _backend(
     backend.error_passthrough = passthrough
     backend.fills_usage_sink = declares
     return backend
+
+
+def _stream_mock(backend: MagicMock, endpoint: str) -> MagicMock:
+    """The generator factory the route under test actually calls.
+
+    `/v1/completions` calls `completions_stream`; the other two both call
+    `chat_completions_stream` (`/v1/messages` converts an OpenAI stream).
+    Picking the wrong one would assert `call_count == 1` against a mock
+    nobody touched, which is a `MagicMock` and would red for the right
+    reason -- but say the wrong thing about why.
+    """
+    if endpoint == "/v1/completions":
+        return backend.completions_stream
+    return backend.chat_completions_stream
 
 
 def _app(backend: MagicMock, cost_tracker: Any) -> FastAPI:
@@ -579,6 +633,159 @@ class TestABilledStreamCountsNothing:
         assert tracker.record.call_count == 1
         assert tracker.record.call_args.kwargs["tokens_input"] == PROMPT_TOKENS
         assert tracker.record.call_args.kwargs["tokens_output"] == COMPLETION_TOKENS
+
+
+class TestThePassthroughRelayIsNotAnExemption:
+    """The `msg-225` objection, driven instead of argued.
+
+    The PR gate read the diff and inferred that the
+    `if passthrough and byte_iter is not None:` branch bypasses
+    `backend.chat_completions_stream`, so an anthropic upstream 4xx relayed
+    verbatim would complete normally with an empty sink and be miscounted as
+    a parser defect. The premise is false -- `byte_iter` **is** that
+    generator, built with `usage_sink=usage_sink` at `routes.py:504`
+    (`:1001` in `completions`, `:2186` in `messages`) -- and the scenario is
+    unreachable besides, because `anthropic.py:450` checks
+    `status_code >= 400` before yielding anything. But NEITHER FACT WAS IN
+    THE DIFF: line 504 falls between hunks. Ruled at `T-streaming-ledger-row`
+    `msg-226`; this class and the comment at that branch are the remedy,
+    because a ruling in a chatroom is not readable from a diff.
+
+    Which is which, since three new green cases must not read as coverage:
+
+    - `..._whose_parser_stopped_matching_IS_counted` is a **DETECTOR**, and
+      it is why this class exists. Nothing here reds today if someone writes
+      the requested exclusion; after this, that one does.
+    - `test_an_upstream_error_under_passthrough_is_not_counted` is a
+      **FENCE**. Measured 0.0 before this commit and 0.0 after; it changes
+      no behaviour and adds no safety, it only stops the answer to `msg-225`
+      from being a claim someone has to re-derive.
+    """
+
+    @pytest.mark.parametrize(("endpoint", "body"), ROUTES, ids=ROUTE_IDS)
+    def test_a_declaring_passthrough_backend_whose_parser_stopped_matching_IS_counted(
+        self, endpoint: str, body: dict
+    ) -> None:
+        """DETECTOR. Healthy 200 relay, normal completion, empty sink => one.
+
+        This is not an error relay. Every chunk is delivered, the status is
+        200, the stream ends normally -- and the sink is empty, which on a
+        declaring backend means its parser stopped matching what the
+        upstream sends. That is the single defect the whole mechanism exists
+        to separate, arriving on the one backend that carries
+        `error_passthrough`.
+
+        Excluding `passthrough` from `_record_missing_stream_usage`, as
+        `msg-225` requests, returns 0.0 here: the counter goes blind on
+        `anthropic` -- the only backend with the flag and one of the three
+        that declare they fill the sink -- against REAL parser defects, not
+        just error relays. `msg-222` §1 recorded that anti-correlation as a
+        trap for us to avoid; this case reds if it is ever walked into from
+        the other direction.
+
+        The `usage_sink` assertion is the refutation itself, as a
+        measurement rather than a comment: the passthrough path passes the
+        sink to the backend generator exactly as the `else` does.
+
+        Parametrised over all three routes deliberately. Only
+        `chat_completions` and `completions` have an `if passthrough`
+        branch; `/v1/messages` has none -- there the flag chooses an error
+        BODY SHAPE and nothing else -- so its case guards the predicate
+        rather than a branch, and the predicate is where the requested
+        exclusion would most naturally be written.
+        """
+        tracker = MagicMock()
+        before = _missing_count(endpoint)
+        backend = _backend(declares=True, fills=False, passthrough=True)
+
+        with _client(backend, tracker) as client:
+            response = client.post(endpoint, json=body)
+
+        assert response.status_code == 200
+        assert _missing_count(endpoint) - before == 1.0
+        assert tracker.record.call_count == 0
+
+        # ★ The premise of `msg-225`, measured false: the passthrough path
+        # does not skip the parser, it calls it, and hands it the sink.
+        stream = _stream_mock(backend, endpoint)
+        assert stream.call_count == 1
+        assert stream.call_args.kwargs["usage_sink"] is not None
+
+    @pytest.mark.parametrize(
+        ("endpoint", "body", "raise_at", "relayed_status"),
+        [
+            # Raised before any byte leaves the backend => the router's
+            # pre-flight `__anext__()` answers with a `JSONResponse` and
+            # `stream_generator` is never constructed at all.
+            ("/v1/chat/completions", CHAT_BODY, "first_chunk", UPSTREAM_STATUS),
+            ("/v1/completions", COMPLETIONS_BODY, "first_chunk", UPSTREAM_STATUS),
+            ("/v1/messages", MESSAGES_BODY, "first_chunk", UPSTREAM_STATUS),
+            # Raised after a chunk => `except BackendError`, re-raised, and
+            # `completed_normally` never set. `relayed_status=None` means
+            # the error reaches the caller as an exception.
+            ("/v1/chat/completions", CHAT_BODY, "mid_stream", None),
+            ("/v1/completions", COMPLETIONS_BODY, "mid_stream", None),
+            # ★ `/v1/messages` + `mid_stream` is ABSENT, and measured rather
+            # than assumed: there the converter absorbs the exception and
+            # the delta is 1.0, not 0.0. That is the known gap, already held
+            # head-on by
+            # `test_a_messages_stream_error_with_an_empty_sink_IS_counted`.
+            # Listing it here as 0.0 would be the assumption `msg-226` §11
+            # warned against.
+        ],
+        ids=[
+            "first_chunk-chat_completions",
+            "first_chunk-completions",
+            "first_chunk-messages",
+            "mid_stream-chat_completions",
+            "mid_stream-completions",
+        ],
+    )
+    def test_an_upstream_error_under_passthrough_is_not_counted(
+        self,
+        endpoint: str,
+        body: dict,
+        raise_at: str,
+        relayed_status: int | None,
+    ) -> None:
+        """FENCE. The gate's actual scenario, in both of its shapes: 0.0.
+
+        `msg-225` said an anthropic 4xx forwarded through the passthrough
+        branch would be counted. It is not, and it is excluded twice over,
+        which is why both shapes are here rather than one:
+
+        - `first_chunk` -- what `anthropic.py:450/488` really does. The
+          `>= 400` check runs before a single byte is yielded, so the raise
+          lands on the router's pre-flight, which returns a `JSONResponse`
+          carrying the upstream's status, body and `Retry-After`. The
+          predicate is never even called.
+        - `mid_stream` -- the variant the pre-flight cannot catch.
+          `BackendUpstreamError` is a `BackendError` (`base.py:98`), so it
+          reaches the `except` clause, is re-raised, and the success mark
+          that sets `completed_normally` is never reached.
+
+        A fence and not a detector: both were 0.0 before this commit too.
+        The status/`Retry-After` assertions are not decoration -- they are
+        what proves the relay really happened rather than the request
+        failing some other way and reaching 0.0 for the wrong reason.
+        """
+        tracker = MagicMock()
+        before = _missing_count(endpoint)
+        backend = _backend(
+            declares=True, fills=False, passthrough=True, upstream_error_at=raise_at
+        )
+
+        with _client(backend, tracker) as client:
+            if relayed_status is None:
+                with pytest.raises(BackendUpstreamError):
+                    client.post(endpoint, json=body)
+            else:
+                response = client.post(endpoint, json=body)
+                assert response.status_code == relayed_status
+                assert response.headers["Retry-After"] == "42"
+
+        assert _missing_count(endpoint) - before == 0.0
+        assert tracker.record.call_count == 0
 
 
 class TestTheDeclarationIsNotAnExistingFlagInDisguise:

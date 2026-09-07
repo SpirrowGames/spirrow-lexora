@@ -499,6 +499,8 @@ async def chat_completions(
         byte_iter = None
         passthrough = getattr(backend, "error_passthrough", False)
         if passthrough:
+            # ★ The sink is passed HERE, on the passthrough path too. Read
+            # the next three lines before reading `stream_generator` below.
             byte_iter = backend.chat_completions_stream(
                 request_dict, usage_sink=usage_sink
             ).__aiter__()
@@ -586,6 +588,24 @@ async def chat_completions(
             # rationale, which this must not erode.
             completed_normally = False
             try:
+                # ★ THIS BRANCH DOES NOT BYPASS THE PARSER -- it *is* the
+                # parser. `byte_iter` is
+                # `backend.chat_completions_stream(request_dict,
+                # usage_sink=usage_sink)`, built at line 504 above (:1001 in
+                # `completions`, :2186 in `messages`) -- the same generator
+                # the `else` calls, with the same sink. A passthrough stream
+                # therefore fills the sink and opens a ledger row exactly
+                # like a non-passthrough one does.
+                #
+                # ∴ do NOT exclude `passthrough` from
+                # `_record_missing_stream_usage`. `anthropic` is the only
+                # backend that carries the flag (`ERROR_PASSTHROUGH_TYPES`)
+                # and one of the three that DO fill the sink, so excluding
+                # it would blind the counter on the best-instrumented
+                # backend against real parser defects -- while an upstream
+                # 4xx/5xx is already excluded twice over, by the pre-flight
+                # above and by `completed_normally`. Detector:
+                # test_a_declaring_passthrough_backend_whose_parser_stopped_matching_IS_counted
                 if passthrough and byte_iter is not None:
                     if first_chunk is not None:
                         yield first_chunk
@@ -976,6 +996,8 @@ async def completions(
         byte_iter = None
         passthrough = getattr(backend, "error_passthrough", False)
         if passthrough:
+            # ★ The sink is passed HERE, on the passthrough path too. Same
+            # construction as `chat_completions` above, same consequence.
             byte_iter = backend.completions_stream(
                 request_dict, usage_sink=usage_sink
             ).__aiter__()
@@ -1054,6 +1076,10 @@ async def completions(
             # success. See the identical pair in `chat_completions` above.
             completed_normally = False
             try:
+                # ★ Not a parser bypass: `byte_iter` is
+                # `backend.completions_stream(..., usage_sink=usage_sink)`
+                # from line 1001 above. See the full note on the
+                # identical branch in `chat_completions`.
                 if passthrough and byte_iter is not None:
                     if first_chunk is not None:
                         yield first_chunk
@@ -2154,6 +2180,9 @@ async def messages(
         # same line in `chat_completions` above.
         usage_sink = UsageSink()
 
+        # ★ The sink is passed HERE, and unconditionally: this endpoint has
+        # no `if passthrough` branch at all -- the flag only picks the error
+        # body shape at the `BackendUpstreamError` clause below.
         byte_iter = backend.chat_completions_stream(
             openai_request, usage_sink=usage_sink
         ).__aiter__()
