@@ -67,7 +67,7 @@ from lexora.services.metrics import MetricsCollector
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.stats import StatsCollector
-from tests.api.test_ledger_coverage import DURATION_SLACK
+from tests.api.test_ledger_coverage import DURATION_SLACK, read_outer_clock
 
 # How far the fake wall clock jumps backwards between two reads. Any value
 # larger than a mocked request's real elapsed time makes the resulting
@@ -87,6 +87,25 @@ BACKWARDS_STEP_SECONDS = 5.0
 # what a mixed pair produces, so it discriminates the two without being tight
 # enough to flake on a slow or heavily loaded CI runner.
 MAX_PLAUSIBLE_DURATION_SECONDS = 60.0
+
+# How far `_TickSkippingClock` jumps forward, once, in the middle of a
+# handler's interval. The mechanism being reproduced is measured and small:
+# `time.monotonic()` on this runner is `GetTickCount64()` and when the system
+# timer interrupt is delayed it advances by TWO ticks at once -- observed steps
+# of 31 and 32 ms against a nominal 15.625 ms, a factor of 2.05, taken while
+# the full suite ran in another process.
+#
+# This constant is three orders of magnitude larger than that, and
+# deliberately. The half of the test below that matters is the one asserting
+# the SUPERSEDED bound goes red, and that bound is
+# `duration <= perf_counter_wall + DURATION_SLACK`: whether a real 32 ms skip
+# reddens it depends on how many milliseconds of TestClient round trip this
+# particular runner puts outside the handler's window. A fence whose verdict
+# depends on runner speed is the flake being repaired, reintroduced. 5 s sits
+# far above any plausible round trip, so the verdict is a property of the
+# mechanism and not of the machine. Same reasoning, same value, as
+# `BACKWARDS_STEP_SECONDS` above.
+CLOCK_SKIP_SECONDS = 5.0
 
 
 class _BackwardsWallClock:
@@ -118,6 +137,61 @@ class _BackwardsWallClock:
         return value
 
     def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+class _TickSkippingClock:
+    """A stand-in for the `time` module whose `monotonic()` skips forward once.
+
+    Every reading after `skip()` is `CLOCK_SKIP_SECONDS` further along than
+    real time went. That is what a delayed timer interrupt does to
+    `GetTickCount64()`: the clock does not advance late, it advances by more
+    than a tick in one step, and `time.get_clock_info("monotonic").resolution`
+    goes on reporting the nominal figure throughout.
+
+    The skip is triggered by the backend double rather than by counting reads,
+    so it lands strictly between the handler's two endpoints no matter how
+    many times the handler reads the clock. Counting would make this test's
+    meaning depend on an implementation detail of `routes.py`.
+
+    **Only `monotonic()` is faked**, and `__getattr__` delegates the rest, in
+    the same shape as `_BackwardsWallClock` above. The asymmetry there is the
+    opposite of the one here and both are deliberate: that fake moves the
+    clock the handler was supposed to stop reading, this one moves the clock
+    the handler was supposed to move to.
+    """
+
+    def __init__(self, skip_seconds: float) -> None:
+        self._skip_seconds = skip_seconds
+        self._offset = 0.0
+        self.skips = 0
+
+    def skip(self) -> None:
+        self._offset += self._skip_seconds
+        self.skips += 1
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self._offset
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+class _ClockAttributeRecorder:
+    """A pass-through stand-in for `time` that records which names are read.
+
+    Nothing is faked. The point is the set of attribute names `routes.py`
+    resolves while serving one request, which is the only mechanical way to
+    state "the handler measures its interval off `monotonic` and off no other
+    clock" -- a claim the bracket in `test_ledger_coverage.py` now depends on
+    and which was previously readable only by grepping the source.
+    """
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def __getattr__(self, name: str) -> Any:
+        self.names.add(name)
         return getattr(time, name)
 
 
@@ -328,72 +402,180 @@ class TestPreflightDurationSurvivesABackwardsClock:
         _assert_bracketed(metrics.durations)
 
 
-def test_the_outer_clock_is_finer_than_the_slack() -> None:
-    """`test_ledger_coverage.py`'s bracket budgets for ONE clock's quantum.
+def test_a_skipped_tick_cannot_break_the_upper_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bracket's upper bound survives the clock error that falsified it.
 
-    That bracket widens each end by `DURATION_SLACK`, and it spends that width
-    on the handler's inner clock and on nothing else. So it treats the outer
-    reading `wall` -- taken off `time.perf_counter()` -- as exact. That is
-    legitimate only while `perf_counter`'s own quantum is small next to the
-    slack; where it is not, the outer reading carries a quantum the bracket
-    never budgets for, and the derivation stops being true while the numbers
-    still look reasonable. The derivation itself is stated once, at
+    This replaces `test_the_outer_clock_is_finer_than_the_slack`, and the
+    removal is as much of the point as the addition. That check asserted
+    `perf_counter.resolution < DURATION_SLACK`, fencing the premise that the
+    bracket's OUTER reading carried a quantum small enough to ignore. The
+    bracket no longer has an outer clock distinct from the inner one, so that
+    premise is not merely satisfied, it is gone. A green check standing over a
+    premise nothing rests on is the same defect this thread found in the check
+    below, arrived at from the other direction, so it is deleted rather than
+    left to accumulate authority.
+
+    What replaces it fences the premise the bound actually has now: that ONE
+    non-decreasing clock reads both ends. Given that, and given the outer
+    window strictly containing the inner one,
+
+        m(outer_start) <= m(inner_start) <= m(inner_end) <= m(outer_end)
+
+    so `duration <= wall` holds identically -- for a clock of any coarseness,
+    and for a clock that skips ticks. The derivation is stated once, at
     `DURATION_SLACK` in `test_ledger_coverage.py`, and is not restated here.
 
-    Nothing in the repository made that so. It is a property of whichever
-    platform runs the suite, and it was stated only in a comment -- "resolution
-    1e-07 here" -- which is precisely the unchecked-claim shape this suite
-    keeps finding. So it is measured here instead of asserted there.
+    So this test injects the exact error that killed the old bound. A clock
+    that jumps forward mid-request, triggered by the backend double so it
+    lands strictly between the handler's two readings, and then both halves
+    are asserted on the same request:
 
-    The derivation is not quoted here either, and that is deliberate rather
-    than terse. A verbatim sentence of it used to sit at the top of this
-    docstring, and it went stale inside the very commit that edited the
-    original: one file went on arguing from a word the other file had already
-    dropped, and the two disagreed from the moment they were written. Name the
-    other file and the claim, and let it speak for itself. A copy of another
-    file's prose is a second thing to keep true.
+      1. the shipped bound holds -- and it holds because `read_outer_clock`
+         resolves through `routes.time`, which is what this test patches, so
+         the skip reaches BOTH ends the way a real skipped tick does;
+      2. the SUPERSEDED bound, `duration <= perf_counter_wall +
+         DURATION_SLACK`, is RED on that same request.
 
-    This is the second of the derivation's two premises. The first -- that the
-    slack is not finer than the handler's tick -- is fenced separately, by
-    `test_the_slack_covers_the_handlers_tick_and_the_floor` below. Neither
-    stands in for the other, and they fail in different ways: a *platform*
-    reddens this one with no edit at all, whereas no platform can redden that
-    one and only an *edit* to the derivation can. Both are kept. Why the second
-    survives despite being unreddenable by any platform is measured in its own
-    docstring, not argued here. An edit can redden this one too, but only on a
-    platform where that edit actually moves `DURATION_SLACK` -- see the last
-    paragraph, which is an observation and not a symmetry argument.
-
-    Measured where this was written: `perf_counter` reports 1e-07 against a
-    slack of 15.625 ms, five orders of magnitude, so unlike the check it
-    replaces this one does not hold by a whisker. The Linux runner is no longer
-    an assumption either: on `ubuntu-latest` both `perf_counter` and `monotonic`
-    report 1e-09, read off the failure text of CI run 34053301337 rather than
-    assumed. What follows from those two readings is arithmetic, and is marked
-    as such: unmutated, `max(1e-09, 0.001)` makes the slack the floor, so there
-    this holds by six orders rather than five.
-
-    That run also reddened this assertion, which nothing here predicted. It was
-    a throwaway branch, never merged, whose mutation was the 1 ms floor dropped
-    from `DURATION_SLACK`. On Linux the floor is what the slack IS, so dropping
-    it collapses the slack onto `m` = 1e-09, which is exactly `p`, and this
-    check fails with `assert 1e-09 < 1e-09`. On Windows the floor is a no-op --
-    the slack stays 15.625 ms whether it is there or not -- so the same edit
-    leaves this green. Margin width is not what decides it; whether the edit
-    moves `DURATION_SLACK` on that platform is. The check is therefore not
-    merely a platform detector: an edit to the line it guards reddens it too,
-    on a platform in the class this ships to.
+    (2) is why this is a demonstration and not a claim. The failure it
+    reproduces was reachable in the tree only about one full-suite run in
+    eight, and only under load; here it is deterministic and it is on every
+    run. (1) is the fence: revert `read_outer_clock` to a locally-held
+    `time.perf_counter` and this test reddens on the next run rather than in
+    some later eighth.
     """
-    outer = time.get_clock_info("perf_counter").resolution
-    assert outer < DURATION_SLACK, (
-        f"perf_counter resolution {outer!r} is not finer than DURATION_SLACK "
-        f"{DURATION_SLACK!r}: `wall` in test_ledger_coverage.py carries a "
-        f"quantum of its own that the duration bracket does not budget for"
+    clock = _TickSkippingClock(CLOCK_SKIP_SECONDS)
+    monkeypatch.setattr(routes, "time", clock)
+
+    async def _skip_then_respond(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        clock.skip()
+        return CHAT_RESPONSE
+
+    backend = _backend()
+    backend.chat_completions = AsyncMock(side_effect=_skip_then_respond)
+
+    metrics = _RecordingMetrics()
+    started = read_outer_clock()
+    started_superseded = time.perf_counter()
+    response = _client(backend, metrics).post(
+        "/v1/chat/completions", json=CHAT_COMPLETIONS_BODY
+    )
+    wall = read_outer_clock() - started
+    wall_superseded = time.perf_counter() - started_superseded
+
+    assert response.status_code == 200
+    # Without this the rest is vacuous in the one way that matters: a skip
+    # that never fired would leave both assertions below trivially satisfied
+    # and this test green while measuring nothing.
+    assert clock.skips == 1, (
+        f"the clock skipped {clock.skips} times, not once -- the jump did not "
+        f"land inside the handler's interval and nothing below was measured"
+    )
+    assert metrics.durations, "no duration reached the metrics path"
+    duration = metrics.durations[0]
+
+    assert duration <= wall, (
+        f"duration {duration!r} exceeds wall {wall!r} across a skipped tick: "
+        f"the bracket's two ends are no longer reading one clock, which is "
+        f"the only thing making its upper bound sound"
+    )
+    assert not duration <= wall_superseded + DURATION_SLACK, (
+        f"the superseded bound (perf_counter wall {wall_superseded!r} plus "
+        f"DURATION_SLACK {DURATION_SLACK!r}) admitted duration {duration!r} "
+        f"across a {CLOCK_SKIP_SECONDS}s skip -- this test is not reproducing "
+        f"the failure it exists to reproduce"
     )
 
 
-def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
-    """`DURATION_SLACK` must clear the handler's tick, and must clear the floor.
+@pytest.mark.parametrize(("endpoint", "body"), NON_STREAMING_ROUTES)
+def test_the_handler_measures_its_interval_off_monotonic_alone(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, body: dict
+) -> None:
+    """The other half of "one clock reads both ends", stated mechanically.
+
+    `read_outer_clock` guarantees the bracket's outer end resolves through
+    `routes.time.monotonic`. That is worth nothing on its own if `routes.py`
+    stops measuring its interval with `monotonic`, and no assertion in this
+    suite said which clock it reads -- the claim lived in a comment and in a
+    grep count. This records the attribute names `routes.py` actually resolves
+    off the `time` module while serving one request, one route per handler.
+
+    The lower half (`monotonic` is read) and the upper half (`time` and
+    `perf_counter` are not) fail differently and are asserted separately: a
+    handler that read nothing would satisfy the second on its own.
+
+    The ceiling, stated because the second half over-reaches on purpose: it
+    forbids these handlers from reading any other clock AT ALL, which is
+    stronger than "no other clock measures an interval". A `time.time()` added
+    for a log timestamp would redden it. That is the deliberate trade -- a
+    read is mechanically visible and an interval is not, and the failure this
+    file exists for was exactly an interval nobody could see the ends of. A
+    legitimate second reader should redden this and be argued for here, rather
+    than arrive silently.
+    """
+    recorder = _ClockAttributeRecorder()
+    monkeypatch.setattr(routes, "time", recorder)
+
+    metrics = _RecordingMetrics()
+    response = _client(_backend(), metrics).post(endpoint, json=body)
+
+    assert response.status_code == 200
+    assert "monotonic" in recorder.names, (
+        f"{endpoint} resolved {sorted(recorder.names)!r} off `time` and never "
+        f"`monotonic`: the bracket in test_ledger_coverage.py reads the outer "
+        f"end off `routes.time.monotonic` and would no longer share a clock "
+        f"with the handler"
+    )
+    assert not recorder.names & {"time", "perf_counter"}, (
+        f"{endpoint} resolved {sorted(recorder.names & {'time', 'perf_counter'})!r} "
+        f"off `time` as well as `monotonic` -- a second clock on this path is "
+        f"either the adjustable one coming back or an interval endpoint that "
+        f"no longer pairs with the outer reading"
+    )
+
+
+def test_the_lower_bound_slack_keeps_its_derivation_and_its_floor() -> None:
+    """`DURATION_SLACK`'s VALUE is fenced against edits. Only its value.
+
+    This check used to be called `test_the_slack_covers_the_handlers_tick_and
+    _the_floor` and its first failure message used to end "the bracket is
+    tighter than the clock feeding it and will flake on a true reading". Both
+    have been withdrawn, and what they claimed is worth writing out because it
+    is the most instructive thing in this file.
+
+    The bracket flaked on a true reading. This check was green through it.
+    `time.get_clock_info("monotonic").resolution` is a NOMINAL figure, not an
+    observation: measured on this runner while the suite ran in another
+    process, `time.monotonic()` steps 15 or 16 ms normally and **31 or 32 ms**
+    when the timer interrupt is delayed, while `get_clock_info` reports
+    0.015625 throughout. So the proposition the old name asserted -- that the
+    slack covers the handler's tick -- is FALSE here, by roughly a factor of
+    two, and this check is structurally incapable of noticing, because
+    `DURATION_SLACK` is `max(m, 0.001)` and the `m` below is the same
+    `get_clock_info` read. Both sides of the first conjunct are one nominal
+    constant. It asks the clock to describe itself.
+
+    That is worse than a tautology and it is a different failure from the one
+    the tautology argument below was about. The argument below asks whether an
+    EDIT can redden a check; it never asks whether the check's operands can
+    express the proposition at all. Nothing here is being repaired by renaming
+    it: the check keeps exactly the coverage the mutation table measured, and
+    the name and message now claim exactly that and no more.
+
+    What still rests on this line, after `T-duration-slack-underestimates-the-
+    tick`: the bracket's LOWER end alone. The upper end no longer budgets a
+    tick -- it reads both ends off one clock and holds identically -- so the
+    falsification above no longer threatens it. It does still threaten the
+    lower end, which is left in place deliberately and survives on a measured
+    margin (min +0.011625 s over 32 samples of the shipped shape, +0.012625
+    over 32 taken before the change) rather than on its derivation.
+    That residual is recorded at `DURATION_SLACK` in `test_ledger_coverage.py`
+    and is not re-argued here.
+
+    The rest of this docstring is the original argument for the check's
+    existence, unchanged, because the mutation table it carries is unaffected
+    by the rescope.
 
     This check was deleted once and is restored here, so the argument that
     deleted it is written out rather than left to be re-derived. That argument:
@@ -477,8 +659,17 @@ def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
     message instead of assumed. And the floor conjunct does catch the
     floor-dropped edit there, so the two conjuncts are complementary by
     measurement on both platform classes rather than by arithmetic on one.
-    The unpredicted part was the other failure in that run, in
-    `test_the_outer_clock_is_finer_than_the_slack`; it is recorded there.
+    The unpredicted part was the other failure in that run, and its record is
+    kept here because the check that held it has since been deleted: it was
+    `test_the_outer_clock_is_finer_than_the_slack`, asserting
+    `perf_counter.resolution < DURATION_SLACK`, and on that Linux runner
+    dropping the floor collapsed the slack onto `m` = 1e-09, which is exactly
+    `p`, so it failed on `assert 1e-09 < 1e-09`. On Windows the same edit
+    leaves it green, the floor being a no-op where the slack is 15.625 ms
+    either way. That check has been replaced by
+    `test_a_skipped_tick_cannot_break_the_upper_bound`, because the premise it
+    fenced -- the bracket's outer reading carrying a quantum of its own -- no
+    longer exists once both ends read one clock.
 
     The ceiling, so that no more is claimed for this than it gives: it guards
     the *value* of `DURATION_SLACK` and never its *provenance*. The drift this
@@ -489,9 +680,11 @@ def test_the_slack_covers_the_handlers_tick_and_the_floor() -> None:
     """
     m = time.get_clock_info("monotonic").resolution
     assert DURATION_SLACK >= m, (
-        f"DURATION_SLACK {DURATION_SLACK!r} is finer than the handler's tick "
-        f"{m!r}: test_ledger_coverage.py's bracket is tighter than the clock "
-        f"feeding it and will flake on a true reading"
+        f"DURATION_SLACK {DURATION_SLACK!r} no longer covers the REPORTED "
+        f"monotonic resolution {m!r}: the derivation line in "
+        f"test_ledger_coverage.py has been edited away from `max(m, 0.001)`. "
+        f"This says nothing about the clock's real quantum, which is larger "
+        f"than the report -- see this test's docstring"
     )
     assert DURATION_SLACK >= 0.001, (
         f"DURATION_SLACK {DURATION_SLACK!r} is below the 1 ms floor that keeps "
