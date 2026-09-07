@@ -144,6 +144,26 @@ COMPLETION_TOKENS = 42
 # is fenced below by comparison instead -- a delayed call against an undelayed
 # one -- which rests on no resolution premise and additionally catches the one
 # thing a bracket cannot: a constant inside the band.
+#
+# Two corrections to the paragraphs above, neither of which changes the
+# decision they record.
+#
+# The `SLOW - slack <= d <= wall + slack` shape quoted above described
+# `test_ledger_coverage.py` as it stood when this file was written. That file's
+# upper end no longer carries slack: it reads `wall` off the handler's own
+# clock, which makes `d <= wall` hold identically and removes the resolution
+# premise from that end rather than widening the budget for it
+# (T-duration-slack-underestimates-the-tick). Its LOWER end still carries one
+# tick, so the reasoning above still applies to the half this file was
+# comparing itself against, and the decision here is unchanged.
+#
+# And the observation above -- "the reported `monotonic` resolution of 0.015625
+# is nominal" -- was right, was recorded here first, and was left sitting in a
+# comment while the file it indicts went on shipping a one-tick upper bound
+# that then flaked about one full-suite run in eight for another round. Under
+# load the step reaches 31 and 32 ms, not merely 15 or 16. A measurement that
+# falsifies another file's premise is not filed by writing it down next to the
+# code that already worked around it.
 SLOW = 0.05
 
 # One well-formed OpenAI SSE chunk. `/v1/chat/completions` and `/v1/completions`
