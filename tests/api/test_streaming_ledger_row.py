@@ -23,8 +23,16 @@ was reached. The requirement is "a row is opened", so that is what is driven.
 
 The fake backend fills the sink itself rather than being an `anthropic`. The
 router must not know any upstream format, so reaching for a real backend here
-would assert the opposite of the design -- and these detectors keep working
-when PR-B adds `gemini` and `claude_code`.
+would assert the opposite of the design.
+
+That last clause used to read "and these detectors keep working when PR-B adds
+`gemini` and `claude_code`" -- a prediction. PR-B has landed both, and the
+prediction is now a measurement: this file's 16 cases stayed 16 green under
+every single-site mutation in `test_gemini_stream_usage.py`'s and
+`test_claude_code_stream_usage.py`'s tables, and not one line of this file or
+of `stream_generator` changed to admit either backend. That is the design
+property -- the router learned no upstream format -- observed rather than
+asserted.
 
 Mutation, so the detectors are measured rather than asserted. Counts are this
 file alone, 16 cases, run on win32 / CPython 3.12.
