@@ -708,9 +708,41 @@ class TestLedgerCoversEveryNonStreamingRoute:
             f"nesting identity that makes `backend_delta <= duration` exact "
             f"no longer holds"
         )
-        # Then the shipped bracket, unchanged, on the same request: under one
-        # frozen clock all four readings collapse to the same value and the
-        # identity is satisfied at its boundary, 0.0 <= 0.0 <= 0.0.
+        # Then the shipped bracket, unchanged, on the same request. It is
+        # satisfied at its boundary, 0.0 <= 0.0 <= 0.0, and what holds it
+        # there is SIX reads of the frozen clock, not four. They fall into
+        # three pairs, one per term, and every term is the difference of two
+        # reads of the same stopped clock -- which is why every term is 0.0:
+        #
+        #   backend_delta  <- `_backend`'s two, through `read_outer_clock`
+        #   duration       <- `routes.py`'s OWN two, its `start_time` and its
+        #                     `duration` read. `routes` does `import time` and
+        #                     then `time.monotonic()`, so patching `routes.time`
+        #                     reaches these as well; they are the only two of
+        #                     the six not taken through `read_outer_clock`.
+        #   wall           <- this test's two, the `started` and `wall` reads
+        #                     above, also through `read_outer_clock`
+        #
+        # Counted rather than eyeballed: a wrapper on `_FrozenClock.monotonic`
+        # records exactly 6 reads per param, 2 at each of those three sites, on
+        # all four params, all 6 returning one value.
+        #
+        # The `four-reading nesting identity` in the message above is a
+        # DIFFERENT four and `wall` is not among them: handler-start,
+        # backend-entered, backend-exit, handler-end -- the two inner pairs,
+        # whose nesting is what makes `backend_delta <= duration` exact. Two
+        # quartets under one bare phrase five lines apart is what left this
+        # line open to being read as a claim that only the inner clock was
+        # frozen, so it is stated as six here and the nesting identity keeps
+        # the name it earns there.
+        #
+        # `wall` is frozen too, by construction and not by luck: the patch is
+        # this test's FIRST statement, installed before `started` is read, so
+        # both outer reads resolve through the frozen `routes.time` exactly as
+        # the inner four do. Deliberately NOT asserted here -- that leg's
+        # provenance is already fenced by `test_interval_clock.py::
+        # test_a_skipped_tick_cannot_break_the_upper_bound`, and a second fence
+        # on a leg that already has one buys no detection.
         assert backend_delta <= kwargs["duration"] <= wall
 
 
