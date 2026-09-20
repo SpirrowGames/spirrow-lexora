@@ -16,8 +16,17 @@ from lexora.main import create_app
 
 
 def _app_with_null_provider() -> TestClient:
-    """Build the app with a safe (NullProvider-only) decision config."""
-    settings = Settings(decision=DecisionSettings(primary="null", mode="off"))
+    """Build the app with a safe (NullProvider-only) decision config.
+
+    ``log_path=":memory:"`` is passed explicitly so this test does not
+    write a ``data/decisions.db`` file into the working tree on every
+    run. Production defaults to on-disk (see :class:`DecisionSettings`);
+    tests that need to introspect the log use ``app.state.decision_log.
+    fetch_all()`` on the in-memory instance.
+    """
+    settings = Settings(
+        decision=DecisionSettings(primary="null", mode="off", log_path=":memory:")
+    )
     return TestClient(create_app(settings=settings))
 
 
@@ -61,7 +70,11 @@ class TestDecideRoute:
 
     def test_questions_version_recorded_in_log(self) -> None:
         """A request WITH ``questions_version`` lands on the log row."""
-        settings = Settings(decision=DecisionSettings(primary="null", mode="off"))
+        settings = Settings(
+            decision=DecisionSettings(
+                primary="null", mode="off", log_path=":memory:"
+            )
+        )
         app = create_app(settings=settings)
         client = TestClient(app)
         resp = client.post(
@@ -164,9 +177,55 @@ class TestDecideStartupEnvCheck:
     ) -> None:
         monkeypatch.setenv("TYPESAFE_API_KEY", "sk-not-a-real-key")
         settings = Settings(
-            decision=DecisionSettings(primary="jev", fallback="llm", mode="active")
+            decision=DecisionSettings(
+                primary="jev", fallback="llm", mode="active", log_path=":memory:"
+            )
         )
         # No exception; a happy startup is the whole assertion.
         app = create_app(settings=settings)
         # And the app carries the config it was built with.
         assert app.state.decision_settings.primary == "jev"
+
+
+class TestDecisionLogPathHonoured:
+    """``create_app`` places the decision log at ``settings.decision.log_path``.
+
+    Rationale (msg-251): before this fix the wiring in ``main.py``
+    hard-coded ``DecisionLog(path=":memory:")``, which made the
+    shadow-mode data-collection promise in msg-237 unachievable — a
+    process restart forgot every logged row. The test below pins the
+    write against the configured path so a regression that reintroduces
+    the literal is caught here rather than in production traffic.
+    """
+
+    def test_writes_land_on_configured_path(self, tmp_path) -> None:
+        """A write through the endpoint appears in the configured SQLite file."""
+        db_path = tmp_path / "sub" / "decisions.db"
+        settings = Settings(
+            decision=DecisionSettings(
+                primary="null", mode="off", log_path=str(db_path)
+            )
+        )
+        app = create_app(settings=settings)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/v1/decide",
+            json={
+                "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}},
+                "policy": "p",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert db_path.exists(), "log file was not created at the configured path"
+
+        # Cross-check the row landed via a fresh connection so this
+        # test does not lean on the same in-memory handle it wrote
+        # through — the whole point of on-disk persistence is that a
+        # second reader can see the row.
+        import sqlite3
+
+        with sqlite3.connect(str(db_path)) as ro:
+            (count,) = ro.execute("SELECT COUNT(*) FROM decisions").fetchone()
+        assert count == 1

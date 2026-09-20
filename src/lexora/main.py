@@ -150,7 +150,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # need to change when llm / jev arrive in follow-up PRs.
     app.state.decision_settings = settings.decision
     app.state.decision_providers = build_default_providers()
-    app.state.decision_log = DecisionLog(path=":memory:")
+    # On-disk by default (msg-251 blocking objection): the shadow-mode
+    # data-collection story msg-237 requires — "較正曲線とリプレイ評価
+    # はここから引く" / "mindwire の 116 判断点リプレイもこの
+    # エンドポイント経由で流し、オフライン評価と本番を同一コード
+    # パスにする" — is only satisfied if rows survive a process
+    # restart. ``settings.decision.log_path`` defaults to
+    # ``data/decisions.db``; tests point it at a tmp path or at
+    # ``:memory:``. The parent directory is created by DecisionLog
+    # itself.
+    app.state.decision_log = DecisionLog(path=settings.decision.log_path)
 
     # Include API routes
     app.include_router(router)

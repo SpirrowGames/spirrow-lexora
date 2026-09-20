@@ -1410,6 +1410,7 @@ def app_with_shared_model_router(monkeypatch: pytest.MonkeyPatch):
     not the setup.
     """
     from lexora import config as config_module
+    from lexora.decide.config import DecisionSettings
 
     def _fake_settings() -> "config_module.Settings":  # type: ignore[name-defined]
         return config_module.Settings(
@@ -1425,7 +1426,11 @@ def app_with_shared_model_router(monkeypatch: pytest.MonkeyPatch):
                     ),
                 },
                 tiers={"light": TierSettings(backend="b1", model="dup-model")},
-            )
+            ),
+            # Keep the decision log in memory so this test does not
+            # write ``data/decisions.db`` as an incidental side effect
+            # of building the app (msg-251 fix).
+            decision=DecisionSettings(log_path=":memory:"),
         )
 
     monkeypatch.setattr(config_module, "create_settings", _fake_settings)
@@ -1517,6 +1522,7 @@ def app_with_shared_model_router_app(monkeypatch: pytest.MonkeyPatch):
     hands back the app rather than a single client.
     """
     from lexora import config as config_module
+    from lexora.decide.config import DecisionSettings
 
     def _fake_settings() -> "config_module.Settings":  # type: ignore[name-defined]
         return config_module.Settings(
@@ -1532,7 +1538,11 @@ def app_with_shared_model_router_app(monkeypatch: pytest.MonkeyPatch):
                     ),
                 },
                 tiers={"light": TierSettings(backend="b1", model="dup-model")},
-            )
+            ),
+            # Same log-path override as the sibling fixture above:
+            # tests do not need to persist rows across a process
+            # boundary, so :memory: keeps this test hermetic.
+            decision=DecisionSettings(log_path=":memory:"),
         )
 
     monkeypatch.setattr(config_module, "create_settings", _fake_settings)

@@ -107,6 +107,22 @@ class DecisionSettings(BaseSettings):
         ge=1,
         description="Per-call upstream deadline in milliseconds.",
     )
+    log_path: str = Field(
+        default="data/decisions.db",
+        description=(
+            "Filesystem path for the SQLite decision log. Parent directory "
+            "is created if missing (see :class:`lexora.decide.log."
+            "DecisionLog`). Must be a durable path — msg-237 requires the "
+            "log for calibration-curve fitting and for replaying "
+            "mindwire's 116 decision points through the same code path, "
+            "which is only possible if rows survive a process restart. "
+            "The one exception is tests, which pass ``:memory:`` "
+            "explicitly through the settings override. The regular "
+            "``data/decisions.db`` default matches the sibling convention "
+            "in ``services/cost_tracker.py`` (``data/costs.db``) so an "
+            "operator does not have to learn two directory layouts."
+        ),
+    )
 
 
 def references_jev(settings: DecisionSettings) -> bool:

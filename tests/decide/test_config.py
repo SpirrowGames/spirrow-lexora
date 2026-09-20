@@ -32,6 +32,25 @@ class TestDecisionSettingsDefaults:
         assert settings.fallback == "llm"
         assert settings.timeout_ms == 2000
 
+    def test_default_log_path_is_on_disk(self) -> None:
+        """The decision log defaults to a durable path.
+
+        msg-251 blocking objection: ``:memory:`` would make shadow-mode
+        data collection (msg-237's calibration curves and mindwire's
+        116 decision-point replay) forget everything at every process
+        restart. The default must be on disk. The specific path
+        ``data/decisions.db`` matches the sibling ``data/costs.db``
+        convention in ``services/cost_tracker.py`` so an operator does
+        not have to learn two directory layouts.
+        """
+        settings = DecisionSettings()
+        assert settings.log_path == "data/decisions.db"
+
+    def test_log_path_accepts_memory_for_tests(self) -> None:
+        """Tests may pass ``:memory:`` explicitly to keep the run hermetic."""
+        settings = DecisionSettings(log_path=":memory:")
+        assert settings.log_path == ":memory:"
+
     def test_timeout_ms_must_be_positive(self) -> None:
         """0 / negative timeouts are refused (ge=1 in the field)."""
         with pytest.raises(Exception):
