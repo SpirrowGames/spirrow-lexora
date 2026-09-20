@@ -9,6 +9,7 @@ import yaml
 from pydantic import BeforeValidator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from lexora.decide.config import DecisionSettings
 from lexora.utils.logging import get_logger
 
 _logger = get_logger(__name__)
@@ -475,6 +476,7 @@ class Settings(BaseSettings):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
+    decision: DecisionSettings = Field(default_factory=DecisionSettings)
 
 
 def load_yaml_config(config_path: Path | None = None) -> dict:
@@ -615,6 +617,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
     retry_config = yaml_config.get("retry", {})
     logging_config = yaml_config.get("logging", {})
     routing_config = yaml_config.get("routing", {})
+    decision_config = yaml_config.get("decision", {})
 
     # Parse backends if provided
     routing_settings_kwargs: dict = {}
@@ -683,6 +686,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
         retry=RetrySettings(**retry_config),
         logging=LoggingSettings(**logging_config),
         routing=routing_settings,
+        decision=DecisionSettings(**decision_config),
     )
 
 

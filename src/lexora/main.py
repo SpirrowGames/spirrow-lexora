@@ -13,6 +13,9 @@ from lexora.api.routes import router
 from lexora.backends.base import ModelNotFoundError
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import create_settings, Settings
+from lexora.decide.config import check_typesafe_api_key
+from lexora.decide.log import DecisionLog
+from lexora.decide.routes import build_default_providers, router as decide_router
 from lexora.services.metrics import MetricsCollector
 from lexora.services.model_registry import ModelRegistry
 from lexora.services.rate_limiter import RateLimiter
@@ -90,6 +93,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shutdown
     logger.info("lexora_shutting_down")
     await app.state.backend_router.close()
+    decision_log = getattr(app.state, "decision_log", None)
+    if decision_log is not None:
+        decision_log.close()
     logger.info("lexora_shutdown_complete")
 
 
@@ -111,6 +117,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         format=settings.logging.format,
     )
 
+    # Decision-endpoint startup check (msg-239 / msg-240):
+    #
+    # This runs before the app object is even built. A config that
+    # names ``jev`` for ``primary`` or ``fallback`` while
+    # ``TYPESAFE_API_KEY`` is unset does not produce a partially-
+    # constructed FastAPI application — it raises during ``create_app``
+    # so uvicorn refuses to bind the port, which under
+    # ``deploy/lexora.service`` (``Restart=always``) makes the failure
+    # observable as a crash loop rather than a silent degradation to
+    # NullProvider.
+    #
+    # The message does NOT carry the value of the env variable, its
+    # length, or any prefix (msg-240 §1). Callers do not need those
+    # facts to fix the config, and log capture pipelines would
+    # otherwise carry them further than intended.
+    check_typesafe_api_key(settings.decision)
+
     app = FastAPI(
         title="Lexora",
         description="LLM Gateway / Router for Spirrow Platform",
@@ -121,8 +144,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Store settings in app state
     app.state.settings = settings
 
+    # /v1/decide wiring (T-decide-endpoint T02 PR 1). Provider registry
+    # is built here so the endpoint has stable state to lean on; PR 1
+    # ships only NullProvider (msg-246), but the mount point does not
+    # need to change when llm / jev arrive in follow-up PRs.
+    app.state.decision_settings = settings.decision
+    app.state.decision_providers = build_default_providers()
+    # On-disk by default (msg-251 blocking objection): the shadow-mode
+    # data-collection story msg-237 requires — "較正曲線とリプレイ評価
+    # はここから引く" / "mindwire の 116 判断点リプレイもこの
+    # エンドポイント経由で流し、オフライン評価と本番を同一コード
+    # パスにする" — is only satisfied if rows survive a process
+    # restart. ``settings.decision.log_path`` defaults to
+    # ``data/decisions.db``; tests point it at a tmp path or at
+    # ``:memory:``. The parent directory is created by DecisionLog
+    # itself.
+    app.state.decision_log = DecisionLog(path=settings.decision.log_path)
+
     # Include API routes
     app.include_router(router)
+    app.include_router(decide_router)
 
     # ModelNotFoundError -> 404 in the caller's dialect (T-silent-routing
     # R-1a / R-2). Registered as a global handler so every endpoint that

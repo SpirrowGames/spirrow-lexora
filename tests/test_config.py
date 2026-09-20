@@ -119,6 +119,50 @@ queue:
         assert settings.vllm.url == "http://localhost:8000"
         assert settings.server.port == 8001
 
+    def test_decision_log_path_loaded_from_yaml(self, tmp_path: Path) -> None:
+        """``[decision].log_path`` from YAML reaches DecisionSettings.
+
+        msg-251 fix: the operator must be able to point the SQLite
+        decision log at a specific path (or ``:memory:`` in tests)
+        through the same YAML surface that already carries
+        ``primary`` / ``mode`` / ``fallback``. This pins that wiring
+        so a future refactor of ``create_settings`` that drops the
+        ``**decision_config`` splat gets a red test rather than a
+        silently-ignored key.
+        """
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+decision:
+  primary: "null"
+  mode: "off"
+  log_path: "/var/lib/lexora/decisions.db"
+"""
+        )
+        settings = create_settings(config_file)
+        assert settings.decision.log_path == "/var/lib/lexora/decisions.db"
+        assert settings.decision.primary == "null"
+
+    def test_decision_log_path_defaults_when_yaml_silent(
+        self, tmp_path: Path
+    ) -> None:
+        """A YAML that omits ``log_path`` still gets the on-disk default.
+
+        The default is the whole point of the msg-251 fix — a config
+        that does not opt out of persistence must not silently degrade
+        to ``:memory:``.
+        """
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+decision:
+  primary: "null"
+  mode: "off"
+"""
+        )
+        settings = create_settings(config_file)
+        assert settings.decision.log_path == "data/decisions.db"
+
 
 class TestErrorPassthroughIsRefusedWhereUnimplemented:
     """N-2: `error_passthrough` は受け口だけ全 type にあり、配線は 1 type だけ。
