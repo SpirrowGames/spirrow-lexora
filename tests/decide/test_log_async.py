@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from lexora.config import Settings
 from lexora.decide.config import DecisionSettings
@@ -243,3 +244,52 @@ def test_sync_only_use_spawns_no_thread() -> None:
     assert len(log.fetch_all()) == 1
     log.close()
 
+
+
+async def test_cancelled_write_failure_is_logged_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bohr msg-467: a write that fails after its awaiter was cancelled
+    has no caller to raise into, so ``_log_write_failure`` must log it —
+    exactly once, with no row content."""
+    import lexora.decide.log as log_mod
+
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingLogger:
+        def error(self, event: str, **kw: Any) -> None:
+            events.append((event, kw))
+
+    monkeypatch.setattr(log_mod, "_logger", _RecordingLogger())
+
+    log = DecisionLog()
+    release = threading.Event()
+    entered = threading.Event()
+
+    def _boom(row: DecisionRow) -> None:
+        entered.set()
+        assert release.wait(_WAIT)
+        raise sqlite3.OperationalError("database is locked")
+
+    log.write = _boom  # type: ignore[method-assign]
+    try:
+        task = asyncio.create_task(log.awrite(_row(0)))
+        assert await asyncio.to_thread(entered.wait, _WAIT)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert events == []  # still running: nothing to report yet
+        release.set()
+    finally:
+        release.set()
+        await asyncio.to_thread(log.close)  # drains the failing job
+    # done-callbacks run via call_soon; give the loop a turn
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert events == [
+        (
+            "decision_log_write_failed",
+            {"exc_type": "OperationalError", "error": "database is locked"},
+        )
+    ]
