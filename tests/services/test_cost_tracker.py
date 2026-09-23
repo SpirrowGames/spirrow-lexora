@@ -239,19 +239,70 @@ class TestSubscriptionBackendIsNotPriced:
                 "an unbillable ID must land in the honest unpriced state (R-10)."
             )
 
-    def test_gemini_naysayer_tier_stays_unpriced(self, db_path: Path) -> None:
-        """``gemini-3.1-pro-preview`` remains deliberately absent.
+    def test_gemini_naysayer_tier_is_priced(self, db_path: Path) -> None:
+        """``gemini-3.1-pro-preview`` is priced from 2026-09-23.
 
-        Its published price is a context-size step, which a flat
-        {input, output} pair cannot express. Pinning it here so that the
-        R-10 deletion is not later "balanced" by filling this one in.
+        This test used to pin the model as deliberately absent, because the
+        schema could not express a prompt-size step. D-2 of
+        T-ledger-gemini-thinking-tokens added ``tiers`` / ``cached_input``,
+        and msg-335 quoted the official Standard rates (boundary 200,000,
+        ``<=`` lower tier), so the entry now exists and rows land on
+        ``pricing_known=1``.
         """
-        assert "gemini-3.1-pro-preview" not in DEFAULT_PRICING
+        assert "gemini-3.1-pro-preview" in DEFAULT_PRICING
         tracker = CostTracker(db_path=db_path)
+        # A 1M-token prompt is above the 200k boundary: $4 in + $18 out.
         assert tracker.calculate_cost("gemini-3.1-pro-preview", 1_000_000, 1_000_000) == (
-            0.0,
-            False,
+            22.0,
+            True,
         )
+        tracker.record(
+            model="gemini-3.1-pro-preview",
+            endpoint="/v1/chat/completions",
+            tokens_input=1000,
+            tokens_output=10,
+            tokens_thinking=90,
+        )
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT pricing_known, cost_usd FROM request_costs"
+            ).fetchone()
+        # 1000 * $2 + (10 + 90) * $12, per MTok.
+        assert row == (1, pytest.approx(0.0032))
+
+    @pytest.mark.parametrize(
+        ("prompt", "cached", "output", "thinking", "expected"),
+        [
+            # Exactly at the boundary: `<= 200k` is the LOWER tier.
+            (200_000, None, 0, None, 0.4),
+            # One token over: the whole request moves to the upper tier.
+            (200_001, None, 0, None, 0.800004),
+            # Lower tier, every term: 60k*$2 + 40k*$0.20 + (1k+9k)*$12.
+            (100_000, 40_000, 1_000, 9_000, 0.248),
+            # Upper tier, every term: 200k*$4 + 100k*$0.40 + (1k+4k)*$18.
+            (300_000, 100_000, 1_000, 4_000, 0.93),
+        ],
+    )
+    def test_gemini_naysayer_tier_rates_and_boundary(
+        self,
+        db_path: Path,
+        prompt: int,
+        cached: int | None,
+        output: int,
+        thinking: int | None,
+        expected: float,
+    ) -> None:
+        """The msg-335 rates, the 200,000 boundary and its `<=` side."""
+        tracker = CostTracker(db_path=db_path)
+        cost, known = tracker.calculate_cost(
+            "gemini-3.1-pro-preview",
+            prompt,
+            output,
+            tokens_thinking=thinking,
+            tokens_cached_input=cached,
+        )
+        assert known is True
+        assert cost == pytest.approx(expected)
 
     def test_priced_models_are_untouched(self, db_path: Path) -> None:
         """Fence: the models that *are* billable keep their rates.
