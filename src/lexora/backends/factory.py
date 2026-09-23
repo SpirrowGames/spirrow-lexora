@@ -1,12 +1,14 @@
 """Backend factory for creating backend instances."""
 
 import os
+from collections.abc import Mapping
 
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend
 from lexora.backends.claude_code import ClaudeCodeBackend
 from lexora.backends.codex import CodexBackend
 from lexora.backends.codex_verification import CodexStateStore
+from lexora.backends.fallback import WEBHOOK_ENV, FallbackBackend
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
 from lexora.backends.vllm import VLLMBackend
@@ -195,5 +197,43 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             max_concurrency=codex.max_concurrency,
             name=name,
         )
+    elif settings.type == "fallback":
+        raise ValueError(
+            f"fallback backend '{name}' wraps other backends; the router builds it "
+            f"with create_fallback_backend once they exist"
+        )
     else:
         raise ValueError(f"Unknown backend type: {settings.type}")
+
+
+def create_fallback_backend(
+    name: str, settings: BackendSettings, backends: Mapping[str, Backend]
+) -> FallbackBackend:
+    """Build a ``type: fallback`` backend over two already-built backends.
+
+    T-naysayer-codex-backend msg-448 B-1. ``RoutingSettings`` has checked
+    that ``primary`` names a codex backend and ``fallback`` a gemini one; the
+    isinstance check keeps that honest at runtime. The webhook URL is read
+    from ``LEXORA_FALLBACK_WEBHOOK_URL`` here and nowhere else (B-3).
+    """
+    section = settings.fallback
+    if section is None:  # config validator guarantees this
+        raise ValueError(f"fallback backend '{name}' has no 'fallback:' section")
+    primary = backends[section.primary]
+    if not isinstance(primary, CodexBackend):
+        raise ValueError(f"fallback backend '{name}': primary '{section.primary}' is not a codex backend")
+    logger.info(
+        "creating_fallback_backend",
+        name=name,
+        primary=section.primary,
+        fallback=section.fallback,
+        mode=section.mode,
+    )
+    return FallbackBackend(
+        name=name,
+        primary=primary,
+        fallback=backends[section.fallback],
+        fallback_name=section.fallback,
+        mode=section.mode,
+        webhook_url=os.environ.get(WEBHOOK_ENV) or None,
+    )

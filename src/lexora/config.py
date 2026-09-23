@@ -311,16 +311,33 @@ class CodexSettings(BaseModel):
     )
 
 
+class FallbackSettings(BaseModel):
+    """Settings for a ``fallback`` backend (T-naysayer-codex-backend msg-448 B-1).
+
+    Names two other backends of this config: ``primary`` must be a ``codex``
+    backend and ``fallback`` a ``gemini`` backend (``RoutingSettings``
+    checks both). ``mode``: ``fallback`` answers with codex and falls back
+    to Gemini; ``shadow`` answers with Gemini and runs codex alongside for
+    comparison (B-5). Behaviour: ``lexora/backends/fallback.py``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    primary: str = Field(description="Name of the codex backend tried first.")
+    fallback: str = Field(description="Name of the gemini backend used when codex cannot answer.")
+    mode: Literal["fallback", "shadow"] = Field(default="fallback")
+
+
 class BackendSettings(BaseSettings):
     """Single backend settings."""
 
     type: Literal[
-        "vllm", "openai_compatible", "anthropic", "claude_code", "gemini", "codex"
+        "vllm", "openai_compatible", "anthropic", "claude_code", "gemini", "codex", "fallback"
     ] = Field(
         default="vllm",
         description=(
             "Backend type (vllm, openai_compatible, anthropic, claude_code, "
-            "gemini, or codex)"
+            "gemini, codex, or fallback)"
         ),
     )
     url: str = Field(default="http://localhost:8000", description="Backend server URL")
@@ -429,6 +446,22 @@ class BackendSettings(BaseSettings):
         ),
     )
 
+    fallback: FallbackSettings | None = Field(
+        default=None,
+        description="Required when type is 'fallback' and refused on every other type.",
+    )
+
+    @model_validator(mode="after")
+    def _fallback_section_matches_type(self) -> "BackendSettings":
+        """Require ``fallback:`` exactly on ``type: fallback``."""
+        if self.type == "fallback" and self.fallback is None:
+            raise ValueError("backend type 'fallback' requires a 'fallback:' section (primary, fallback)")
+        if self.type != "fallback" and self.fallback is not None:
+            raise ValueError(
+                f"'fallback:' section is only read by backend type 'fallback', not '{self.type}'"
+            )
+        return self
+
     @model_validator(mode="after")
     def _codex_section_matches_type(self) -> "BackendSettings":
         """Require ``codex:`` exactly on ``type: codex``; default its timeout."""
@@ -534,6 +567,28 @@ class RoutingSettings(BaseSettings):
         default_factory=ClassifierSettings,
         description="Task classifier settings",
     )
+
+    @model_validator(mode="after")
+    def _check_fallback_references(self) -> "RoutingSettings":
+        """A ``fallback`` backend's ``primary`` must name a ``codex`` backend
+        and its ``fallback`` a ``gemini`` backend of this config (msg-448
+        B-1). Checked here, where the other backends are visible."""
+        for name, backend in self.backends.items():
+            if backend.type != "fallback" or backend.fallback is None:
+                continue
+            for role, target, wanted in (
+                ("primary", backend.fallback.primary, "codex"),
+                ("fallback", backend.fallback.fallback, "gemini"),
+            ):
+                other = self.backends.get(target)
+                if other is None:
+                    raise ValueError(f"fallback backend '{name}': {role} '{target}' is not a configured backend")
+                if other.type != wanted:
+                    raise ValueError(
+                        f"fallback backend '{name}': {role} '{target}' is type '{other.type}', "
+                        f"expected '{wanted}'"
+                    )
+        return self
 
     @model_validator(mode="after")
     def _reject_tier_backend_collisions(self) -> "RoutingSettings":

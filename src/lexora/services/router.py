@@ -4,7 +4,8 @@ import asyncio
 from typing import Any
 
 from lexora.backends.base import Backend, BackendError, ModelNotFoundError
-from lexora.backends.factory import create_backend
+from lexora.backends.factory import create_backend, create_fallback_backend
+from lexora.backends.fallback import FallbackBackend
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import RoutingSettings, VLLMSettings
 from lexora.utils.logging import get_logger
@@ -82,8 +83,16 @@ class BackendRouter:
                         ),
                     )
 
-            for name, settings in routing_settings.backends.items():
-                self._backends[name] = create_backend(name, settings)
+            # ``type: fallback`` wraps two other backends, so it is built
+            # after every other backend exists (T-naysayer-codex-backend B-1).
+            ordered = sorted(
+                routing_settings.backends.items(), key=lambda item: item[1].type == "fallback"
+            )
+            for name, settings in ordered:
+                if settings.type == "fallback":
+                    self._backends[name] = create_fallback_backend(name, settings, self._backends)
+                else:
+                    self._backends[name] = create_backend(name, settings)
                 self._health_checked[name] = settings.health_check
                 if not settings.health_check:
                     logger.info("backend_health_check_skipped", backend=name)
@@ -132,6 +141,14 @@ class BackendRouter:
                         tier=tier_name,
                         backend=tier_settings.backend,
                     )
+
+            # A fallback backend records the tier(s) that reach it on its
+            # shadow comparison rows (B-5); requests reach it with the tier
+            # already resolved to a model, so it cannot see the tier itself.
+            for name, backend in self._backends.items():
+                if isinstance(backend, FallbackBackend):
+                    tiers = sorted(t for t, b in self._tier_to_backend.items() if b == name)
+                    backend.tier_label = ",".join(tiers) or None
 
             logger.info(
                 "multi_backend_routing_enabled",
