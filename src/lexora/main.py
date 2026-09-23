@@ -178,6 +178,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.decision_providers = build_default_providers(
         os.environ.get(TYPESAFE_API_KEY_ENV) if references_jev(settings.decision) else None,
         timeout_ms=settings.decision.timeout_ms,
+        jev_model=settings.decision.jev_model,
     )
 
     # Include API routes

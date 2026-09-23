@@ -5,9 +5,12 @@ never run in CI. Run explicitly, with ``TYPESAFE_API_KEY`` set:
 
     uv run --extra dev pytest -m smoke tests/decide/test_jev_smoke.py
 
-One problem, one primitive (``noul``). The point is to confirm the wire
-shape assumed in :mod:`lexora.decide.jev_client` (marked UNVERIFIED there)
+One request, one ``noul`` question, one billed call. The point is to
+confirm the wire format in :mod:`lexora.decide.jev_client` (taken from
+Fermi's quote of docs.typesafe.ai/api.md, T-decide-jev-provider msg-336)
 against the live API before any deployment sets ``primary = "jev"``.
+Running it is a billing decision and needs sign-off (msg-336 / msg-339
+step 3).
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ async def test_real_noul_roundtrip() -> None:
     if not api_key:
         pytest.skip("TYPESAFE_API_KEY not set")
     provider = JevProvider(api_key, timeout_ms=30_000)
-    answers = await provider.evaluate(
+    result = await provider.evaluate(
         state="The customer wrote: 'This is the best purchase I have made all year.'",
         questions={
             "positive": QuestionSpec(
@@ -35,4 +38,9 @@ async def test_real_noul_roundtrip() -> None:
             )
         },
     )
-    assert 0.0 <= answers["positive"]["noul"] <= 1.0
+    assert 0.0 <= result.answers["positive"]["noul"] <= 1.0
+    # The version that actually served the call and its usage: the fields
+    # the decision log records (Bohr msg-339 #2 / #5).
+    assert result.upstream is not None
+    assert result.upstream.model
+    assert result.upstream.input_tokens is not None

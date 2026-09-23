@@ -6,7 +6,8 @@ threads (mindwire / prismind / verimend) have a stable URL to point at;
 the interesting behaviour is in the provider layer.
 
 PR 1 scope (msg-246): only ``NullProvider`` was wired. T-decide-jev-provider
-adds ``JevProvider`` and the NullProvider fallback on ``ProviderError``. The ``mode`` /
+adds ``JevProvider``, the NullProvider fallback on ``ProviderError``, and
+logs the upstream ``model`` / usage (Bohr msg-342 #2). The ``mode`` /
 ``primary`` / ``fallback`` settings *are* honoured — a config that
 selects Jev on PR 1 is refused at startup by
 :func:`lexora.decide.config.check_typesafe_api_key`, so the route never
@@ -26,18 +27,28 @@ from fastapi import APIRouter, Depends, Request
 
 from lexora.decide.config import DecisionSettings
 from lexora.decide.contract import DecideRequest, DecideResponse
+from lexora.decide.jev_client import DEFAULT_MODEL
 from lexora.decide.log import DecisionLog, build_decision_row
 from lexora.decide.providers import (
     DecisionProvider,
     JevProvider,
     NullProvider,
     ProviderError,
+    UpstreamMeta,
 )
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+#: Fallback codes logged at ``error`` rather than ``warning`` (Bohr msg-339
+#: #4 / msg-342 #1). Each one points at something a human has to fix: a
+#: bad key, a malformed request from Lexora or the caller, a changed
+#: response shape, or a Lexora bug.
+_ERROR_LEVEL_CODES = frozenset(
+    {"auth", "invalid_request", "invalid_response", "internal_error"}
+)
 
 
 def _get_decision_settings(request: Request) -> DecisionSettings:
@@ -105,24 +116,46 @@ async def decide(
     decision_id = uuid.uuid4().hex
     start = time.monotonic()
     provider_error: str | None = None
+    upstream: UpstreamMeta | None = None
+    failure: dict[str, Any] | None = None
     try:
-        answers = await provider.evaluate(state=body.state, questions=body.questions)
-    except ProviderError as exc:
-        # Safe-default, not fail-loud (Fermi msg-257 §3): the caller
-        # (e.g. mindwire's Tier-C gate, D20 fail-open) gets a well-formed
-        # NullProvider answer, and the row records who actually answered
-        # (``null``) plus why the primary did not (Bohr msg-258 §4).
-        # The warning carries the fixed code only — no body, no key.
-        provider_error = _format_provider_error(provider.name, exc)
-        logger.warning(
+        result = await provider.evaluate(state=body.state, questions=body.questions)
+    except ProviderError as err:
+        # Copy out the five plain values and drop ``err`` right away
+        # (Bohr msg-344 v7 #2). The fallback and the log write happen
+        # below, outside this block.
+        failure = {
+            "code": err.code,
+            "exc_type": err.exc_type,
+            "where": err.where,
+            "loc": err.loc,
+        }
+        upstream = err.upstream
+        provider_error = f"{provider.name}:{err.code}"
+    else:
+        upstream = result.upstream
+    if failure is not None:
+        # Safe default instead of failing loud (Fermi msg-257 §3). The
+        # caller, e.g. mindwire's Tier-C gate (D20 fail-open), gets a
+        # well-formed NullProvider answer. The row records who answered
+        # (``null``) and why the primary did not (Bohr msg-258 §4).
+        #
+        # Do NOT add ``exc_info=True`` here or anywhere else a
+        # ProviderError is logged. The exception chain is cut
+        # (msg-344), but ``ProviderError.__traceback__`` still reaches
+        # the provider's frame, whose locals hold ``state``.
+        log = (
+            logger.error if failure["code"] in _ERROR_LEVEL_CODES else logger.warning
+        )
+        log(
             "decide_provider_fallback",
             primary=provider.name,
-            code=exc.code,
-            discarded=exc.discarded,
             decision_id=decision_id,
+            **failure,
         )
         provider = providers["null"]
-        answers = await provider.evaluate(state=body.state, questions=body.questions)
+        result = await provider.evaluate(state=body.state, questions=body.questions)
+    answers = result.answers
     latency_ms = int((time.monotonic() - start) * 1000)
 
     row = build_decision_row(
@@ -135,6 +168,9 @@ async def decide(
         latency_ms=latency_ms,
         questions_version=body.questions_version,
         provider_error=provider_error,
+        provider_model=upstream.model if upstream else None,
+        provider_input_tokens=upstream.input_tokens if upstream else None,
+        provider_output_tokens=upstream.output_tokens if upstream else None,
     )
     decision_log.write(row)
 
@@ -174,18 +210,11 @@ def _answers_for_log(answers: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _format_provider_error(primary: str, exc: ProviderError) -> str:
-    """``"<primary>:<code>"`` plus ``";discarded=<n>"`` when ``n > 0``."""
-    text = f"{primary}:{exc.code}"
-    if exc.discarded:
-        text += f";discarded={exc.discarded}"
-    return text
-
-
 def build_default_providers(
     api_key: str | None = None,
     *,
     timeout_ms: int = 2000,
+    jev_model: str = DEFAULT_MODEL,
 ) -> dict[str, DecisionProvider]:
     """Return the provider registry.
 
@@ -197,5 +226,5 @@ def build_default_providers(
     """
     providers: dict[str, DecisionProvider] = {"null": NullProvider()}
     if api_key:
-        providers["jev"] = JevProvider(api_key, timeout_ms=timeout_ms)
+        providers["jev"] = JevProvider(api_key, timeout_ms=timeout_ms, model=jev_model)
     return providers

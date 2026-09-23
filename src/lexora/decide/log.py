@@ -49,17 +49,22 @@ CREATE TABLE IF NOT EXISTS decisions (
     answers_json      TEXT NOT NULL,
     latency_ms        INTEGER NOT NULL,
     timestamp         TEXT NOT NULL,
-    provider_error    TEXT NULL
+    provider_error    TEXT NULL,
+    provider_model    TEXT NULL,
+    provider_input_tokens  INTEGER NULL,
+    provider_output_tokens INTEGER NULL
 )
 """
 
 _INSERT_SQL = """
 INSERT INTO decisions (
     decision_id, policy, state_hash, questions_hash, questions_version,
-    provider, answers_json, latency_ms, timestamp, provider_error
+    provider, answers_json, latency_ms, timestamp, provider_error,
+    provider_model, provider_input_tokens, provider_output_tokens
 ) VALUES (
     :decision_id, :policy, :state_hash, :questions_hash, :questions_version,
-    :provider, :answers_json, :latency_ms, :timestamp, :provider_error
+    :provider, :answers_json, :latency_ms, :timestamp, :provider_error,
+    :provider_model, :provider_input_tokens, :provider_output_tokens
 )
 """
 
@@ -69,6 +74,9 @@ INSERT INTO decisions (
 #: fresh DB (whose CREATE already carries the column) is left alone.
 _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("provider_error", "TEXT NULL"),
+    ("provider_model", "TEXT NULL"),
+    ("provider_input_tokens", "INTEGER NULL"),
+    ("provider_output_tokens", "INTEGER NULL"),
 )
 
 
@@ -139,13 +147,23 @@ class DecisionRow:
       (see :mod:`lexora.decide.contract`). Fixed width so the schema
       does not have to grow when a hash algorithm changes; the width is
       part of the writer's contract, not the dataclass's.
+    * ``provider`` — WHO ANSWERED the caller. Calibration populations
+      are cut on this column (msg-260).
+    * ``provider_*`` (``provider_error`` / ``provider_model`` /
+      ``provider_input_tokens`` / ``provider_output_tokens``) — WHAT
+      HAPPENED ON THE UPSTREAM CALL (Bohr msg-342 #2). They are not
+      about who answered, so ``provider="null"`` next to
+      ``provider_model="jev-1.13.0"`` is a valid row: Jev returned a
+      2xx and billed the call, but Lexora threw the answers away
+      (``provider_error="jev:invalid_response"``). This replaces v4's
+      ``;discarded=N`` as the SQL way to find billed-but-discarded calls.
     * ``provider_error`` — ``None`` when the provider in ``provider``
-      answered directly. When the primary failed and NullProvider served
-      the fallback, ``provider`` is ``"null"`` and this carries
-      ``"<primary>:<code>"`` plus ``";discarded=<n>"`` when ``n`` sibling
-      upstream calls had already completed (and been billed) before the
-      failure was observed (Bohr msg-260 #2). A fixed code, never an
-      upstream body or header.
+      answered directly. Otherwise ``"<primary>:<code>"`` with a fixed
+      code, never an upstream body or header.
+    * ``provider_model`` / ``provider_*_tokens`` — the version that
+      actually served the call and its ``usage``, when a 2xx arrived.
+      Each field is read leniently, so a malformed one is ``None``.
+      Always ``None`` for NullProvider and for non-2xx failures.
     * ``answers_json`` — JSON-serialised ``answers`` object. Kept as a
       string rather than a nested dict because SQLite has no JSON
       column type and turning every read into a JSON parse in Python
@@ -168,6 +186,9 @@ class DecisionRow:
     timestamp: str
     questions_version: str | None = None
     provider_error: str | None = None
+    provider_model: str | None = None
+    provider_input_tokens: int | None = None
+    provider_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         # Fixed-width hash discipline lives here so a caller who passes
@@ -196,6 +217,9 @@ def build_decision_row(
     questions_version: str | None,
     timestamp: datetime | None = None,
     provider_error: str | None = None,
+    provider_model: str | None = None,
+    provider_input_tokens: int | None = None,
+    provider_output_tokens: int | None = None,
 ) -> DecisionRow:
     """Construct a :class:`DecisionRow` from the request/response shape.
 
@@ -219,6 +243,9 @@ def build_decision_row(
         latency_ms=latency_ms,
         timestamp=ts,
         provider_error=provider_error,
+        provider_model=provider_model,
+        provider_input_tokens=provider_input_tokens,
+        provider_output_tokens=provider_output_tokens,
     )
 
 
@@ -291,7 +318,8 @@ class DecisionLog:
             cursor = self._conn.execute(
                 "SELECT decision_id, policy, state_hash, questions_hash, "
                 "questions_version, provider, answers_json, latency_ms, "
-                "timestamp, provider_error FROM decisions ORDER BY timestamp, decision_id"
+                "timestamp, provider_error, provider_model, provider_input_tokens, "
+                "provider_output_tokens FROM decisions ORDER BY timestamp, decision_id"
             )
             columns = [c[0] for c in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -318,4 +346,7 @@ def _row_as_params(row: DecisionRow) -> dict[str, Any]:
         "latency_ms": row.latency_ms,
         "timestamp": row.timestamp,
         "provider_error": row.provider_error,
+        "provider_model": row.provider_model,
+        "provider_input_tokens": row.provider_input_tokens,
+        "provider_output_tokens": row.provider_output_tokens,
     }

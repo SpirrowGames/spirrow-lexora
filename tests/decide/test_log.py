@@ -51,6 +51,9 @@ class TestDecisionRowShape:
             "latency_ms",
             "timestamp",
             "provider_error",
+            "provider_model",
+            "provider_input_tokens",
+            "provider_output_tokens",
         }
         fields = {f for f in DecisionRow.__dataclass_fields__ if not f.startswith("_")}
         assert fields == allowed
@@ -195,6 +198,9 @@ class TestDecisionLogSqlite:
             "latency_ms",
             "timestamp",
             "provider_error",
+            "provider_model",
+            "provider_input_tokens",
+            "provider_output_tokens",
         }
         # And to satisfy the type checker that sqlite3 is used.
         assert isinstance(log._conn, sqlite3.Connection)  # noqa: SLF001
@@ -217,6 +223,20 @@ CREATE TABLE decisions (
 """
 
 
+#: Columns added on top of the PR #43 schema (Bohr msg-339 v5 schema).
+_ADDED = (
+    "provider_error",
+    "provider_model",
+    "provider_input_tokens",
+    "provider_output_tokens",
+)
+
+
+def _assert_added_once(cols: list[str]) -> None:
+    for name in _ADDED:
+        assert cols.count(name) == 1, name
+
+
 def _columns(db_path: Path) -> list[str]:
     import sqlite3
 
@@ -229,11 +249,22 @@ class TestDecisionLogMigrations:
 
     def test_provider_error_roundtrip(self) -> None:
         log = DecisionLog(":memory:")
-        log.write(_sample_row(provider_error="jev:timeout;discarded=1"))
+        log.write(
+            _sample_row(
+                provider_error="jev:invalid_response",
+                provider_model="jev-1.13.0",
+                provider_input_tokens=10,
+                provider_output_tokens=2,
+            )
+        )
         log.write(_sample_row(decision_id="did-2"))
         rows = {r["decision_id"]: r for r in log.fetch_all()}
-        assert rows["did-1"]["provider_error"] == "jev:timeout;discarded=1"
-        assert rows["did-2"]["provider_error"] is None
+        assert rows["did-1"]["provider_error"] == "jev:invalid_response"
+        assert rows["did-1"]["provider_model"] == "jev-1.13.0"
+        assert rows["did-1"]["provider_input_tokens"] == 10
+        assert rows["did-1"]["provider_output_tokens"] == 2
+        for name in _ADDED:
+            assert rows["did-2"][name] is None, name
 
     def test_build_decision_row_carries_provider_error(self) -> None:
         row = build_decision_row(
@@ -246,8 +277,13 @@ class TestDecisionLogMigrations:
             latency_ms=1,
             questions_version=None,
             provider_error="jev:auth",
+            provider_model="jev-1.13.0",
+            provider_input_tokens=5,
+            provider_output_tokens=1,
         )
         assert row.provider_error == "jev:auth"
+        assert row.provider_model == "jev-1.13.0"
+        assert (row.provider_input_tokens, row.provider_output_tokens) == (5, 1)
 
     def test_migrations_on_fresh_file(self, tmp_path: Path) -> None:
         """Einstein msg-261: a fresh file must get CREATE before any ALTER."""
@@ -255,7 +291,7 @@ class TestDecisionLogMigrations:
         apply_decision_log_migrations(str(db_path))
         cols = _columns(db_path)
         assert "decision_id" in cols
-        assert cols.count("provider_error") == 1
+        _assert_added_once(cols)
         log = DecisionLog(str(db_path))
         log.write(_sample_row())
         assert len(log.fetch_all()) == 1
@@ -272,7 +308,7 @@ class TestDecisionLogMigrations:
         db_path = tmp_path / "decisions.db"
         apply_decision_log_migrations(db_path)
         apply_decision_log_migrations(db_path)
-        assert _columns(db_path).count("provider_error") == 1
+        _assert_added_once(_columns(db_path))
 
     def test_up_migration_from_pr43_schema(self, tmp_path: Path) -> None:
         """An existing PR #43 DB gains the column; old rows are intact."""
@@ -285,18 +321,30 @@ class TestDecisionLogMigrations:
                 "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?)",
                 ("old-1", "p", "a" * 16, "b" * 16, None, "null", "{}", 3, "t0"),
             )
-        assert "provider_error" not in _columns(db_path)
+        assert not set(_ADDED) & set(_columns(db_path))
 
         apply_decision_log_migrations(db_path)
         log = DecisionLog(db_path)
-        log.write(_sample_row(decision_id="new-1", provider_error="jev:auth"))
+        log.write(
+            _sample_row(
+                decision_id="new-1",
+                provider_error="jev:invalid_response",
+                provider_model="jev-1.13.0",
+                provider_input_tokens=120,
+                provider_output_tokens=7,
+            )
+        )
         rows = {r["decision_id"]: r for r in log.fetch_all()}
         log.close()
 
-        assert rows["old-1"]["provider_error"] is None
+        for name in _ADDED:
+            assert rows["old-1"][name] is None, name
         assert rows["old-1"]["latency_ms"] == 3
-        assert rows["new-1"]["provider_error"] == "jev:auth"
-        assert _columns(db_path).count("provider_error") == 1
+        assert rows["new-1"]["provider_error"] == "jev:invalid_response"
+        assert rows["new-1"]["provider_model"] == "jev-1.13.0"
+        assert rows["new-1"]["provider_input_tokens"] == 120
+        assert rows["new-1"]["provider_output_tokens"] == 7
+        _assert_added_once(_columns(db_path))
 
     def test_concurrent_migrations_are_race_safe(self, tmp_path: Path) -> None:
         """Einstein msg-259 #1: many workers migrating one PR #43 DB at once.
@@ -333,7 +381,7 @@ class TestDecisionLogMigrations:
             t.join()
 
         assert errors == []
-        assert _columns(db_path).count("provider_error") == 1
+        _assert_added_once(_columns(db_path))
         with sqlite3.connect(str(db_path)) as conn:
             assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone() == (1,)
 

@@ -17,6 +17,9 @@ Contract (msg-237 / msg-244 / msg-246):
 * ``fallback``: which provider serves the answer when ``primary`` fails
   under ``active``, and which serves the caller under ``shadow``.
 * ``timeout_ms``: per-call upstream deadline in milliseconds.
+* ``jev_model``: the ``model`` value sent to Jev (default ``jev-latest``).
+  The version that actually served each request is logged in
+  ``provider_model``.
 
 Choosing Jev (T-decide-jev-provider, Bohr msg-258 §6): while
 ``LlmEmulationProvider`` is not implemented, a config with
@@ -118,6 +121,16 @@ class DecisionSettings(BaseSettings):
         default=2000,
         ge=1,
         description="Per-call upstream deadline in milliseconds.",
+    )
+    jev_model: str = Field(
+        default="jev-latest",
+        min_length=1,
+        description=(
+            "Value sent as the required ``model`` field to Jev's systemone "
+            "endpoint (Bohr msg-339 #2). ``jev-latest`` until the logged "
+            "``provider_model`` values show which version to pin. Env: "
+            "``LEXORA_DECISION__JEV_MODEL``."
+        ),
     )
     log_path: str = Field(
         default="data/decisions.db",

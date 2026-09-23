@@ -1,43 +1,57 @@
-"""Unit tests for :class:`lexora.decide.providers.JevProvider`.
+"""Unit tests for :class:`lexora.decide.providers.JevProvider` (v8 design).
 
-HTTP is faked with :class:`httpx.MockTransport`; nothing here reaches the
-network. The wire shape the fake speaks is the one assumed in
-:mod:`lexora.decide.jev_client` (marked UNVERIFIED there) — these tests pin
-Lexora's behaviour around that shape (mapping, error classification,
-fail-fast, key hygiene), not TypeSafe's actual API. That is what
-``tests/decide/test_jev_smoke.py`` is for.
+HTTP is faked with :class:`httpx.MockTransport`, so nothing here reaches
+the network. The fake speaks the wire format Fermi quoted from
+docs.typesafe.ai/api.md (T-decide-jev-provider msg-336). What these tests
+pin down is Lexora's side of that format; they cannot prove TypeSafe
+serves it. ``tests/decide/test_jev_smoke.py`` checks that against the
+live API.
 """
 
 from __future__ import annotations
 
-import asyncio
+import gc
 import json
-import time
+import re
+import types
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 import pytest
 
+from lexora.decide import jev_client
 from lexora.decide.contract import QuestionSpec
-from lexora.decide.providers import DecisionProvider, JevProvider, ProviderError
+from lexora.decide.providers import (
+    DecisionProvider,
+    JevProvider,
+    ProviderError,
+    ProviderResult,
+    UpstreamMeta,
+)
 
 API_KEY = "sk-test-SECRET-value-0123456789"
+STATE = "STATE-SENTINEL-confidential-4c1d"
+INPUT_SENTINEL = "INPUT-SENTINEL-echoed-by-422-9b2e"
 
 Handler = Callable[[httpx.Request], Awaitable[httpx.Response]]
 
 
-def _provider(handler: Handler, timeout_ms: int = 2000) -> JevProvider:
+def _provider(handler: Handler, timeout_ms: int = 2000, model: str = "jev-latest") -> JevProvider:
     return JevProvider(
         API_KEY,
         timeout_ms=timeout_ms,
+        model=model,
         base_url="https://jev.test",
         transport=httpx.MockTransport(handler),
     )
 
 
-def _ok(payload: object) -> Handler:
+def _respond(status: int, payload: object = None, *, text: str | None = None) -> Handler:
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=payload)
+        if text is not None:
+            return httpx.Response(status, text=text)
+        return httpx.Response(status, json=payload)
 
     return handler
 
@@ -46,184 +60,495 @@ def _q(type_: str, instructions: str = "i", criteria: object = None) -> Question
     return QuestionSpec(type=type_, instructions=instructions, criteria=criteria)  # type: ignore[arg-type]
 
 
+def _ok(answers: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {
+        "model": "jev-1.13.0",
+        "answers": answers,
+        "usage": {"input_tokens": 100, "output_tokens": 4},
+        **extra,
+    }
+
+
 async def _raises(provider: JevProvider, **questions: QuestionSpec) -> ProviderError:
     with pytest.raises(ProviderError) as excinfo:
-        await provider.evaluate(state="s", questions=questions)
+        await provider.evaluate(state=STATE, questions=questions or {"q": _q("noul")})
     return excinfo.value
 
 
 class TestShape:
     def test_name_and_protocol(self) -> None:
-        p = _provider(_ok({}))
+        p = _provider(_respond(200, {}))
         assert p.name == "jev"
         assert isinstance(p, DecisionProvider)
 
 
-class TestHappyPath:
-    async def test_noul(self) -> None:
+class TestSingleCall:
+    """Bohr msg-339 #1: one request == one POST to /v1/systemone."""
+
+    async def test_all_questions_in_one_post(self) -> None:
         seen: list[httpx.Request] = []
 
         async def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request)
-            return httpx.Response(200, json={"noul": 0.83})
+            return httpx.Response(
+                200,
+                json=_ok(
+                    {
+                        "a": {"type": "noul", "noul": 0.95},
+                        "b": {
+                            "type": "choice",
+                            "choice": "billing",
+                            "probabilities": {"billing": 0.9, "other": 0.1},
+                            "confidence": 0.81,
+                        },
+                    }
+                ),
+            )
 
-        answers = await _provider(handler).evaluate(
-            state="the state", questions={"esc": _q("noul", "Escalate?")}
+        questions = {
+            "a": _q("noul", "Escalate?"),
+            "b": _q("choice", "Which?", {"billing": "money", "other": "else"}),
+        }
+        result = await _provider(handler, model="jev-9.9.9").evaluate(
+            state="the state", questions=questions
         )
-        assert answers == {"esc": {"noul": 0.83}}
+        assert len(seen) == 1
         req = seen[0]
-        assert req.url.path == "/v1/noul"
+        assert req.method == "POST"
+        assert req.url.path == "/v1/systemone"
+        assert req.headers["authorization"] == f"Bearer {API_KEY}"
+        assert req.headers["content-type"] == "application/json"
         body = json.loads(req.content)
-        assert body == {"state": "the state", "instructions": "Escalate?"}
+        assert body["state"] == "the state"
+        assert body["model"] == "jev-9.9.9"
+        assert set(body["questions"]) == {"a", "b"}
+        # criteria=None is omitted, not sent as null.
+        assert body["questions"]["a"] == {"type": "noul", "instructions": "Escalate?"}
+        assert body["questions"]["b"]["criteria"] == {"billing": "money", "other": "else"}
+        assert isinstance(result, ProviderResult)
+        assert result.answers["a"]["noul"] == 0.95
+        assert result.answers["b"]["choice"] == "billing"
+        assert result.upstream == UpstreamMeta("jev-1.13.0", 100, 4)
 
-    async def test_choice_forwards_criteria(self) -> None:
+    async def test_extra_question_fields_forwarded(self) -> None:
         seen: list[httpx.Request] = []
-        payload = {"choice": "b", "probabilities": {"a": 0.2, "b": 0.8}, "confidence": 0.6}
 
         async def handler(request: httpx.Request) -> httpx.Response:
             seen.append(request)
-            return httpx.Response(200, json=payload)
+            return httpx.Response(200, json=_ok({"q": {"noul": 0.1}}))
 
-        answers = await _provider(handler).evaluate(
-            state="s", questions={"pick": _q("choice", criteria=["a", "b"])}
+        spec = QuestionSpec.model_validate(
+            {"type": "noul", "instructions": "i", "future_field": {"x": 1}}
         )
-        assert answers == {"pick": payload}
-        assert seen[0].url.path == "/v1/choice"
-        assert json.loads(seen[0].content)["criteria"] == ["a", "b"]
+        await _provider(handler).evaluate(state="s", questions={"q": spec})
+        assert json.loads(seen[0].content)["questions"]["q"]["future_field"] == {"x": 1}
 
-    async def test_score(self) -> None:
-        payload = {"score": 1.4, "legend": ["low", "mid", "high"], "confidence": 0.3}
-        answers = await _provider(_ok(payload)).evaluate(
-            state="s", questions={"sev": _q("score", criteria=["low", "mid", "high"])}
-        )
-        assert answers == {"sev": payload}
+    async def test_default_model_is_jev_latest(self) -> None:
+        seen: list[httpx.Request] = []
 
-    async def test_multiple_questions_all_answered(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"noul": 0.1})
+            seen.append(request)
+            return httpx.Response(200, json=_ok({"q": {"noul": 0.1}}))
 
-        answers = await _provider(handler).evaluate(
-            state="s", questions={"a": _q("noul"), "b": _q("noul")}
+        await JevProvider(
+            API_KEY, timeout_ms=1000, base_url="https://jev.test",
+            transport=httpx.MockTransport(handler),
+        ).evaluate(state="s", questions={"q": _q("noul")})
+        assert json.loads(seen[0].content)["model"] == "jev-latest"
+
+
+class TestScoreLegend:
+    """Bohr msg-339 #3: dict legend → list; probabilities keep index keys."""
+
+    async def test_legend_normalised(self) -> None:
+        raw = {
+            "type": "score",
+            "score": 1.05,
+            "legend": {"2": "Very angry", "0": "Calm", "1": "Frustrated"},
+            "probabilities": {"0": 0.0, "1": 0.95, "2": 0.05},
+            "confidence": 0.92,
+        }
+        result = await _provider(_respond(200, _ok({"s": raw}))).evaluate(
+            state="s", questions={"s": _q("score", criteria=["Calm", "Frustrated", "Very angry"])}
         )
-        assert set(answers) == {"a", "b"}
+        ans = result.answers["s"]
+        assert ans["legend"] == ["Calm", "Frustrated", "Very angry"]
+        assert ans["probabilities"] == {"0": 0.0, "1": 0.95, "2": 0.05}
+        assert ans["score"] == 1.05
+        assert ans["type"] == "score"  # unknown/extra keys pass through
+
+    @pytest.mark.parametrize(
+        "legend",
+        [
+            {"0": "a", "2": "c"},  # gap
+            {"1": "a", "2": "b"},  # does not start at 0
+            {"0": "a", "x": "b"},  # non-numeric
+            {"0": "a", "1": 3},  # non-string value
+            {},
+            ["a", "b"],
+            None,
+        ],
+    )
+    async def test_bad_legend_is_invalid_response(self, legend: object) -> None:
+        raw = {"score": 1.0, "legend": legend, "confidence": 0.5}
+        err = await _raises(_provider(_respond(200, _ok({"s": raw}))), s=_q("score"))
+        assert err.code == "invalid_response"
 
 
 class TestErrorClassification:
+    """Bohr msg-339 #4 table."""
+
     async def test_timeout(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ReadTimeout("timed out", request=request)
 
-        err = await _raises(_provider(handler), q=_q("noul"))
+        err = await _raises(_provider(handler))
         assert err.code == "timeout"
-        assert err.discarded == 0
+        assert err.exc_type == "ReadTimeout"
+        assert err.upstream is None
 
-    @pytest.mark.parametrize("status", [401, 403])
-    async def test_auth(self, status: int) -> None:
+    async def test_overall_deadline(self) -> None:
+        import asyncio
+
         async def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(status, json={"error": "bad key"})
+            await asyncio.sleep(5)
+            return httpx.Response(200, json=_ok({"q": {"noul": 0.1}}))
 
-        assert (await _raises(_provider(handler), q=_q("noul"))).code == "auth"
-
-    @pytest.mark.parametrize("status", [429, 500, 503])
-    async def test_http_status(self, status: int) -> None:
-        async def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(status, text="upstream says no")
-
-        assert (await _raises(_provider(handler), q=_q("noul"))).code == "http_status"
+        err = await _raises(_provider(handler, timeout_ms=50))
+        assert err.code == "timeout"
 
     async def test_network(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("refused", request=request)
 
-        assert (await _raises(_provider(handler), q=_q("noul"))).code == "network"
-
-    async def test_invalid_json(self) -> None:
-        async def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, text="<html>not json")
-
-        assert (await _raises(_provider(handler), q=_q("noul"))).code == "invalid_response"
+        err = await _raises(_provider(handler))
+        assert err.code == "network"
+        assert err.exc_type == "ConnectError"
 
     @pytest.mark.parametrize(
-        ("type_", "payload"),
+        ("status", "code"),
         [
-            ("noul", {}),
-            ("noul", {"noul": 1.5}),
-            ("noul", {"noul": "high"}),
-            ("noul", [0.5]),
-            ("choice", {"choice": "a", "probabilities": {"a": 1.0}}),
-            ("score", {"score": 1.0, "legend": "low", "confidence": 0.1}),
+            (401, "auth"),
+            (422, "invalid_request"),
+            (429, "rate_limited"),
+            (529, "overloaded"),
+            (500, "http_status"),
+            (503, "http_status"),
+            (403, "http_status"),
         ],
     )
-    async def test_invalid_shape(self, type_: str, payload: object) -> None:
-        err = await _raises(_provider(_ok(payload)), q=_q(type_))
+    async def test_status(self, status: int, code: str) -> None:
+        err = await _raises(_provider(_respond(status, {"error": "no"})))
+        assert err.code == code
+        assert err.upstream is None
+        assert err.exc_type is None
+
+    async def test_no_retry_on_429(self) -> None:
+        calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(429)
+
+        await _raises(_provider(handler))
+        assert calls == 1
+
+
+class TestInvalidResponse:
+    """Bohr msg-342: every 2xx parse failure → invalid_response, never raised raw."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"model": "jev-1", "answers": []},
+            {"model": "jev-1", "answers": {"q": {"noul": "high"}}},
+            {"model": "jev-1", "answers": {"q": {"noul": 1.5}}},
+            {"model": "jev-1", "answers": {"q": [0.5]}},
+            {"model": "jev-1", "answers": {}},  # requested qid missing
+            {"model": "jev-1"},
+            [1, 2, 3],
+        ],
+    )
+    async def test_bad_shape(self, payload: object) -> None:
+        err = await _raises(_provider(_respond(200, payload)))
         assert err.code == "invalid_response"
 
+    async def test_not_json(self) -> None:
+        err = await _raises(_provider(_respond(200, text="<html>not json")))
+        assert err.code == "invalid_response"
+        assert err.exc_type == "JSONDecodeError"
+        assert err.upstream is None
 
-class TestFailFast:
-    """Einstein msg-259 #2 / Bohr msg-260 #2: TaskGroup cancels siblings."""
+    async def test_choice_missing_confidence(self) -> None:
+        payload = _ok({"c": {"choice": "a", "probabilities": {"a": 1.0}}})
+        err = await _raises(_provider(_respond(200, payload)), c=_q("choice"))
+        assert err.code == "invalid_response"
 
-    async def test_one_failure_fails_whole_request_and_cancels_siblings(self) -> None:
-        slow_finished = asyncio.Event()
+    async def test_usage_kept_on_invalid_response(self) -> None:
+        """msg-342 #2: billed but discarded → usage/model still carried."""
+        payload = _ok({"q": {"noul": "nope"}})
+        err = await _raises(_provider(_respond(200, payload)))
+        assert err.code == "invalid_response"
+        assert err.upstream == UpstreamMeta("jev-1.13.0", 100, 4)
 
-        async def handler(request: httpx.Request) -> httpx.Response:
-            instr = json.loads(request.content)["instructions"]
-            if instr == "fast-ok":
-                return httpx.Response(200, json={"noul": 0.9})
-            if instr == "fails":
-                await asyncio.sleep(0.05)
-                raise httpx.ReadTimeout("timed out", request=request)
-            # "slow": would complete long after the failure.
-            await asyncio.sleep(5)
-            slow_finished.set()
-            return httpx.Response(200, json={"noul": 0.1})
-
-        start = time.monotonic()
-        err = await _raises(
-            _provider(handler),
-            a=_q("noul", "fast-ok"),
-            b=_q("noul", "fails"),
-            c=_q("noul", "slow"),
+    async def test_broken_usage_with_good_answers_is_success(self) -> None:
+        payload = {"model": 7, "answers": {"q": {"noul": 0.2}}, "usage": "lots"}
+        result = await _provider(_respond(200, payload)).evaluate(
+            state="s", questions={"q": _q("noul")}
         )
-        elapsed = time.monotonic() - start
+        assert result.answers["q"]["noul"] == 0.2
+        assert result.upstream == UpstreamMeta(None, None, None)
 
-        assert err.code == "timeout"
-        # "fast-ok" completed (billed upstream) before the failure and was
-        # thrown away; "slow" was cancelled, not counted.
-        assert err.discarded == 1
-        assert "discarded=1" in str(err)
-        assert elapsed < 2.0, "sibling was not cancelled"
-        assert not slow_finished.is_set()
+    async def test_unexpected_parse_exception_is_wrapped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exception type the parser did not plan for still becomes
+        invalid_response (msg-342 #1) with exc_type/where only."""
 
-    async def test_non_jev_exception_is_not_masked(self) -> None:
-        """A bug (not a classified upstream failure) must not become a
-        silent NullProvider fallback."""
+        def boom(payload: object, questions: object) -> object:
+            raise KeyError(STATE)
+
+        monkeypatch.setattr(jev_client, "parse_answers", boom)
+        err = await _raises(_provider(_respond(200, _ok({"q": {"noul": 0.1}}))))
+        assert err.code == "invalid_response"
+        assert err.exc_type == "KeyError"
+        assert err.upstream == UpstreamMeta("jev-1.13.0", 100, 4)
+
+    async def test_internal_error_on_request_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = 0
 
         async def handler(request: httpx.Request) -> httpx.Response:
-            raise RuntimeError("bug")
+            nonlocal calls
+            calls += 1
+            return httpx.Response(200)
 
-        with pytest.raises(BaseExceptionGroup):
-            await _provider(handler).evaluate(state="s", questions={"q": _q("noul")})
+        def boom(state: str, questions: object, model: str) -> object:
+            raise TypeError(f"cannot serialise {state}")
+
+        monkeypatch.setattr(jev_client, "build_body", boom)
+        err = await _raises(_provider(handler))
+        assert err.code == "internal_error"
+        assert err.exc_type == "TypeError"
+        assert calls == 0
+
+
+class TestExtract422Loc:
+    """Bohr msg-346 v8 #2 + Einstein advisory (narrow catch)."""
+
+    async def test_loc_extracted(self) -> None:
+        body = {
+            "detail": [
+                {
+                    "loc": ["body", "questions", "q1", "criteria"],
+                    "msg": f"bad {INPUT_SENTINEL}",
+                    "input": INPUT_SENTINEL,
+                    "ctx": {"x": INPUT_SENTINEL},
+                }
+            ]
+        }
+        err = await _raises(_provider(_respond(422, body)), q1=_q("noul"))
+        assert err.code == "invalid_request"
+        assert err.loc == ("body", "questions", "q1", "criteria")
+        assert err.exc_type is None
+        assert INPUT_SENTINEL not in repr(vars(err))
+
+    async def test_int_elements_and_first_readable_entry(self) -> None:
+        body = {"detail": ["junk", {"msg": "no loc"}, {"loc": ["body", 3]}, {"loc": ["x"]}]}
+        err = await _raises(_provider(_respond(422, body)))
+        assert err.loc == ("body", "3")
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"text": "<html>oops"},
+            {"payload": {"detail": {"loc": ["body"]}}},
+            {"payload": {"detail": [{"msg": "no loc"}]}},
+            {"payload": {"error": "x"}},
+            {"payload": ["detail"]},
+            {"payload": {"detail": []}},
+        ],
+    )
+    async def test_broken_body_keeps_code(self, kwargs: dict[str, Any]) -> None:
+        err = await _raises(_provider(_respond(422, **kwargs)))
+        assert err.code == "invalid_request"  # NOT internal_error
+        assert err.loc is None
+
+    async def test_truncation(self) -> None:
+        loc = ["x" * 200] + [f"p{i}" for i in range(40)]
+        err = await _raises(_provider(_respond(422, {"detail": [{"loc": loc}]})))
+        assert err.loc is not None
+        assert len(err.loc) == jev_client.LOC_MAX_ELEMENTS
+        assert err.loc[0] == "x" * jev_client.LOC_MAX_ELEMENT_CHARS
+
+    def test_bug_in_extractor_is_not_swallowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Einstein advisory: only shape-mismatch exceptions are caught."""
+
+        class Resp:
+            def json(self) -> object:
+                raise AttributeError("typo in extractor")
+
+        with pytest.raises(AttributeError):
+            jev_client.extract_422_loc(Resp())  # type: ignore[arg-type]
+
+    async def test_bug_in_extractor_still_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(resp: object) -> object:
+            raise NameError("typo")
+
+        monkeypatch.setattr(jev_client, "extract_422_loc", boom)
+        err = await _raises(_provider(_respond(422, {"detail": []})))
+        assert err.code == "internal_error"
+        assert err.exc_type == "NameError"
+
+
+# ---------------------------------------------------------------------------
+# Exception-chain severance (Bohr msg-344 v7, Einstein msg-343)
+# ---------------------------------------------------------------------------
+
+_WHERE = re.compile(r"^[^/\\:][^:]*:\d+$")
+
+
+async def _ok_noul_but_bad(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json=_ok({"q": {"noul": "x"}}))
+
+
+async def _connect_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("refused", request=request)
+
+
+async def _read_timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("timed out", request=request)
+
+
+def _status(n: int) -> Handler:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            n, json={"detail": [{"loc": ["body"], "input": STATE, "msg": API_KEY}]}
+        )
+
+    return handler
+
+
+_ALL_FAILURES: list[Any] = [
+    pytest.param(_read_timeout, "timeout", id="timeout"),
+    pytest.param(_connect_error, "network", id="network"),
+    pytest.param(_status(401), "auth", id="401"),
+    pytest.param(_status(422), "invalid_request", id="422"),
+    pytest.param(_status(429), "rate_limited", id="429"),
+    pytest.param(_status(529), "overloaded", id="529"),
+    pytest.param(_status(502), "http_status", id="5xx"),
+    pytest.param(_ok_noul_but_bad, "invalid_response", id="invalid_response"),
+    pytest.param(_respond(200, text=f"{STATE} not json"), "invalid_response", id="not-json"),
+    pytest.param(_respond(200, {"answers": []}), "invalid_response", id="answers-list"),
+    pytest.param(
+        _respond(200, _ok({"q": {"score": 1, "legend": None, "confidence": 0.1}})),
+        "invalid_response",
+        id="legend-null",
+    ),
+]
+
+#: Objects the reachability walk does not enter. Traceback/frame: the
+#: residual risk accepted in msg-344 v7 #2 (``__traceback__`` reaches
+#: ``evaluate``'s frame, which holds ``state`` and ``self``). Types,
+#: modules and code/function objects lead to global interpreter state
+#: (``sys.modules`` → everything), which says nothing about what the
+#: exception itself holds.
+_OPAQUE = (
+    types.TracebackType,
+    types.FrameType,
+    type,
+    types.ModuleType,
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.CodeType,
+    types.MethodType,
+)
+
+
+def _reachable_strings(root: object) -> list[str]:
+    seen: set[int] = set()
+    out: list[str] = []
+    stack: list[object] = [root]
+    while stack:
+        obj = stack.pop()
+        if id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        if isinstance(obj, (str, bytes)):
+            out.append(obj if isinstance(obj, str) else obj.decode("latin-1"))
+            continue
+        if obj is not root and isinstance(obj, _OPAQUE):
+            continue
+        stack.extend(gc.get_referents(obj))
+        # Frozen dataclasses with __slots__ are not always traversed; add
+        # instance dicts explicitly.
+        d = getattr(obj, "__dict__", None)
+        if isinstance(d, dict) and not isinstance(obj, _OPAQUE):
+            stack.append(d)
+    return out
+
+
+class TestChainSevered:
+    @pytest.mark.parametrize(("handler", "code"), _ALL_FAILURES)
+    async def test_no_chain_and_no_sentinels(self, handler: Handler, code: str) -> None:
+        err = await _raises(_provider(handler))
+        assert err.code == code
+        assert err.__cause__ is None
+        assert err.__context__ is None
+        for text in (str(err), repr(err), repr(vars(err))):
+            assert STATE not in text
+            assert API_KEY not in text
+        assert str(err) == f"jev:{code}"
+        assert set(vars(err)) == {"code", "exc_type", "where", "loc", "upstream"}
+        if err.where is not None:
+            assert _WHERE.match(err.where), err.where
+        if err.exc_type is not None:
+            assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", err.exc_type)
+
+    @pytest.mark.parametrize(("handler", "code"), _ALL_FAILURES)
+    async def test_nothing_reachable_holds_key_or_state(
+        self, handler: Handler, code: str
+    ) -> None:
+        err = await _raises(_provider(handler))
+        for s in _reachable_strings(err):
+            assert API_KEY not in s
+            assert STATE not in s
+
+    async def test_internal_error_chain_severed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(state: str, questions: object, model: str) -> object:
+            raise TypeError(f"cannot serialise {state}")
+
+        monkeypatch.setattr(jev_client, "build_body", boom)
+        err = await _raises(_provider(_respond(200, {})))
+        assert err.code == "internal_error"
+        assert err.__cause__ is None and err.__context__ is None
+        assert STATE not in repr(vars(err))
+        assert err.where is not None and _WHERE.match(err.where)
+        for s in _reachable_strings(err):
+            assert STATE not in s
+
+    def test_walk_would_find_a_leak(self) -> None:
+        """The reachability walk is not vacuous: a chained exception is found."""
+        try:
+            raise KeyError(STATE)
+        except KeyError as inner:
+            try:
+                raise ProviderError.__new__(ProviderError) from inner
+            except ProviderError as leaky:
+                caught = leaky
+        assert any(STATE in s for s in _reachable_strings(caught))
 
 
 class TestApiKeyHygiene:
-    async def test_authorization_header_carries_key(self) -> None:
-        seen: list[httpx.Request] = []
-
-        async def handler(request: httpx.Request) -> httpx.Response:
-            seen.append(request)
-            return httpx.Response(200, json={"noul": 0.5})
-
-        await _provider(handler).evaluate(state="s", questions={"q": _q("noul")})
-        assert seen[0].headers["authorization"] == f"Bearer {API_KEY}"
-
-    async def test_key_absent_from_errors_and_repr(self) -> None:
-        async def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(401, text=f"bad key {API_KEY}")
-
-        provider = _provider(handler)
-        err = await _raises(provider, q=_q("noul"))
-        assert API_KEY not in str(err)
-        assert API_KEY not in repr(err)
-        assert err.__cause__ is None
+    async def test_key_absent_from_repr(self) -> None:
+        provider = _provider(_respond(200, {}))
         assert API_KEY not in repr(provider)
         assert API_KEY not in repr(vars(provider))

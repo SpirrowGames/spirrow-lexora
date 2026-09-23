@@ -1,16 +1,18 @@
-"""Provider abstraction for ``/v1/decide`` and the ``null`` implementation.
+"""Provider abstraction for ``/v1/decide``: ``null`` and ``jev``.
 
-The interface is a Protocol rather than an abstract class so the tests
-can drop in an ad-hoc fake without inheriting; future ``LlmEmulation``
-and ``Jev`` providers will implement it directly. Only the ``null``
-implementation shipped in T02 PR 1 (msg-246); :class:`JevProvider` lands
-in T-decide-jev-provider.
+The interface is a Protocol rather than an abstract class, so tests can
+use an ad-hoc fake without inheriting from anything. ``NullProvider``
+shipped in T02 PR 1 (msg-246). :class:`JevProvider` lands in
+T-decide-jev-provider, following Bohr's v8 design (msg-339 / 342 / 344 /
+346). The planned ``LlmEmulation`` provider will implement the same
+Protocol and return the same :class:`ProviderResult`.
 """
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable
+import os
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 import httpx
@@ -18,23 +20,139 @@ import httpx
 from lexora.decide import jev_client
 from lexora.decide.contract import Answer, QuestionSpec
 
-ProviderErrorCode = Literal["timeout", "http_status", "network", "auth", "invalid_response"]
+#: Fixed failure codes (Bohr msg-339 #4 table + msg-342 ``internal_error``).
+ProviderErrorCode = Literal[
+    "timeout",
+    "network",
+    "auth",
+    "invalid_request",
+    "rate_limited",
+    "overloaded",
+    "http_status",
+    "invalid_response",
+    "internal_error",
+]
+
+
+@dataclass(frozen=True)
+class UpstreamMeta:
+    """What the upstream call reported about itself (Bohr msg-342 #2).
+
+    ``model`` is the version that actually served the request (e.g.
+    ``"jev-1.13.0"``), not the requested alias. Every field is filled
+    leniently: one that is missing or has the wrong type is ``None``.
+    """
+
+    model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    """Return type of :meth:`DecisionProvider.evaluate` (Bohr msg-342 #2).
+
+    ``upstream`` is ``None`` for providers that call nothing upstream
+    (NullProvider). Metadata travels in the return value, not on
+    ``self``, so concurrent requests cannot see each other's values.
+    """
+
+    answers: dict[str, Answer]
+    upstream: UpstreamMeta | None = None
+
+
+@dataclass(frozen=True)
+class _Failure:
+    """Plain-value description of a provider failure (Bohr msg-344/346).
+
+    Holds only strings, a string tuple and an :class:`UpstreamMeta`. It
+    never holds the original exception, an httpx ``Request`` /
+    ``Response``, or any body.
+    """
+
+    code: ProviderErrorCode
+    exc_type: str | None = None
+    where: str | None = None
+    loc: tuple[str, ...] | None = None  # set only for 422
+    upstream: UpstreamMeta | None = None
+
+    @staticmethod
+    def from_exc(
+        code: ProviderErrorCode,
+        exc: BaseException,
+        upstream: UpstreamMeta | None = None,
+    ) -> _Failure:
+        """Keep the class name and the innermost ``file:line``.
+
+        The message and traceback are dropped: a ``KeyError`` /
+        ``TypeError`` message can contain part of ``state`` (msg-342 #1).
+        Frame locals and arguments are never read.
+        """
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        where = (
+            f"{_relpath(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}"
+            if tb is not None
+            else None
+        )
+        return _Failure(code, type(exc).__name__, where, None, upstream)
+
+
+_SRC_ROOT = Path(__file__).resolve().parents[2]  # .../src (parent of ``lexora``)
+
+
+def _relpath(filename: str) -> str:
+    """Turn a code filename into a relative, ``/``-separated path.
+
+    Files under Lexora's ``src`` become ``lexora/...``. Library files keep
+    only the part after ``site-packages``. Anything else keeps only its
+    basename, so an absolute host path never reaches a log line.
+    """
+    path = Path(filename)
+    try:
+        return path.resolve().relative_to(_SRC_ROOT).as_posix()
+    except (ValueError, OSError):
+        pass
+    parts = path.parts
+    if "site-packages" in parts:
+        idx = len(parts) - 1 - parts[::-1].index("site-packages")
+        rest = parts[idx + 1 :]
+        if rest:
+            return "/".join(rest)
+    return path.name or filename.replace(os.sep, "/").rsplit("/", 1)[-1]
 
 
 class ProviderError(Exception):
     """An upstream provider failed; the route falls back to NullProvider.
 
-    ``code`` is one of a fixed set. ``discarded`` counts sibling upstream
-    calls in the same request that had already completed — and so were
-    billed — when the failure was observed; their answers are thrown away
-    because a request is answered by exactly one provider (Bohr msg-260
-    #2). Deliberately holds no HTTP body, header, or API key.
+    Its public surface is exactly five plain values (Bohr msg-346 v8 #1):
+    ``code`` / ``exc_type`` / ``where`` / ``loc`` / ``upstream``.
+    ``str(err)`` is ``"jev:<code>"``. The exception holds no reference to
+    the original exception, an httpx object, a body, or the API key.
+    :class:`JevProvider` raises it outside every ``except`` block, so both
+    ``__cause__`` and ``__context__`` are ``None`` (msg-344 v7 #1).
+
+    ``upstream`` is set only when a 2xx arrived and the answers were then
+    rejected. In that case the call was billed and its usage is still
+    logged (msg-342 #2).
     """
 
-    def __init__(self, code: ProviderErrorCode, *, discarded: int = 0) -> None:
-        super().__init__(code if not discarded else f"{code};discarded={discarded}")
-        self.code: ProviderErrorCode = code
-        self.discarded = discarded
+    def __init__(self, failure: _Failure, *, provider: str = "jev") -> None:
+        super().__init__(f"{provider}:{failure.code}")
+        self.code: ProviderErrorCode = failure.code
+        self.exc_type = failure.exc_type
+        self.where = failure.where
+        self.loc = failure.loc
+        self.upstream = failure.upstream
+
+
+class _Classified(Exception):
+    """Internal signal: an already-classified failure. Holds a ``_Failure`` only."""
+
+    def __init__(self, failure: _Failure) -> None:
+        super().__init__()
+        self.failure = failure
 
 
 @runtime_checkable
@@ -47,8 +165,8 @@ class DecisionProvider(Protocol):
     ``provider`` column of the decision log, so a drift here would show
     up as a wrong provider name in every offline evaluation.
 
-    ``evaluate`` returns a dict keyed by the same question names the
-    caller supplied. Providers that cannot answer a particular question
+    ``evaluate`` returns a :class:`ProviderResult` whose ``answers`` is
+    keyed by the same question names the caller supplied. Providers that cannot answer a particular question
     (e.g. NullProvider on a ``choice`` primitive) still emit an entry —
     they never omit the name — because a caller iterating over
     ``answers`` must not have to distinguish "provider did not answer"
@@ -62,7 +180,7 @@ class DecisionProvider(Protocol):
         *,
         state: str,
         questions: dict[str, QuestionSpec],
-    ) -> dict[str, Answer]:
+    ) -> ProviderResult:
         """Answer every question in ``questions`` against ``state``."""
 
 
@@ -95,7 +213,7 @@ class NullProvider:
         *,
         state: str,
         questions: dict[str, QuestionSpec],
-    ) -> dict[str, Answer]:
+    ) -> ProviderResult:
         # ``state`` is unused deliberately: NullProvider is a shape-
         # correct constant, not a degenerate LLM. The parameter stays
         # in the signature so the Protocol is satisfied and so the two
@@ -105,7 +223,7 @@ class NullProvider:
         answers: dict[str, Answer] = {}
         for name, question in questions.items():
             answers[name] = _null_answer_for(question)
-        return answers
+        return ProviderResult(answers=answers, upstream=None)
 
 
 def _null_answer_for(question: QuestionSpec) -> Answer:
@@ -165,30 +283,49 @@ def _extract_score_legend(criteria: object) -> list[str]:
     return legend
 
 
-_JevCall = Callable[[httpx.AsyncClient, str, str, QuestionSpec], Awaitable[Answer]]
-
-_JEV_DISPATCH: dict[str, _JevCall] = {
-    "noul": jev_client.call_noul,
-    "choice": jev_client.call_choice,
-    "score": jev_client.call_score,
-}
+_Stage = Literal["request", "http", "parse"]
 
 
 class JevProvider:
-    """Provider backed by the Jev (TypeSafe) judgment API.
+    """Provider backed by the Jev (TypeSafe) ``systemone`` API.
 
-    API key (msg-240 §1 / Bohr msg-258 §2): passed in once by
-    ``create_app`` from the env and captured in a closure — not stored on
-    ``app.state``, on settings, or as a plain attribute, and never put in
-    an exception or log line. ``repr(provider)`` does not show it.
+    API key (msg-240 §1 / Bohr msg-258 §2): ``create_app`` passes it in
+    once from the env and it is captured in a closure. It is not stored on
+    ``app.state``, on settings, or as a plain attribute, and it never goes
+    into an exception or a log line. ``repr(provider)`` does not show it.
 
-    Failure semantics (Bohr msg-260 #2, Einstein msg-259 #2 / msg-261):
-    questions are dispatched concurrently under :class:`asyncio.TaskGroup`.
-    The first failure cancels the in-flight siblings (fail-fast, to limit
-    billed-but-discarded upstream calls) and the whole ``evaluate`` raises
-    one :class:`ProviderError`. There is no partial result: a request is
-    answered by exactly one provider, so the ``provider`` column never
-    mixes Jev answers with NullProvider answers.
+    One request is one upstream call (Bohr msg-339 #1): all questions go
+    in a single POST, so either every question is answered or none is.
+    One request therefore has exactly one ``provider`` value.
+
+    Failure semantics (Bohr msg-342 #1 / msg-344 / msg-346, Einstein
+    msg-340 #1 / msg-343 / msg-345): every exception raised inside
+    ``evaluate`` becomes a :class:`ProviderError`. The router catches that
+    one type and falls back to NullProvider, so a change in Jev's response
+    shape can never turn ``/v1/decide`` into a 500. How exceptions map to
+    codes:
+
+    * httpx timeout / ``asyncio.timeout`` → ``timeout``; other
+      ``httpx.RequestError`` → ``network``.
+    * Status codes → :func:`jev_client.classify_status` (422 also carries a
+      ``loc``).
+    * Any exception while reading a 2xx → ``invalid_response``, with the
+      leniently read :class:`UpstreamMeta` attached.
+    * Any other exception (a Lexora bug while building the request, for
+      example) → ``internal_error``.
+
+    The classifying ``try`` is in :meth:`_attempt`, which returns a
+    :class:`_Failure` instead of raising. :meth:`evaluate` raises the
+    ``ProviderError`` outside any ``except`` block, so the error has no
+    ``__cause__`` and no ``__context__``. That matters because the
+    original exception can reach the ``state`` text, or through
+    ``httpx.Request`` the ``Authorization`` header (msg-344 v7 #1).
+    ``_attempt``'s frame, which holds the key and the response, has
+    already returned and is not part of the error's traceback.
+
+    Residual risk (msg-344 v7 #2): ``ProviderError.__traceback__`` still
+    reaches :meth:`evaluate`'s frame, and that frame holds ``state`` and
+    ``self``. Never log it with ``exc_info``.
     """
 
     name = "jev"
@@ -198,6 +335,7 @@ class JevProvider:
         api_key: str,
         *,
         timeout_ms: int,
+        model: str = jev_client.DEFAULT_MODEL,
         base_url: str = jev_client.DEFAULT_BASE_URL,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -205,52 +343,73 @@ class JevProvider:
             return api_key
 
         self._key = _key
-        self._timeout_s = timeout_ms / 1000.0
+        self._timeout_ms = timeout_ms
+        self._model = model
         self._base_url = base_url
         self._transport = transport
 
     def __repr__(self) -> str:
-        return f"JevProvider(base_url={self._base_url!r})"
+        return f"JevProvider(base_url={self._base_url!r}, model={self._model!r})"
 
     async def evaluate(
         self,
         *,
         state: str,
         questions: dict[str, QuestionSpec],
-    ) -> dict[str, Answer]:
-        answers: dict[str, Answer] = {}
-        api_key = self._key()
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=self._timeout_s,
-            transport=self._transport,
-        ) as client:
+    ) -> ProviderResult:
+        outcome = await self._attempt(state, questions)
+        if isinstance(outcome, _Failure):
+            # Outside every ``except``: no implicit __context__ is attached.
+            raise ProviderError(outcome, provider=self.name)
+        return outcome
 
-            async def _one(name: str, question: QuestionSpec) -> None:
-                call = _JEV_DISPATCH[question.type]
-                answers[name] = await call(client, api_key, state, question)
+    async def _attempt(
+        self, state: str, questions: dict[str, QuestionSpec]
+    ) -> ProviderResult | _Failure:
+        """Run the call. Return a result or a plain :class:`_Failure`; never raise.
 
-            try:
-                async with asyncio.TaskGroup() as tg:
-                    for name, question in questions.items():
-                        tg.create_task(_one(name, question))
-            except BaseExceptionGroup as eg:
-                # Anything that is not a classified Jev failure is a bug;
-                # re-raise it unchanged rather than hide it behind a
-                # fallback.
-                matched, rest = eg.split(jev_client.JevCallError)
-                if rest is not None or matched is None:
-                    raise
-                first = _first_leaf(matched)
-                # ``answers`` holds exactly the calls that completed
-                # before cancellation: billed upstream, discarded here.
-                raise ProviderError(first.code, discarded=len(answers)) from None
-        return answers
-
-
-def _first_leaf(eg: BaseExceptionGroup[jev_client.JevCallError]) -> jev_client.JevCallError:
-    exc: BaseException = eg
-    while isinstance(exc, BaseExceptionGroup):
-        exc = exc.exceptions[0]
-    assert isinstance(exc, jev_client.JevCallError)
-    return exc
+        ``asyncio.CancelledError`` is a ``BaseException`` and propagates
+        unchanged: the caller is cancelling the request, so this is not a
+        Jev failure.
+        """
+        stage: _Stage = "request"
+        meta: UpstreamMeta | None = None
+        try:
+            body = jev_client.build_body(state, questions, self._model)
+            stage = "http"
+            resp = await jev_client.call_systemone(
+                body,
+                api_key=self._key(),
+                timeout_ms=self._timeout_ms,
+                base_url=self._base_url,
+                transport=self._transport,
+            )
+            status_code = jev_client.classify_status(resp.status_code)
+            if status_code is not None:
+                loc = (
+                    jev_client.extract_422_loc(resp)
+                    if status_code == "invalid_request"
+                    else None
+                )
+                raise _Classified(_Failure(status_code, loc=loc))
+            stage = "parse"
+            payload = resp.json()
+            model, tokens_in, tokens_out = jev_client.extract_meta(payload)
+            meta = UpstreamMeta(model, tokens_in, tokens_out)
+            answers = jev_client.parse_answers(payload, questions)
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            return _Failure.from_exc("timeout", exc)
+        except httpx.RequestError as exc:
+            return _Failure.from_exc("network", exc)
+        except _Classified as signal:
+            return signal.failure
+        except jev_client.InvalidResponse:
+            # Shape check failed: the class name is enough, and there is
+            # no "where" worth keeping for a deliberate raise.
+            return _Failure("invalid_response", "InvalidResponse", None, None, meta)
+        except Exception as exc:  # noqa: BLE001 — msg-342 #1: the boundary is here
+            code: ProviderErrorCode = (
+                "invalid_response" if stage == "parse" else "internal_error"
+            )
+            return _Failure.from_exc(code, exc, upstream=meta)
+        return ProviderResult(answers=answers, upstream=meta)
