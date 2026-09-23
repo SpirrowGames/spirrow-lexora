@@ -5,6 +5,8 @@ import os
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend
 from lexora.backends.claude_code import ClaudeCodeBackend
+from lexora.backends.codex import CodexBackend
+from lexora.backends.codex_verification import CodexStateStore
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
 from lexora.backends.vllm import VLLMBackend
@@ -165,6 +167,32 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             working_dir=working_dir,
             max_turns=max_turns,
             model_mapping=settings.model_mapping,
+            name=name,
+        )
+    elif settings.type == "codex":
+        # T-naysayer-codex-backend PR-1. Construction starts no subprocess
+        # and reads no credential: a host with no CLI and no login still
+        # boots, and every request is refused by the verification gate
+        # (CodexNotVerifiedError) until verify_codex has passed.
+        codex = settings.codex
+        if codex is None:  # config validator guarantees this; keep mypy honest
+            raise ValueError(f"codex backend '{name}' has no 'codex:' section")
+        logger.info(
+            "creating_codex_backend",
+            name=name,
+            model_mapping_count=len(settings.model_mapping),
+        )
+        return CodexBackend(
+            codex_home=codex.codex_home,
+            state_store=CodexStateStore(codex.state_db_path),
+            codex_bin=codex.codex_bin,
+            bwrap_bin=codex.bwrap_bin,
+            ro_binds=codex.ro_binds,
+            cli_overrides=codex.cli_overrides,
+            model_mapping=settings.model_mapping,
+            models=settings.get_model_names(),
+            timeout=settings.timeout,
+            max_concurrency=codex.max_concurrency,
             name=name,
         )
     else:

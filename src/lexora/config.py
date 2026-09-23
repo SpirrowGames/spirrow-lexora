@@ -2,11 +2,11 @@
 
 import os
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BeforeValidator, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from lexora.decide.config import DecisionSettings
@@ -177,16 +177,150 @@ def _normalize_models_list(v: Any) -> list[ModelInfo]:
 ModelsList = Annotated[list[ModelInfo], BeforeValidator(_normalize_models_list)]
 
 
+#: Timeout applied to a ``codex`` backend whose YAML does not set ``timeout``
+#: (T-naysayer-codex-backend msg-294 PR-1: "timeout は 600s"). The generic
+#: ``BackendSettings.timeout`` default (120s) is sized for HTTP backends and
+#: would cut a naysayer review off mid-generation.
+CODEX_DEFAULT_TIMEOUT_S: float = 600.0
+
+
+#: ``cli_overrides`` keys refused at load time (msg-315 #2). ``model_provider``
+#: / ``model_providers.*`` would make production talk to a different endpoint
+#: than the one V-2' checked (V-2' adds its own provider override);
+#: ``sandbox*`` / ``approval*`` / ``shell_environment_policy*`` would loosen
+#: the containment the gate vouches for. ``profile`` / ``profiles.*`` are
+#: refused too because selecting a profile can set any of the above
+#: indirectly (added by the implementer, not in msg-315 -- see PR #46).
+CODEX_FORBIDDEN_OVERRIDE_PREFIXES: tuple[str, ...] = (
+    "model_provider",
+    "sandbox",
+    "approval",
+    "shell_environment_policy",
+    "profile",
+)
+
+#: Lexora's own source tree; ``ro_binds`` may not reach it.
+_LEXORA_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _posix(path: str | Path) -> PurePosixPath:
+    return PurePosixPath(Path(path).as_posix() if isinstance(path, Path) else path)
+
+
+def _overlaps(a: PurePosixPath, b: PurePosixPath) -> bool:
+    """True when ``a`` equals ``b``, lies under it, or contains it."""
+    return a == b or b in a.parents or a in b.parents
+
+
+class CodexSettings(BaseModel):
+    """Settings for a ``codex`` backend (``codex exec`` under bwrap).
+
+    T-naysayer-codex-backend msg-294 PR-1. A plain ``BaseModel`` rather than
+    ``BaseSettings`` on purpose: ``BaseSettings`` would also read these
+    fields from same-named environment variables (``CODEX_HOME`` is one the
+    CLI itself uses), so the process environment could silently rewrite the
+    sandbox layout. Only the YAML can set them.
+
+    ``extra="forbid"``, and **no field here or on ``BackendSettings`` can
+    turn the verification gate off**. The gate (``CodexBackend._ensure_verified``)
+    has no configuration surface at all; ``tests/backends/test_codex.py``
+    pins both facts. Every field below that changes the command line is part
+    of the config hash the gate compares, so editing one closes the gate
+    until ``python -m lexora.tools.verify_codex`` passes again.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    codex_home: str = Field(
+        description=(
+            "Dedicated CODEX_HOME holding the CLI's login. The only host "
+            "directory bind-mounted into the sandbox besides /usr (read-only) "
+            "and the per-request working directory. Keep it outside /home "
+            "where possible: an ancestor of a bind target is visible inside "
+            "the sandbox as an otherwise empty directory."
+        ),
+    )
+    codex_bin: str = Field(default="codex", description="codex CLI executable.")
+    bwrap_bin: str = Field(default="bwrap", description="bubblewrap executable.")
+    ro_binds: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Extra host paths bound read-only into the sandbox (e.g. the "
+            "CLI's install directory when it lives outside /usr). Hashed."
+        ),
+    )
+    cli_overrides: list[str] = Field(
+        default_factory=list,
+        description=(
+            "``key=value`` pairs passed to ``codex exec`` as ``-c`` overrides "
+            "(e.g. the tool-disabling setting once measured). Hashed."
+        ),
+    )
+    max_concurrency: int = Field(
+        default=2, ge=1, description="Concurrent ``codex exec`` processes."
+    )
+
+    @model_validator(mode="after")
+    def _restrict_sandbox_widening(self) -> "CodexSettings":
+        """Refuse settings that would widen the sandbox (msg-315 #2).
+
+        ``ro_binds``: absolute, normalised paths only, and none may overlap
+        ``/home``, ``/root``, the parent of ``codex_home`` or Lexora's source
+        tree (working directory and package root). "Overlap" includes being
+        an ancestor: binding ``/`` or ``/srv`` would expose what lies under
+        it, so refusing only paths *under* the sensitive roots is not enough
+        (the ancestor half is the implementer's reading, see PR #46).
+
+        ``cli_overrides``: ``key=value`` only; keys starting with any
+        ``CODEX_FORBIDDEN_OVERRIDE_PREFIXES`` entry are refused.
+        """
+        sensitive = [
+            PurePosixPath("/home"),
+            PurePosixPath("/root"),
+            PurePosixPath(self.codex_home).parent,
+            _posix(_LEXORA_REPO_ROOT),
+            _posix(Path.cwd()),
+        ]
+        for raw in self.ro_binds:
+            path = PurePosixPath(raw)
+            if not raw.startswith("/") or ".." in path.parts or str(path) != raw.rstrip("/"):
+                raise ValueError(f"codex.ro_binds entry {raw!r} must be an absolute, normalised path")
+            for root in sensitive:
+                if root.is_absolute() and _overlaps(path, root):
+                    raise ValueError(
+                        f"codex.ro_binds entry {raw!r} overlaps {str(root)!r}; binding it "
+                        f"would widen the sandbox"
+                    )
+        for override in self.cli_overrides:
+            key, sep, _ = override.partition("=")
+            key = key.strip().lower()
+            if not sep or not key:
+                raise ValueError(f"codex.cli_overrides entry {override!r} must be key=value")
+            if key.startswith(CODEX_FORBIDDEN_OVERRIDE_PREFIXES):
+                raise ValueError(
+                    f"codex.cli_overrides key {key!r} is refused: it would change the "
+                    f"provider, sandbox or approval policy the verification vouches for"
+                )
+        return self
+    state_db_path: str = Field(
+        default="data/codex.db",
+        description=(
+            "SQLite file holding the ``codex_verification`` table and the "
+            "runtime tool-use violation latch."
+        ),
+    )
+
+
 class BackendSettings(BaseSettings):
     """Single backend settings."""
 
     type: Literal[
-        "vllm", "openai_compatible", "anthropic", "claude_code", "gemini"
+        "vllm", "openai_compatible", "anthropic", "claude_code", "gemini", "codex"
     ] = Field(
         default="vllm",
         description=(
             "Backend type (vllm, openai_compatible, anthropic, claude_code, "
-            "or gemini)"
+            "gemini, or codex)"
         ),
     )
     url: str = Field(default="http://localhost:8000", description="Backend server URL")
@@ -286,6 +420,33 @@ class BackendSettings(BaseSettings):
             "dropped (see ERROR_PASSTHROUGH_TYPES)."
         ),
     )
+
+    codex: CodexSettings | None = Field(
+        default=None,
+        description=(
+            "Required when type is 'codex' and refused on every other type "
+            "(a section the factory would ignore is a config that lies)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _codex_section_matches_type(self) -> "BackendSettings":
+        """Require ``codex:`` exactly on ``type: codex``; default its timeout."""
+        if self.type == "codex":
+            if self.codex is None:
+                raise ValueError(
+                    "backend type 'codex' requires a 'codex:' section "
+                    "(at least codex.codex_home)."
+                )
+            if "timeout" not in self.model_fields_set:
+                self.timeout = CODEX_DEFAULT_TIMEOUT_S
+        elif self.codex is not None:
+            raise ValueError(
+                f"'codex:' section is only read by backend type 'codex', "
+                f"not '{self.type}'; it would be accepted and ignored, so it "
+                f"is refused instead."
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_unimplemented_error_passthrough(self) -> "BackendSettings":
