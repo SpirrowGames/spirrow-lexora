@@ -17,15 +17,25 @@ The schema accepts only what the code implements (msg-387 v3). ``shadow``
 ``llm`` (``LlmEmulationProvider``) and a ``fallback`` provider selector are
 not implemented, so they are not in the schema: a config naming any of
 them fails validation at load instead of being accepted and silently
-doing nothing. ``DecisionSettings`` forbids unknown keys (the
-pydantic-settings default, pinned by a test), so a leftover ``fallback``
-key in ``[decision]`` stops start-up too. The PR that implements shadow /
+doing nothing. ``DecisionSettings`` forbids unknown keys
+(``extra="forbid"``, set explicitly and pinned by a test), so a leftover
+``fallback`` key in ``[decision]`` stops start-up too. The PR that implements shadow /
 LlmEmulation adds the value back together with the behaviour. This
 withdraws the earlier "validate the mode up front so a later PR does not
 have to revisit the schema" policy.
 
 The defaults (``primary="null"``, ``mode="off"``) never reach Jev, so no
 metered call happens until an operator opts in.
+
+Configuration source (Bohr msg-390 v4): ``[decision]`` is set from the
+YAML config only; environment variables are not read for it.
+``DecisionSettings`` is a plain :class:`pydantic.BaseModel`, not a
+``BaseSettings``, so neither ``LEXORA_DECISION__*`` nor unprefixed names
+such as ``LOG_PATH`` / ``PRIMARY`` / ``MODE`` can change it (as a
+``BaseSettings`` without ``env_prefix`` it used to pick the unprefixed
+names up, measured 2026-09-23). The one exception is
+``TYPESAFE_API_KEY``, which is read from the environment (msg-239) and
+never from YAML.
 
 Startup env check (msg-239 / msg-240):
 
@@ -48,8 +58,7 @@ from __future__ import annotations
 import os
 from typing import Literal
 
-from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel, ConfigDict, Field
 
 #: The single env variable Lexora reads for the TypeSafe API key. Fixed by
 #: msg-239: chosen to match TypeSafe's official SDK default so a Lexora
@@ -72,8 +81,8 @@ DecisionProviderName = Literal["null", "jev"]
 DecisionMode = Literal["off", "active"]
 
 
-class DecisionSettings(BaseSettings):
-    """Configuration for the ``/v1/decide`` endpoint.
+class DecisionSettings(BaseModel):
+    """Configuration for the ``/v1/decide`` endpoint (YAML ``[decision]`` only).
 
     Defaults are deliberately safe: ``primary="null"`` + ``mode="off"``
     means an operator who ships this branch without touching
@@ -81,6 +90,8 @@ class DecisionSettings(BaseSettings):
     an external service. A config that names ``primary="jev"`` must
     ship the env variable too (see :func:`check_typesafe_api_key`).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     primary: DecisionProviderName = Field(
         default="null",
@@ -108,8 +119,8 @@ class DecisionSettings(BaseSettings):
         description=(
             "Value sent as the required ``model`` field to Jev's systemone "
             "endpoint (Bohr msg-339 #2). ``jev-latest`` until the logged "
-            "``provider_model`` values show which version to pin. Env: "
-            "``LEXORA_DECISION__JEV_MODEL``."
+            "``provider_model`` values show which version to pin. Set via "
+            "``[decision].jev_model`` in the YAML config."
         ),
     )
     log_path: str = Field(

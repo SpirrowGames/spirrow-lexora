@@ -199,11 +199,9 @@ class TestSchemaMatchesImplementation:
     def test_fallback_key_is_rejected(self, value: str) -> None:
         """A leftover ``fallback`` key stops load instead of being ignored.
 
-        Relies on pydantic-settings' ``BaseSettings`` default
-        ``extra="forbid"`` (measured 2026-09-23; plain pydantic
-        ``BaseModel`` defaults to ``ignore``, which is where the opposite
-        expectation comes from). This test pins that default so a change
-        to it shows up here.
+        ``DecisionSettings`` is a ``BaseModel`` (msg-390 v4), whose
+        default would be ``extra="ignore"``; ``forbid`` is set explicitly
+        and pinned here so dropping it shows up.
         """
         assert DecisionSettings.model_config.get("extra") == "forbid"
         with pytest.raises(ValidationError) as excinfo:
@@ -229,3 +227,38 @@ class TestSchemaMatchesImplementation:
     @pytest.mark.parametrize("mode", ["off", "active"])
     def test_implemented_modes_pass(self, mode: str) -> None:
         assert DecisionSettings(mode=mode).mode == mode  # type: ignore[arg-type]
+
+
+class TestYamlOnlySource:
+    """``[decision]`` comes from YAML only (Bohr msg-390 v4).
+
+    On develop b1ef20d (``DecisionSettings(BaseSettings)`` without
+    ``env_prefix``) the unprefixed variables below were read into the
+    decision config by ``create_settings`` — this test failed there.
+    """
+
+    def test_unprefixed_env_is_ignored(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        for name, value in {
+            "LOG_PATH": "/elsewhere/other.db",
+            "PRIMARY": "jev",
+            "MODE": "active",
+            "TIMEOUT_MS": "1234",
+            "JEV_MODEL": "hijack",
+        }.items():
+            monkeypatch.setenv(name, value)
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("decision:\n  timeout_ms: 3000\n", encoding="utf-8")
+        decision = create_settings(config_file).decision
+        assert decision.primary == "null"
+        assert decision.mode == "off"
+        assert decision.timeout_ms == 3000
+        assert decision.jev_model == "jev-latest"
+        assert decision.log_path == "data/decisions.db"
+
+    def test_prefixed_env_is_ignored(self, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        monkeypatch.setenv("LEXORA_DECISION__PRIMARY", "jev")
+        monkeypatch.setenv("LEXORA_DECISION__MODE", "active")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("decision:\n  timeout_ms: 3000\n", encoding="utf-8")
+        decision = create_settings(config_file).decision
+        assert (decision.primary, decision.mode) == ("null", "off")
