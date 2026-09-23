@@ -394,6 +394,31 @@ class GeminiBackend(Backend):
         total_tokens = usage.get(
             "totalTokenCount", prompt_tokens + completion_tokens
         )
+        # T-ledger-gemini-thinking-tokens D-3 (rationale corrected msg-455).
+        # A whole response, so a missing key is a genuine 0 (Gemini omits
+        # `thoughtsTokenCount` when there was no thinking).
+        # `completion_tokens` stays `candidatesTokenCount` and does NOT
+        # absorb thinking, so the ledger does not count thinking twice: the
+        # non-streaming ledger sites record `tokens_output =
+        # usage["completion_tokens"]` as-is, while thinking reaches
+        # `tokens_thinking` separately via `lexora_thinking_tokens` and is
+        # priced at the output rate there. Folding thinking into
+        # `completion_tokens` would bill it in both columns. For the same
+        # reason thinking is NOT returned as `completion_tokens_details
+        # .reasoning_tokens` -- OpenAI defines that as a part of
+        # `completion_tokens`, and here it would exceed it. It rides a
+        # Lexora-own key instead. `cached_tokens` IS a part of
+        # `prompt_tokens` (`promptTokenCount` includes it), so the standard
+        # OpenAI field is correct for it.
+        #
+        # `total_tokens` is Gemini's `totalTokenCount` passed through: the
+        # billed total, thinking INCLUDED. It therefore does NOT equal
+        # `prompt_tokens + completion_tokens` when there was thinking; the
+        # difference is exactly `lexora_thinking_tokens`. This is a known,
+        # deliberate deviation from the OpenAI arithmetic (msg-455 (a)):
+        # recomputing the total would under-report billed tokens.
+        thinking_tokens = int(usage.get("thoughtsTokenCount") or 0)
+        cached_tokens = int(usage.get("cachedContentTokenCount") or 0)
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
@@ -411,6 +436,8 @@ class GeminiBackend(Backend):
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total_tokens,
+                "prompt_tokens_details": {"cached_tokens": cached_tokens},
+                "lexora_thinking_tokens": thinking_tokens,
             },
         }
 
@@ -630,6 +657,26 @@ class GeminiBackend(Backend):
                             if "candidatesTokenCount" in metadata:
                                 usage_sink.completion_tokens = int(
                                     metadata.get("candidatesTokenCount") or 0
+                                )
+                            # D-3 (T-ledger-gemini-thinking-tokens). Same
+                            # presence rule as above. Gemini omits these keys
+                            # when the count is zero, so once ANY usage block
+                            # has been seen, "not stated" becomes 0 rather
+                            # than staying None ("not measured"). Done here on
+                            # the first block rather than after the loop so a
+                            # client disconnect after usage arrived still
+                            # leaves integers on the row.
+                            if usage_sink.thinking_tokens is None:
+                                usage_sink.thinking_tokens = 0
+                            if usage_sink.cached_input_tokens is None:
+                                usage_sink.cached_input_tokens = 0
+                            if "thoughtsTokenCount" in metadata:
+                                usage_sink.thinking_tokens = int(
+                                    metadata.get("thoughtsTokenCount") or 0
+                                )
+                            if "cachedContentTokenCount" in metadata:
+                                usage_sink.cached_input_tokens = int(
+                                    metadata.get("cachedContentTokenCount") or 0
                                 )
 
                     candidates = event.get("candidates", [])

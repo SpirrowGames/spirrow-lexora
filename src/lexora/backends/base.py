@@ -157,10 +157,20 @@ class UsageSink:
     (``tokens_input > 0 or tokens_output > 0``, the predicate the six
     non-streaming sites use) then opens no row. That is why the verbatim-relay
     backends, whose bytes do not carry the number, need no special case.
+
+    ``thinking_tokens`` / ``cached_input_tokens`` (2026-09-23,
+    T-ledger-gemini-thinking-tokens D-3) are ``None`` for "this backend does
+    not measure it", which becomes NULL in the ledger. Only ``gemini`` fills
+    them, and it turns ``None`` into 0 as soon as it has seen any usage
+    block. ``thinking_tokens`` is NOT part of ``completion_tokens``, and
+    ``cached_input_tokens`` IS part of ``prompt_tokens``. They play no part
+    in the row-opening guard.
     """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    thinking_tokens: int | None = None
+    cached_input_tokens: int | None = None
 
 
 class Backend(ABC):

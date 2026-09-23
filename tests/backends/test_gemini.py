@@ -315,10 +315,15 @@ class TestResponseConversion:
         assert choice["message"]["content"] == "Answer"
         assert choice["message"]["role"] == "assistant"
         assert choice["finish_reason"] == "stop"
+        # The three OpenAI fields are unchanged. The last two are added by
+        # T-ledger-gemini-thinking-tokens D-3 and are 0 here because this
+        # response states neither key (a whole response: missing means 0).
         assert result["usage"] == {
             "prompt_tokens": 5,
             "completion_tokens": 3,
             "total_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 0},
+            "lexora_thinking_tokens": 0,
         }
 
     def test_multi_part_text_concatenated(self, backend):

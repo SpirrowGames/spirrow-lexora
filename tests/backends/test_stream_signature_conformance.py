@@ -39,15 +39,18 @@ import pytest
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import UsageSink
 from lexora.backends.claude_code import ClaudeCodeBackend
+from lexora.backends.codex import CodexBackend
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
 from lexora.backends.vllm import VLLMBackend
 
-# The five the factory can build (`backends/factory.py`), each paired with both
-# streaming methods `routes.py` hands a sink to.
+# Every backend the factory can build (`backends/factory.py`), each paired with
+# both streaming methods `routes.py` hands a sink to. `codex` added by
+# T-naysayer-codex-backend PR-1.
 BACKENDS = [
     ("anthropic", AnthropicBackend),
     ("claude_code", ClaudeCodeBackend),
+    ("codex", CodexBackend),
     ("gemini", GeminiBackend),
     ("openai_compatible", OpenAICompatibleBackend),
     ("vllm", VLLMBackend),
