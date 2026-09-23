@@ -29,7 +29,25 @@ logger = get_logger(__name__)
 #     cost is our own electricity, and the ledger treats "no vendor charge"
 #     as literally zero — distinguished from "we do not know" by the
 #     ``pricing_known`` column that ``record`` writes.
-DEFAULT_PRICING: dict[str, dict[str, float]] = {
+#
+# Shape of one entry (T-ledger-gemini-thinking-tokens D-2, 2026-09-23):
+#
+#     {"input": float, "output": float,
+#      "cached_input": float,                       # optional
+#      "tiers": [{"above_prompt_tokens": int,       # optional
+#                 "input": float, "output": float,
+#                 "cached_input": float}, ...]}
+#
+# A plain {input, output} pair -- every entry that existed before -- is still
+# a complete entry and prices exactly as it did. A tier applies when the
+# request's prompt tokens are strictly ABOVE its `above_prompt_tokens`. The
+# prompt count is the one the backend reported as `prompt_tokens`; for Gemini
+# (`promptTokenCount`) that already includes the cached part. When
+# `cached_input` is absent, cached tokens are charged at `input`, which is the
+# pre-D-2 arithmetic.
+ModelPricing = dict[str, Any]
+
+DEFAULT_PRICING: dict[str, ModelPricing] = {
     # Anthropic — Claude 4 series (Sonnet / Opus, per anthropic.com/pricing)
     "claude-sonnet-4-20250514": {"input": 3.0, "output": 15.0},
     "claude-opus-4-20250514": {"input": 15.0, "output": 75.0},
@@ -51,15 +69,24 @@ DEFAULT_PRICING: dict[str, dict[str, float]] = {
     # and the schema — not just the numbers — has to change.
     "claude-fable-5": {"input": 10.0, "output": 50.0},
     "claude-opus-5": {"input": 5.0, "output": 25.0},
-    # NOTE: `gemini-3.1-pro-preview` (the naysayer tier) is still absent, and
-    # not by oversight. Google prices it on a context-size step —
-    # $2.00/$12.00 per MTok for prompts <= 200k, $4.00/$18.00 above that
-    # (ai.google.dev/gemini-api/docs/pricing, read 2026-09-01). A flat pair
-    # cannot say that. Writing the <=200k rate here would set
-    # `pricing_known=1` and silently under-bill every prompt over 200k, which
-    # is worse than the honest `pricing_known=0` it lands in today. Pricing
-    # that tier correctly needs a schema that carries thresholds; that is a
-    # separate change.
+    # NOTE: `gemini-3.1-pro-preview` (the naysayer tier) is still absent.
+    # The reason changed on 2026-09-23 (T-ledger-gemini-thinking-tokens D-2).
+    # It used to be the schema: Google prices this model on a prompt-size
+    # step, and a flat {input, output} pair could not say that. The table now
+    # takes an optional `tiers` list and a `cached_input` rate (see
+    # `ModelPricing` above), so the schema no longer blocks it.
+    #
+    # What blocks it now is the numbers. The design (msg-307) requires the
+    # per-tier rates, the cached-input rates AND the tier boundary to be read
+    # from ai.google.dev/gemini-api/docs/pricing on the day the entry is
+    # written, with that date and the boundary quoted here. On 2026-09-23 the
+    # page was not reachable from the implementing host (the HTTPS proxy
+    # refused the CONNECT with 403). The earlier note here recorded
+    # $2.00/$12.00 up to 200k and $4.00/$18.00 above it, read 2026-09-01, but
+    # the boundary has since been disputed on the thread (128k vs 200k) and no
+    # cached-input rate was ever recorded, so copying it forward would be the
+    # invented price this table exists to avoid. Until the entry is added this
+    # model keeps landing on `pricing_known=0` -- "unpriced", not "free".
     #
     # NOTE: `claude-code-opus` / `claude-code-sonnet` are absent, and not by
     # oversight. They are not upstream model IDs: `config/lexora_config.yaml`
@@ -116,7 +143,7 @@ class CostTracker:
     def __init__(
         self,
         db_path: str | Path = "data/costs.db",
-        pricing: dict[str, dict[str, float]] | None = None,
+        pricing: dict[str, ModelPricing] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.pricing = {**DEFAULT_PRICING, **(pricing or {})}
@@ -142,6 +169,25 @@ class CostTracker:
         The DB migration is guarded by ``PRAGMA table_info`` so a DB opened
         twice does not fail; existing rows are preserved with NULL in the
         new columns, which is the honest value for "did not record this".
+
+        - ``tokens_thinking`` / ``tokens_cached_input`` (2026-09-23,
+          T-ledger-gemini-thinking-tokens D-1): Gemini's
+          ``thoughtsTokenCount`` and ``cachedContentTokenCount``. NULL means
+          "this backend does not measure this value": every non-Gemini
+          backend, and every row written before the migration. A Gemini row
+          always carries integers, 0 when the upstream omitted the key.
+          ``tokens_output`` keeps its meaning (``candidatesTokenCount``,
+          which EXCLUDES thinking) and ``tokens_input`` keeps its meaning
+          (``promptTokenCount``, which INCLUDES the cached part).
+
+        No exception is swallowed here: if an ``ALTER`` fails, construction
+        fails. That is safe because Lexora runs ONE worker process
+        (``main.py`` passes no ``workers`` to ``uvicorn.run``) and this runs
+        once, inside ``lifespan``, before the first request. Lifespan runs
+        per worker process, so if workers are ever raised above one this
+        migration must move to ``main()`` before ``uvicorn.run``: two workers
+        would both read "column missing" and the second ``ALTER`` would fail
+        on ``duplicate column name``.
         """
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
@@ -183,13 +229,26 @@ class CostTracker:
                 conn.execute(
                     "ALTER TABLE request_costs ADD COLUMN pricing_known INTEGER"
                 )
+            if "tokens_thinking" not in cols:
+                conn.execute(
+                    "ALTER TABLE request_costs ADD COLUMN tokens_thinking INTEGER"
+                )
+            if "tokens_cached_input" not in cols:
+                conn.execute(
+                    "ALTER TABLE request_costs ADD COLUMN tokens_cached_input INTEGER"
+                )
             conn.execute(
                 """CREATE INDEX IF NOT EXISTS idx_costs_tier
                    ON request_costs(tier)"""
             )
 
     def calculate_cost(
-        self, model: str, tokens_input: int, tokens_output: int
+        self,
+        model: str,
+        tokens_input: int,
+        tokens_output: int,
+        tokens_thinking: int | None = None,
+        tokens_cached_input: int | None = None,
     ) -> tuple[float, bool]:
         """Calculate cost for a request.
 
@@ -204,10 +263,28 @@ class CostTracker:
             the same commit; grep for ``calculate_cost`` before rebasing
             any external consumer.
 
+        The formula (T-ledger-gemini-thinking-tokens D-2)::
+
+            (input - cached) * in + cached * cache_in + (output + thinking) * out
+
+        ``tokens_input`` already includes the cached part (Gemini's
+        ``promptTokenCount``), so cached tokens are *moved* from the input
+        rate to the cache rate, never added on top. ``tokens_output``
+        excludes thinking (Gemini's ``candidatesTokenCount``), so thinking is
+        added at the output rate. The rate tier is chosen from
+        ``tokens_input``: the full prompt, cached part included.
+
+        With ``tokens_thinking`` and ``tokens_cached_input`` both None and an
+        entry without ``tiers``, the result is identical to the pre-D-2
+        ``input * in + output * out``.
+
         Args:
             model: Resolved (concrete) model name — never a tier alias.
-            tokens_input: Number of input tokens.
-            tokens_output: Number of output tokens.
+            tokens_input: Number of input tokens (cached part included).
+            tokens_output: Number of output tokens (thinking excluded).
+            tokens_thinking: Thinking tokens, or None if not measured.
+            tokens_cached_input: Cached input tokens (a subset of
+                ``tokens_input``), or None if not measured.
 
         Returns:
             Tuple of (cost in USD, ``pricing_known`` flag). ``pricing_known``
@@ -215,13 +292,38 @@ class CostTracker:
             caller records both, so a subsequent audit can tell a free local
             model from an unpriced one.
         """
-        prices = self.pricing.get(model)
-        pricing_known = prices is not None
-        if prices is None:
-            prices = {"input": 0.0, "output": 0.0}
-        input_cost = (tokens_input / 1_000_000) * prices["input"]
-        output_cost = (tokens_output / 1_000_000) * prices["output"]
-        return round(input_cost + output_cost, 8), pricing_known
+        entry = self.pricing.get(model)
+        if entry is None:
+            return 0.0, False
+        rates = self._rates_for(entry, tokens_input)
+        in_rate = rates["input"]
+        out_rate = rates["output"]
+        cache_rate = rates.get("cached_input", in_rate)
+
+        cached = tokens_cached_input or 0
+        thinking = tokens_thinking or 0
+        input_cost = ((tokens_input - cached) / 1_000_000) * in_rate
+        cached_cost = (cached / 1_000_000) * cache_rate
+        output_cost = ((tokens_output + thinking) / 1_000_000) * out_rate
+        return round(input_cost + cached_cost + output_cost, 8), True
+
+    @staticmethod
+    def _rates_for(entry: ModelPricing, prompt_tokens: int) -> ModelPricing:
+        """Pick the rate set that applies to a prompt of ``prompt_tokens``.
+
+        The base rates apply unless some tier's ``above_prompt_tokens`` is
+        strictly below ``prompt_tokens``; among those the highest threshold
+        wins, so list order in the table does not matter. Each tier is a
+        complete rate set: a tier without ``cached_input`` falls back to its
+        OWN ``input``, not to the base entry's cache rate.
+        """
+        chosen: ModelPricing = entry
+        best: int | None = None
+        for tier in entry.get("tiers") or []:
+            threshold = int(tier["above_prompt_tokens"])
+            if prompt_tokens > threshold and (best is None or threshold > best):
+                chosen, best = tier, threshold
+        return chosen
 
     def record(
         self,
@@ -234,6 +336,8 @@ class CostTracker:
         duration: float | None = None,
         success: bool = True,
         tier: str | None = None,
+        tokens_thinking: int | None = None,
+        tokens_cached_input: int | None = None,
     ) -> float:
         """Record a request's cost.
 
@@ -254,11 +358,22 @@ class CostTracker:
             tier: Tier alias the caller used, if any (``frontier``,
                 ``naysayer``, ...). None when the request specified a
                 concrete model directly.
+            tokens_thinking: Thinking tokens, NOT included in
+                ``tokens_output``. None when the backend does not measure
+                them; stored as NULL.
+            tokens_cached_input: Cached input tokens, a subset of
+                ``tokens_input``. None when not measured; stored as NULL.
 
         Returns:
             Calculated cost in USD.
         """
-        cost, pricing_known = self.calculate_cost(model, tokens_input, tokens_output)
+        cost, pricing_known = self.calculate_cost(
+            model,
+            tokens_input,
+            tokens_output,
+            tokens_thinking=tokens_thinking,
+            tokens_cached_input=tokens_cached_input,
+        )
         if not pricing_known:
             # Best-effort warn. The `record` path is deliberately
             # exception-swallowing (see the except below) so accounting
@@ -279,8 +394,9 @@ class CostTracker:
                     """INSERT INTO request_costs
                        (timestamp, model, backend, endpoint, user_id,
                         tokens_input, tokens_output, cost_usd,
-                        duration_seconds, success, tier, pricing_known)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        duration_seconds, success, tier, pricing_known,
+                        tokens_thinking, tokens_cached_input)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         timestamp,
                         model,
@@ -294,6 +410,8 @@ class CostTracker:
                         1 if success else 0,
                         tier,
                         1 if pricing_known else 0,
+                        tokens_thinking,
+                        tokens_cached_input,
                     ),
                 )
         except Exception:
@@ -364,6 +482,8 @@ class CostTracker:
                     COUNT(*) as total_requests,
                     COALESCE(SUM(tokens_input), 0) as total_tokens_input,
                     COALESCE(SUM(tokens_output), 0) as total_tokens_output,
+                    COALESCE(SUM(tokens_thinking), 0) as total_tokens_thinking,
+                    COALESCE(SUM(tokens_cached_input), 0) as total_tokens_cached_input,
                     COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
                     COALESCE(SUM(CASE WHEN success=1 THEN 1 ELSE 0 END), 0) as successful_requests,
                     COALESCE(SUM(CASE WHEN pricing_known=0 THEN 1 ELSE 0 END), 0) as unpriced_requests

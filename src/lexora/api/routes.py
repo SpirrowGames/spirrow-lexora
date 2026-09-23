@@ -71,6 +71,40 @@ def _passthrough_headers(e: BackendUpstreamError) -> dict[str, str] | None:
     return {"Retry-After": str(max(0, math.ceil(e.retry_after)))}
 
 
+def _ledger_token_extras(source: UsageSink | Any) -> dict[str, int | None]:
+    """The two optional ledger columns, read in one place for every site.
+
+    T-ledger-gemini-thinking-tokens D-4: every ``cost_tracker.record`` call
+    (three streaming, six non-streaming, the ``/v1/messages`` translation
+    path included) spreads this into its kwargs, so no site writes its own
+    read.
+
+    ``source`` is either the per-request ``UsageSink`` (streaming) or the
+    OpenAI-shaped ``usage`` dict of a non-streaming response.
+
+    From a dict, both values are taken only when the response carries
+    ``lexora_thinking_tokens``, a key only Lexora's ``gemini`` backend
+    writes. That key is the marker for "this backend measured these". Without
+    it both are None (NULL in the ledger) even if an upstream relayed its own
+    ``prompt_tokens_details.cached_tokens``: D-1 fixes NULL to mean "this
+    backend is not measured here", and pricing the cache of other vendors is
+    outside the design that added these columns.
+    """
+    if isinstance(source, UsageSink):
+        return {
+            "tokens_thinking": source.thinking_tokens,
+            "tokens_cached_input": source.cached_input_tokens,
+        }
+    if not isinstance(source, dict) or "lexora_thinking_tokens" not in source:
+        return {"tokens_thinking": None, "tokens_cached_input": None}
+    details = source.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    return {
+        "tokens_thinking": int(source.get("lexora_thinking_tokens") or 0),
+        "tokens_cached_input": int(cached or 0),
+    }
+
+
 def _record_missing_stream_usage(
     *,
     backend: Any,
@@ -747,6 +781,7 @@ async def chat_completions(
                             if backend_router.is_tier(request.model)
                             else None
                         ),
+                        **_ledger_token_extras(usage_sink),
                     )
                 # ★ The other half of the same `finally`, and mutually
                 # exclusive with the block above by construction: this can
@@ -857,6 +892,7 @@ async def chat_completions(
                 user_id=request.user,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                **_ledger_token_extras(usage),
             )
 
         logger.info(
@@ -1196,6 +1232,7 @@ async def completions(
                             if backend_router.is_tier(request.model)
                             else None
                         ),
+                        **_ledger_token_extras(usage_sink),
                     )
                 # ★ The observable half of the same `finally`. See the
                 # identical call in `chat_completions` above, and
@@ -1290,6 +1327,7 @@ async def completions(
                 user_id=request.user,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                **_ledger_token_extras(usage),
             )
 
         logger.info(
@@ -1446,6 +1484,7 @@ async def embeddings(
                 user_id=request.user,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                **_ledger_token_extras(usage),
             )
 
         logger.info(
@@ -1865,6 +1904,7 @@ async def generate(
                 user_id=request.user,
                 duration=duration,
                 tier=model if backend_router.is_tier(model) else None,
+                **_ledger_token_extras(usage),
             )
 
         logger.info(
@@ -2049,6 +2089,7 @@ async def chat(
                 user_id=request.user,
                 duration=duration,
                 tier=model if backend_router.is_tier(model) else None,
+                **_ledger_token_extras(usage),
             )
 
         logger.info(
@@ -2370,6 +2411,7 @@ async def messages(
                             if backend_router.is_tier(request.model)
                             else None
                         ),
+                        **_ledger_token_extras(usage_sink),
                     )
                 # ★ The observable half of the same `finally`. See the
                 # identical call in `chat_completions` above, and
@@ -2451,6 +2493,7 @@ async def messages(
                 user_id=user_id,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                **_ledger_token_extras(usage),
             )
 
         logger.info(
