@@ -155,7 +155,12 @@ async def decide(
         provider_input_tokens=upstream.input_tokens if upstream else None,
         provider_output_tokens=upstream.output_tokens if upstream else None,
     )
-    decision_log.write(row)
+    # Off the event loop, on DecisionLog's dedicated single-thread
+    # executor (msg-464 v3): a slow or lock-contended commit must not
+    # freeze the other endpoints, nor occupy the default executor that
+    # serves DNS for upstream connections. A write failure still raises
+    # here and fails the request.
+    await decision_log.awrite(row)
 
     # Provider names are constrained to the Literal in DecideResponse,
     # so we assert the type on the way out. Any provider whose name
