@@ -14,7 +14,15 @@ Scenarios for the backend:
                        (D-1c must treat it as an execution, msg-315 #4).
 * ``quota``         -- ASSUMED usage-limit wording on stderr, exit 1.
 * ``auth``          -- ASSUMED not-logged-in wording on stderr, exit 1.
-* ``sleep``         -- never finishes (timeout path).
+* ``sleep``         -- never finishes (timeout / cancellation path); appends a
+                       byte to ``$CODEX_HOME/ticks`` every 50 ms, so a test can
+                       tell whether the process is still alive.
+* ``exit0_no_terminal`` -- answers, exit 0, but never emits a terminal event.
+* ``quota_with_tool``   -- a ``command_execution`` item, then usage-limit
+                           wording, exit 1, no terminal event.
+* ``launch_no_events``  -- ``bwrap:`` on stderr, exit 1, no event at all.
+* ``launch_with_events``-- ``bwrap:`` on stderr, exit 1, after one event.
+* ``signal``            -- kills itself with SIGKILL (POSIX only).
 
 Scenarios for V-2'-control and V-2' (talk to the mock model named by the
 provider override). The CLI declares ``shell`` and ``read_file`` in its first
@@ -30,12 +38,24 @@ real (unmeasured) tool-disabling setting; the control run drops it.
 * ``wrong_names`` -- declares no tools and knows only a tool the mock cannot
                      guess, so every call is "unknown tool" -> control fails
                      (fixture 5, msg-315).
+* ``stderr_leak``  -- like ``contained``, but copies a tool's stderr onto its
+                      own stderr -> ``V-2'/tool_stderr_isolated`` fails.
+* ``no_item_started`` -- like ``contained``, but reports tool runs only as
+                      ``item.completed`` -> ``V-2'/tool_stderr_isolated`` fails.
+
+A tool run emits ``item.started`` then ``item.completed`` (ASSUMED order).
+The stderr probe (``sh -c <script> lexora-probe OUT NONCE ERR NONCE``) is
+simulated, not run: its stdout is OUT+NONCE and its stderr ERR+NONCE; both go
+into the tool result and ``aggregated_output``, never onto this process's
+stderr (except under ``stderr_leak``).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
+import signal
 import sys
 import time
 import urllib.request
@@ -99,18 +119,21 @@ def tool_calls_from(events: list[dict], chat: bool) -> list[dict]:
     return calls
 
 
-def really_run(call: dict) -> str:
+def really_run(call: dict) -> tuple[str, str]:
+    """(stdout, stderr) of the tool."""
     args = call["args"]
     command = args.get("command") or args.get("cmd")
     if call["name"] == "read_file":
-        return Path(args["path"]).read_text()
+        return Path(args["path"]).read_text(), ""
     if isinstance(command, str):
-        command = command.split()
+        command = shlex.split(command)
     if command and command[0] == "cat":
-        return Path(command[1]).read_text()
+        return Path(command[1]).read_text(), ""
     if command and command[0] == "env":
-        return "\n".join(f"{k}={v}" for k, v in os.environ.items())
-    return ""
+        return "\n".join(f"{k}={v}" for k, v in os.environ.items()), ""
+    if command and command[0] == "sh" and len(command) == 8:
+        return command[4] + command[5] + "\n", command[6] + command[7] + "\n"
+    return "", ""
 
 
 def v2(scenario: str, overrides: dict[str, str], prompt: str, last_message: str | None) -> int:
@@ -135,14 +158,22 @@ def v2(scenario: str, overrides: dict[str, str], prompt: str, last_message: str 
         sys.stderr.write("thread 'main' panicked at codex-rs/core/src/tool.rs:1:1\n")
         sys.stderr.flush()
         os._exit(101)
-    run_tools = scenario in ("executes", "crash") or (scenario == "contained" and not disabled)
+    contained_like = scenario in ("contained", "stderr_leak", "no_item_started")
+    run_tools = scenario in ("executes", "crash") or (contained_like and not disabled)
     results = []
     for call in calls:
         if call["name"] not in known:
             output = f"unknown tool: {call['name']}"
         elif run_tools:
-            output = really_run(call)
-            emit({"type": "item.completed", "item": {"id": call["call_id"], "type": "command_execution", "command": call["name"], "aggregated_output": "", "exit_code": 0, "status": "completed"}})
+            item = {"id": call["call_id"], "type": "command_execution", "command": call["name"]}
+            if scenario != "no_item_started":
+                emit({"type": "item.started", "item": {**item, "status": "in_progress"}})
+            out, err = really_run(call)
+            if scenario == "stderr_leak" and err:
+                sys.stderr.write(err)
+                sys.stderr.flush()
+            output = out + err
+            emit({"type": "item.completed", "item": {**item, "aggregated_output": output, "exit_code": 0, "status": "completed"}})
         else:
             output = "tool call rejected: tools are disabled for this session"
         results.append((call["call_id"], output))
@@ -162,11 +193,22 @@ def main() -> int:
     scenario = sys.argv[1]
     overrides, last_message = parse_args(sys.argv[2:])
     prompt = sys.stdin.read()
-    if scenario in ("contained", "executes", "no_connect", "crash", "wrong_names"):
+    if scenario in ("contained", "executes", "no_connect", "crash", "wrong_names", "stderr_leak", "no_item_started"):
         return v2(scenario, overrides, prompt, last_message)
     if scenario == "sleep":
-        time.sleep(60)
+        ticks = Path(os.environ["CODEX_HOME"]) / "ticks"
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            with ticks.open("a") as fh:
+                fh.write(".")
+            time.sleep(0.05)
         return 0
+    if scenario == "signal":
+        os.kill(os.getpid(), signal.SIGKILL)
+        return 0
+    if scenario == "launch_no_events":
+        sys.stderr.write("bwrap: Can't find source path /nope: No such file or directory\n")
+        return 1
     emit({"type": "thread.started", "thread_id": "t1"})
     emit({"type": "turn.started"})
     if scenario == "ok":
@@ -190,6 +232,19 @@ def main() -> int:
         if last_message:
             Path(last_message).write_text("fine")
         return 0
+    if scenario == "exit0_no_terminal":
+        text = "REVIEW: truncated"
+        emit({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": text}})
+        if last_message:
+            Path(last_message).write_text(text)
+        return 0
+    if scenario == "quota_with_tool":
+        emit({"type": "item.started", "item": {"id": "i1", "type": "command_execution", "command": "sleep 1", "status": "in_progress"}})
+        sys.stderr.write("ERROR: You've hit your usage limit. Try again in 2 hours.\n")
+        return 1
+    if scenario == "launch_with_events":
+        sys.stderr.write("bwrap: Can't find source path /nope: No such file or directory\n")
+        return 1
     if scenario == "quota":
         sys.stderr.write("ERROR: You've hit your usage limit. Try again in 2 hours 5 minutes.\n")
         return 1

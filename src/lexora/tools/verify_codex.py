@@ -48,11 +48,27 @@ Nothing here writes a runtime violation (msg-319): the control executes tools
 on purpose, and a tool executed under the production config is recorded as a
 ``fail`` verification (``tool_executed_under_prod_config``).
 
-``--clear-violation ID --reason TEXT`` clears one runtime violation (a human
-act, non-empty reason required). It never opens the gate on its own: a
-``pass`` recorded afterwards is still required (msg-317).
+``--clear-violation ID --reason TEXT`` clears one runtime violation -- or,
+when ID is not a violation, one unfinished run (a ``run_started`` with no
+``run_finished``, msg-403 D-1e'-6) -- a human act, non-empty reason
+required. It never opens the gate on its own: a ``pass`` recorded afterwards
+is still required (msg-317).
 
-``pass`` iff V-1 passes, the control executed, and 条件 0, 1, 2 all hold. No model output and no
+**V-2'/tool_stderr_isolated (msg-396, measured on the control run).** The
+D-1d-3' exemption (a no-terminal run that the classifier reads as quota is
+not latched) is safe only if (a) a tool's stderr never reaches the text the
+classifier reads -- codex's own stderr and its ``error`` / ``turn.failed``
+events -- and (b) a tool run is announced by ``item.started`` before it
+runs. For every shell tool the control additionally calls a ``sh -c`` probe
+that prints ``OUT+nonce`` on stdout and ``ERR+nonce`` on stderr (each marker
+is assembled by the shell, so the command line itself never contains it).
+Pass requires positive evidence the probe ran (``OUT+nonce`` came back to the
+mock), ``ERR+nonce`` absent from the classifier's text, and an
+``item.started`` of a tool type in the stream. Either assumption failing
+keeps the gate closed.
+
+``pass`` iff V-1 passes, the control executed, 条件 0, 1, 2 all hold and
+``V-2'/tool_stderr_isolated`` holds. No model output and no
 tool output is stored; ``checks_json`` holds check names, verdicts and short
 machine details only.
 
@@ -69,6 +85,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import sys
 import tempfile
@@ -80,13 +97,21 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from lexora.backends.codex import (
+    _TOOL_ITEM_TYPES,
+    _TOOL_MSG_PREFIXES,
     CodexBackend,
     CodexError,
     CodexRun,
     EventFindings,
+    _error_text,
     is_terminal_event,
 )
-from lexora.backends.codex_verification import ClearViolationError, CodexStateStore, ViolationRecord
+from lexora.backends.codex_verification import (
+    ClearViolationError,
+    CodexStateStore,
+    RunRecord,
+    ViolationRecord,
+)
 
 #: Timeout for the V-2' ``codex exec`` run (the mock answers instantly).
 V2_TIMEOUT_S = 120.0
@@ -320,8 +345,23 @@ def _shell_arguments(tool: ToolSpec, argv: list[str]) -> dict[str, Any]:
     for key in ("command", "cmd", "commands", "argv", "args"):
         if key in props:
             typ = props[key].get("type") if isinstance(props[key], dict) else None
-            return {key: argv if typ == "array" else " ".join(argv)}
+            return {key: argv if typ == "array" else shlex.join(argv)}
     return {"command": argv}
+
+
+#: Marker prefixes of the stderr-isolation probe (msg-396).
+STDERR_PROBE_OUT = "LEXORA-PROBE-OUT-"
+STDERR_PROBE_ERR = "LEXORA-PROBE-ERR-"
+_STDERR_PROBE_SCRIPT = "printf '%s%s\\n' \"$1\" \"$2\"; printf '%s%s\\n' \"$3\" \"$4\" 1>&2"
+
+
+def stderr_probe_argv(nonce: str) -> list[str]:
+    """``sh -c`` printing OUT+nonce to stdout and ERR+nonce to stderr.
+
+    The markers are only ever joined by the shell, so a CLI that echoes the
+    command line (to its stderr or anywhere) does not produce them.
+    """
+    return ["sh", "-c", _STDERR_PROBE_SCRIPT, "lexora-probe", STDERR_PROBE_OUT, nonce, STDERR_PROBE_ERR, nonce]
 
 
 def _read_arguments(tool: ToolSpec, path: str) -> dict[str, Any]:
@@ -332,20 +372,26 @@ def _read_arguments(tool: ToolSpec, path: str) -> dict[str, Any]:
     return {"path": path}
 
 
-def calls_for(tools: Sequence[ToolSpec], canary_path: str) -> list[ScriptedCall]:
-    """Scripted calls: for every shell tool ``cat <canary>`` and ``env``; for
-    every read tool, a read of the canary file."""
+def calls_for(
+    tools: Sequence[ToolSpec], canary_path: str, stderr_probe_nonce: str | None = None
+) -> list[ScriptedCall]:
+    """Scripted calls: for every shell tool ``cat <canary>`` and ``env`` (plus
+    the stderr probe when ``stderr_probe_nonce`` is given -- control run
+    only); for every read tool, a read of the canary file."""
 
     def cid() -> str:
         return f"call_{secrets.token_hex(6)}"
 
+    shell_argvs: list[list[str]] = [["cat", canary_path], ["env"]]
+    if stderr_probe_nonce is not None:
+        shell_argvs.append(stderr_probe_argv(stderr_probe_nonce))
     calls: list[ScriptedCall] = []
     for tool in tools:
         if tool.kind == "local_shell":
-            for argv in (["cat", canary_path], ["env"]):
+            for argv in shell_argvs:
                 calls.append(ScriptedCall(cid(), "local_shell_call", tool.name, {"command": argv}))
         elif tool.role == "shell":
-            for argv in (["cat", canary_path], ["env"]):
+            for argv in shell_argvs:
                 calls.append(ScriptedCall(cid(), "function_call", tool.name, _shell_arguments(tool, argv)))
         else:
             calls.append(ScriptedCall(cid(), "function_call", tool.name, _read_arguments(tool, canary_path)))
@@ -586,6 +632,34 @@ def evaluate_control(state: MockState, findings: EventFindings, canary_value: st
     ]
 
 
+def _is_tool_started(event: dict[str, Any]) -> bool:
+    item = event.get("item")
+    if event.get("type") == "item.started" and isinstance(item, dict):
+        return item.get("type") in _TOOL_ITEM_TYPES
+    msg = event.get("msg")
+    mtype = str(msg.get("type", "")) if isinstance(msg, dict) else ""
+    return not event.get("type") and mtype.startswith(_TOOL_MSG_PREFIXES) and mtype.endswith("_begin")
+
+
+def evaluate_stderr_isolation(state: MockState, run: CodexRun | None, nonce: str) -> Check:
+    """``V-2'/tool_stderr_isolated`` from the control run (msg-396 (a)+(b)).
+
+    Pure. Fails unless the probe demonstrably ran, its stderr marker is
+    absent from the text ``classify_failure`` reads, and a tool run was
+    announced by ``item.started``.
+    """
+    name = "V-2'/tool_stderr_isolated"
+    if run is None:
+        return Check(name, False, "control run produced no output")
+    out_marker, err_marker = STDERR_PROBE_OUT + nonce, STDERR_PROBE_ERR + nonce
+    ran = any(out_marker in raw for raw in state.requests[1:])
+    leaked = err_marker in _error_text(run.stderr, run.events)
+    started = any(_is_tool_started(e) for e in run.events)
+    ok = ran and not leaked and started
+    detail = f"probe_ran={ran} stderr_in_classifier_text={leaked} item_started={started}"
+    return Check(name, ok, detail)
+
+
 def evaluate_v2(
     state: MockState,
     findings: EventFindings,
@@ -664,11 +738,16 @@ async def _drive(
     return run, findings, None
 
 
-async def run_v2_control(backend: CodexBackend, wire_api: str = "responses") -> tuple[list[Check], list[ToolSpec]]:
+async def run_v2_control(
+    backend: CodexBackend, wire_api: str = "responses"
+) -> tuple[list[Check], list[ToolSpec], Check]:
     """V-2'-control: dummy CODEX_HOME, tool-disabling overrides removed.
 
     Touches neither the production CODEX_HOME nor the state store (the
-    tools DO run here, which is the point -- msg-318/319).
+    tools DO run here, which is the point -- msg-318/319). Also returns
+    ``V-2'/tool_stderr_isolated``, measured on this same run (msg-396); it is
+    kept out of the control checks so that its failure does not read as
+    "the control did not execute".
     """
     dummy_home = tempfile.mkdtemp(prefix="lexora-codex-control-home-")
     try:
@@ -677,14 +756,14 @@ async def run_v2_control(backend: CodexBackend, wire_api: str = "responses") -> 
 
         def plan(raw: str) -> tuple[list[ToolSpec], list[ScriptedCall]]:
             tools = discover_tools(raw) or list(FALLBACK_TOOLS)
-            return tools, calls_for(tools, canary_posix)
+            return tools, calls_for(tools, canary_posix, stderr_probe_nonce=nonce)
 
         state = MockState(nonce=nonce, planner=plan)
-        _, findings, error = await _drive(backend.control_clone(dummy_home), state, wire_api)
+        run, findings, error = await _drive(backend.control_clone(dummy_home), state, wire_api)
         checks = evaluate_control(state, findings, canary_value)
         if error:
             checks.append(Check("V-2c/cli_run", False, error))
-        return checks, list(state.tools)
+        return checks, list(state.tools), evaluate_stderr_isolation(state, run, nonce)
     finally:
         shutil.rmtree(dummy_home, ignore_errors=True)
 
@@ -730,8 +809,9 @@ async def verify(
         )
         return "fail", checks
     checks.extend(await run_v1(backend, extra_hidden))
-    control_checks, tools = await run_v2_control(backend, wire_api)
+    control_checks, tools, isolation = await run_v2_control(backend, wire_api)
     checks.extend(control_checks)
+    checks.append(isolation)
     if all(c.ok for c in control_checks):
         checks.extend(await run_v2(backend, tools, wire_api))
     else:
@@ -750,6 +830,8 @@ async def verify(
         reasons.append("tool_executed_under_prod_config")
     if "V-2c/tool_executed_under_control" in failed:
         reasons.append("control_tool_not_executed")
+    if "V-2'/tool_stderr_isolated" in failed:
+        reasons.append("tool_stderr_not_isolated")
     backend.state_store.record_verification(
         backend.name,
         result,
@@ -780,10 +862,14 @@ def _load_backend(config: str | None, backend_name: str | None) -> CodexBackend:
     return backend
 
 
-def clear_violation(store: CodexStateStore, violation_id: int, reason: str) -> ViolationRecord:
-    """Human release of one runtime violation (msg-317). Does not open the
-    gate by itself: a ``pass`` recorded after this is still required."""
-    return store.clear_violation(violation_id, reason)
+def clear_violation(store: CodexStateStore, violation_id: int, reason: str) -> ViolationRecord | RunRecord:
+    """Human release of one runtime violation (msg-317) or of one unfinished
+    run (``run_started`` with no ``run_finished``, msg-403 D-1e'-6). The id
+    is looked up as a violation first, then as a run. Does not open the gate
+    by itself: a ``pass`` recorded after this is still required."""
+    if any(v.seq == violation_id for v in store.violations()):
+        return store.clear_violation(violation_id, reason)
+    return store.clear_unfinished_run(violation_id, reason)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -792,7 +878,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--backend", help="name of the codex backend (required if several)")
     parser.add_argument("--wire-api", choices=("responses", "chat"), default="responses")
     parser.add_argument("--hidden", action="append", default=[], help="extra path that must be invisible (repeatable)")
-    parser.add_argument("--clear-violation", type=int, metavar="ID", help="clear one runtime violation, then exit")
+    parser.add_argument("--clear-violation", type=int, metavar="ID", help="clear one runtime violation or unfinished run, then exit")
     parser.add_argument("--reason", help="required with --clear-violation: why V-2' missed it")
     args = parser.parse_args(argv)
     backend = _load_backend(args.config, args.backend)
@@ -802,7 +888,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ClearViolationError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return 2
-        print(f"cleared violation {cleared.id} at {cleared.cleared_at}; run verify_codex again to reopen the gate")
+        kind = "run" if isinstance(cleared, RunRecord) else "violation"
+        print(f"cleared {kind} {cleared.id} at {cleared.cleared_at}; run verify_codex again to reopen the gate")
         return 0
     result, checks = asyncio.run(verify(backend, args.wire_api, args.hidden))
     for check in checks:

@@ -21,6 +21,14 @@ the SAME transaction (``_append``). Forbidden: an in-memory counter, any
   (msg-317): any uncleared row closes the gate, whatever version or hash.
 * ``codex_clearance`` -- a human clearing one violation with a non-empty
   reason (``verify_codex --clear-violation <seq> --reason ...``).
+* ``codex_run`` / ``codex_run_finished`` -- the write-ahead pair of D-1e'
+  (msg-403/405). ``run_started`` is written BEFORE ``codex exec`` is spawned
+  (a failed write means codex is not started); ``run_finished`` only after
+  a non-latching verdict. A ``run_started`` without its ``run_finished``
+  and newer than the latest clearance closes the gate (condition 0), across
+  restarts, whatever else could or could not be written.
+* ``codex_run_clearance`` -- a human clearing one unfinished run (same
+  ``--clear-violation <seq>`` command; the seq is the ``run_started`` one).
 
 Gate predicates read from here (msg-326): the clearance threshold is
 ``COALESCE(MAX(seq) WHERE kind='clearance', 0)`` -- a read-only comparison
@@ -42,7 +50,9 @@ from typing import Any
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS codex_gate_log (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL CHECK (kind IN ('verification', 'violation', 'clearance')),
+    kind TEXT NOT NULL CHECK (
+        kind IN ('verification', 'violation', 'clearance', 'run_started', 'run_finished')
+    ),
     backend TEXT NOT NULL,
     at TEXT NOT NULL
 );
@@ -65,7 +75,28 @@ CREATE TABLE IF NOT EXISTS codex_clearance (
     violation_seq INTEGER NOT NULL UNIQUE REFERENCES codex_runtime_violation(seq),
     reason TEXT NOT NULL CHECK (length(trim(reason)) > 0)
 );
+CREATE TABLE IF NOT EXISTS codex_run (
+    seq INTEGER PRIMARY KEY REFERENCES codex_gate_log(seq),
+    instance_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS codex_run_finished (
+    seq INTEGER PRIMARY KEY REFERENCES codex_gate_log(seq),
+    run_seq INTEGER NOT NULL UNIQUE REFERENCES codex_run(seq)
+);
+CREATE TABLE IF NOT EXISTS codex_run_clearance (
+    seq INTEGER PRIMARY KEY REFERENCES codex_gate_log(seq),
+    run_seq INTEGER NOT NULL UNIQUE REFERENCES codex_run(seq),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0)
+);
 """
+
+
+#: gate_log kinds the D-1e' run log needs; an older table lacks them.
+_RUN_LOG_KINDS = ("'run_started'", "'run_finished'")
+
+#: SQLite busy timeout for every connection (msg-405 D-1e'-2'.1): lock
+#: contention shorter than this is absorbed by SQLite itself.
+BUSY_TIMEOUT_S = 5.0
 
 
 def _now() -> str:
@@ -111,6 +142,25 @@ class ViolationRecord:
         return self.seq
 
 
+@dataclass(frozen=True)
+class RunRecord:
+    """A ``run_started`` row (D-1e'). ``cleared_*`` is set once a human
+    cleared it as an unfinished run."""
+
+    seq: int
+    backend: str
+    at: str
+    instance_id: str
+    finished_seq: int | None = None
+    cleared_seq: int | None = None
+    cleared_at: str | None = None
+    cleared_reason: str | None = None
+
+    @property
+    def id(self) -> int:
+        return self.seq
+
+
 class CodexStateStore:
     """Tiny synchronous SQLite store (the calls are rare and small)."""
 
@@ -119,12 +169,19 @@ class CodexStateStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'codex_gate_log'"
+            ).fetchone()
+        #: False when ``codex_gate_log`` was created by an older schema whose
+        #: ``kind`` CHECK does not admit the D-1e' run log (msg-408 #5). No
+        #: migration: the gate closes as ``schema_outdated`` instead.
+        self.schema_current = bool(row) and all(k in row[0] for k in _RUN_LOG_KINDS)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """One transaction per block: commit on success, roll back on error,
         always close (Windows keeps open files locked)."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_S)
         try:
             with conn:
                 yield conn
@@ -222,6 +279,85 @@ class CodexStateStore:
         if row is None or not isinstance(row[0], int):
             raise sqlite3.DatabaseError("clearance threshold query returned no integer")
         return row[0]
+
+    # ---- write-ahead run log (D-1e', msg-403/405) ----------------------
+
+    def record_run_started(self, backend: str, instance_id: str) -> int:
+        """Write ``run_started`` and return its seq. Called BEFORE the spawn;
+        a raise here means codex must not be started."""
+        at = _now()
+        with self._connect() as conn:
+            seq = self._append(conn, "run_started", backend, at)
+            conn.execute("INSERT INTO codex_run (seq, instance_id) VALUES (?, ?)", (seq, instance_id))
+        return seq
+
+    def record_run_finished(self, backend: str, run_seq: int) -> None:
+        """Pair ``run_seq`` with a ``run_finished``. Idempotent: if the pair
+        already exists (an earlier attempt committed but reported an error),
+        nothing is written."""
+        at = _now()
+        with self._connect() as conn:
+            done = conn.execute("SELECT 1 FROM codex_run_finished WHERE run_seq = ?", (run_seq,)).fetchone()
+            if done is not None:
+                return
+            seq = self._append(conn, "run_finished", backend, at)
+            conn.execute("INSERT INTO codex_run_finished (seq, run_seq) VALUES (?, ?)", (seq, run_seq))
+
+    def runs(self) -> list[RunRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT g.seq, g.backend, g.at, r.instance_id, f.seq, c.seq, cg.at, c.reason "
+                "FROM codex_gate_log g JOIN codex_run r ON r.seq = g.seq "
+                "LEFT JOIN codex_run_finished f ON f.run_seq = g.seq "
+                "LEFT JOIN codex_run_clearance c ON c.run_seq = g.seq "
+                "LEFT JOIN codex_gate_log cg ON cg.seq = c.seq "
+                "WHERE g.kind = 'run_started' ORDER BY g.seq"
+            ).fetchall()
+        return [RunRecord(*row) for row in rows]
+
+    def unfinished_runs(self) -> list[RunRecord]:
+        """``run_started`` rows with no ``run_finished`` and a seq greater
+        than the clearance threshold, across every backend (condition 0,
+        msg-403). A failing query raises; it never reads as "none"."""
+        threshold = self.clearance_threshold()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT g.seq, g.backend, g.at, r.instance_id "
+                "FROM codex_gate_log g JOIN codex_run r ON r.seq = g.seq "
+                "WHERE g.kind = 'run_started' AND g.seq > ? "
+                "AND NOT EXISTS (SELECT 1 FROM codex_run_finished f WHERE f.run_seq = g.seq) "
+                "ORDER BY g.seq",
+                (threshold,),
+            ).fetchall()
+        return [RunRecord(*row) for row in rows]
+
+    def clear_unfinished_run(self, run_seq: int, reason: str) -> RunRecord:
+        """Human release of one unfinished run (msg-403 D-1e'-6). Writes a
+        ``clearance``; like ``clear_violation`` it makes every older pass stop
+        counting, so a new ``pass`` is required."""
+        if not reason or not reason.strip():
+            raise ClearViolationError("a non-empty --reason is required to clear a run")
+        target = next((r for r in self.runs() if r.seq == run_seq), None)
+        if target is None:
+            raise ClearViolationError(f"no violation or run with id {run_seq}")
+        if target.finished_seq is not None:
+            raise ClearViolationError(f"run {run_seq} finished normally; nothing to clear")
+        if target.cleared_seq is not None:
+            raise ClearViolationError(f"run {run_seq} was already cleared at {target.cleared_at}")
+        at = _now()
+        try:
+            with self._connect() as conn:
+                seq = self._append(conn, "clearance", target.backend, at)
+                conn.execute(
+                    "INSERT INTO codex_run_clearance (seq, run_seq, reason) VALUES (?, ?, ?)",
+                    (seq, run_seq, reason.strip()),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ClearViolationError(f"run {run_seq} could not be cleared: {exc}") from exc
+        return RunRecord(
+            target.seq, target.backend, target.at, target.instance_id,
+            cleared_seq=seq, cleared_at=at, cleared_reason=reason.strip(),
+        )
 
     def clear_violation(self, violation_seq: int, reason: str) -> ViolationRecord:
         """Human release of one violation. Refuses an empty reason (msg-317).
