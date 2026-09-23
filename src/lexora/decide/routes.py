@@ -5,7 +5,9 @@ write one decision-log row, return. It exists so the utilisation-side
 threads (mindwire / prismind / verimend) have a stable URL to point at;
 the interesting behaviour is in the provider layer.
 
-PR 1 scope (msg-246): only ``NullProvider`` is wired. The ``mode`` /
+PR 1 scope (msg-246): only ``NullProvider`` was wired. T-decide-jev-provider
+adds ``JevProvider``, the NullProvider fallback on ``ProviderError``, and
+logs the upstream ``model`` / usage (Bohr msg-342 #2). The ``mode`` /
 ``primary`` / ``fallback`` settings *are* honoured — a config that
 selects Jev on PR 1 is refused at startup by
 :func:`lexora.decide.config.check_typesafe_api_key`, so the route never
@@ -25,13 +27,28 @@ from fastapi import APIRouter, Depends, Request
 
 from lexora.decide.config import DecisionSettings
 from lexora.decide.contract import DecideRequest, DecideResponse
+from lexora.decide.jev_client import DEFAULT_MODEL
 from lexora.decide.log import DecisionLog, build_decision_row
-from lexora.decide.providers import DecisionProvider, NullProvider
+from lexora.decide.providers import (
+    DecisionProvider,
+    JevProvider,
+    NullProvider,
+    ProviderError,
+    UpstreamMeta,
+)
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 router = APIRouter()
+
+#: Fallback codes logged at ``error`` rather than ``warning`` (Bohr msg-339
+#: #4 / msg-342 #1). Each one points at something a human has to fix: a
+#: bad key, a malformed request from Lexora or the caller, a changed
+#: response shape, or a Lexora bug.
+_ERROR_LEVEL_CODES = frozenset(
+    {"auth", "invalid_request", "invalid_response", "internal_error"}
+)
 
 
 def _get_decision_settings(request: Request) -> DecisionSettings:
@@ -98,7 +115,47 @@ async def decide(
 
     decision_id = uuid.uuid4().hex
     start = time.monotonic()
-    answers = await provider.evaluate(state=body.state, questions=body.questions)
+    provider_error: str | None = None
+    upstream: UpstreamMeta | None = None
+    failure: dict[str, Any] | None = None
+    try:
+        result = await provider.evaluate(state=body.state, questions=body.questions)
+    except ProviderError as err:
+        # Copy out the five plain values and drop ``err`` right away
+        # (Bohr msg-344 v7 #2). The fallback and the log write happen
+        # below, outside this block.
+        failure = {
+            "code": err.code,
+            "exc_type": err.exc_type,
+            "where": err.where,
+            "loc": err.loc,
+        }
+        upstream = err.upstream
+        provider_error = f"{provider.name}:{err.code}"
+    else:
+        upstream = result.upstream
+    if failure is not None:
+        # Safe default instead of failing loud (Fermi msg-257 §3). The
+        # caller, e.g. mindwire's Tier-C gate (D20 fail-open), gets a
+        # well-formed NullProvider answer. The row records who answered
+        # (``null``) and why the primary did not (Bohr msg-258 §4).
+        #
+        # Do NOT add ``exc_info=True`` here or anywhere else a
+        # ProviderError is logged. The exception chain is cut
+        # (msg-344), but ``ProviderError.__traceback__`` still reaches
+        # the provider's frame, whose locals hold ``state``.
+        log = (
+            logger.error if failure["code"] in _ERROR_LEVEL_CODES else logger.warning
+        )
+        log(
+            "decide_provider_fallback",
+            primary=provider.name,
+            decision_id=decision_id,
+            **failure,
+        )
+        provider = providers["null"]
+        result = await provider.evaluate(state=body.state, questions=body.questions)
+    answers = result.answers
     latency_ms = int((time.monotonic() - start) * 1000)
 
     row = build_decision_row(
@@ -110,6 +167,10 @@ async def decide(
         answers=_answers_for_log(answers),
         latency_ms=latency_ms,
         questions_version=body.questions_version,
+        provider_error=provider_error,
+        provider_model=upstream.model if upstream else None,
+        provider_input_tokens=upstream.input_tokens if upstream else None,
+        provider_output_tokens=upstream.output_tokens if upstream else None,
     )
     decision_log.write(row)
 
@@ -149,11 +210,21 @@ def _answers_for_log(answers: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def build_default_providers() -> dict[str, DecisionProvider]:
-    """Return the provider registry for this PR.
+def build_default_providers(
+    api_key: str | None = None,
+    *,
+    timeout_ms: int = 2000,
+    jev_model: str = DEFAULT_MODEL,
+) -> dict[str, DecisionProvider]:
+    """Return the provider registry.
 
-    PR 1 registers ``null`` only. LlmEmulation and Jev slots are added
-    by follow-up PRs (msg-246 T02 implementation order 2 / 3); once
-    added, this function is the one place the registration lands.
+    ``null`` is always registered (it is the fallback). ``jev`` is
+    registered only when ``create_app`` passes an API key, which it does
+    only when the config references Jev — and in that case the startup
+    check has already refused a missing key, so a Jev-configured app
+    always gets a real JevProvider. ``llm`` is a follow-up PR.
     """
-    return {"null": NullProvider()}
+    providers: dict[str, DecisionProvider] = {"null": NullProvider()}
+    if api_key:
+        providers["jev"] = JevProvider(api_key, timeout_ms=timeout_ms, model=jev_model)
+    return providers

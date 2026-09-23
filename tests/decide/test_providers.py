@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from lexora.decide.contract import QuestionSpec
-from lexora.decide.providers import DecisionProvider, NullProvider
+from lexora.decide.providers import DecisionProvider, NullProvider, ProviderResult
 
 
 class TestNullProviderName:
@@ -23,10 +23,10 @@ class TestNullProviderNoul:
     @pytest.mark.asyncio
     async def test_noul_returns_half(self) -> None:
         """noul answer is 0.5 — the "no signal" value per msg-237."""
-        result = await NullProvider().evaluate(
+        result = (await NullProvider().evaluate(
             state="anything",
             questions={"q": QuestionSpec(type="noul", instructions="i")},
-        )
+        )).answers
         assert result == {"q": {"noul": 0.5}}
 
 
@@ -34,12 +34,12 @@ class TestNullProviderChoice:
     @pytest.mark.asyncio
     async def test_choice_with_string_options(self) -> None:
         """A choice question with a list of option names gets uniform mass."""
-        result = await NullProvider().evaluate(
+        result = (await NullProvider().evaluate(
             state="s",
             questions={
                 "q": QuestionSpec(type="choice", instructions="i", criteria=["a", "b"])
             },
-        )
+        )).answers
         answer = result["q"]
         assert answer["choice"] == "a"
         assert set(answer["probabilities"]) == {"a", "b"}
@@ -49,7 +49,7 @@ class TestNullProviderChoice:
     @pytest.mark.asyncio
     async def test_choice_with_object_options(self) -> None:
         """TypeSafe's ``[{name, description}, ...]`` shape also works."""
-        result = await NullProvider().evaluate(
+        result = (await NullProvider().evaluate(
             state="s",
             questions={
                 "q": QuestionSpec(
@@ -61,7 +61,7 @@ class TestNullProviderChoice:
                     ],
                 )
             },
-        )
+        )).answers
         assert set(result["q"]["probabilities"]) == {"left", "right"}
 
     @pytest.mark.asyncio
@@ -72,17 +72,17 @@ class TestNullProviderChoice:
         it must never raise. Downstream callers iterating over
         ``answers`` see the same key set they asked for.
         """
-        result = await NullProvider().evaluate(
+        result = (await NullProvider().evaluate(
             state="s",
             questions={"q": QuestionSpec(type="choice", instructions="i")},
-        )
+        )).answers
         assert result["q"] == {"choice": "", "probabilities": {}, "confidence": 0.0}
 
 
 class TestNullProviderScore:
     @pytest.mark.asyncio
     async def test_score_returns_zero_and_confidence_zero(self) -> None:
-        result = await NullProvider().evaluate(
+        result = (await NullProvider().evaluate(
             state="s",
             questions={
                 "q": QuestionSpec(
@@ -91,7 +91,7 @@ class TestNullProviderScore:
                     criteria=["low", "mid", "high"],
                 )
             },
-        )
+        )).answers
         assert result["q"] == {
             "score": 0.0,
             "legend": ["low", "mid", "high"],
@@ -109,3 +109,12 @@ class TestProtocolConformance:
         instead of at deployment.
         """
         assert isinstance(NullProvider(), DecisionProvider)
+
+    async def test_null_provider_reports_no_upstream(self) -> None:
+        """Bohr msg-342 #2: NullProvider returns a ProviderResult with
+        ``upstream=None``, which puts NULL in all ``provider_*`` columns."""
+        result = await NullProvider().evaluate(
+            state="s", questions={"q": QuestionSpec(type="noul", instructions="i")}
+        )
+        assert isinstance(result, ProviderResult)
+        assert result.upstream is None

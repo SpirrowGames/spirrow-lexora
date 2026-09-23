@@ -229,3 +229,352 @@ class TestDecisionLogPathHonoured:
         with sqlite3.connect(str(db_path)) as ro:
             (count,) = ro.execute("SELECT COUNT(*) FROM decisions").fetchone()
         assert count == 1
+
+
+class _FakeJev:
+    """Stands in for JevProvider in the registry (route-level tests)."""
+
+    name = "jev"
+
+    def __init__(
+        self, *, error: Exception | None = None, upstream: object = None
+    ) -> None:
+        self._error = error
+        self._upstream = upstream
+        self.calls = 0
+
+    async def evaluate(self, *, state, questions):  # type: ignore[no-untyped-def]
+        from lexora.decide.providers import ProviderResult
+
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return ProviderResult(
+            answers={name: {"noul": 0.91} for name in questions},
+            upstream=self._upstream,  # type: ignore[arg-type]
+        )
+
+
+def _perr(code: str, **kw):  # type: ignore[no-untyped-def]
+    from lexora.decide.providers import ProviderError, _Failure
+
+    return ProviderError(_Failure(code, **kw))  # type: ignore[arg-type]
+
+
+_JEV_KEY = "sk-route-SECRET-0123456789"
+_STATE_SENTINEL = "STATE-SENTINEL-do-not-log-7f3a"
+
+
+def _jev_app(
+    monkeypatch: pytest.MonkeyPatch, fake, log_path: str = ":memory:"
+):  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+    settings = Settings(
+        decision=DecisionSettings(
+            primary="jev", fallback="null", mode="active", log_path=log_path
+        )
+    )
+    app = create_app(settings=settings)
+    app.state.decision_providers["jev"] = fake
+    return app
+
+
+def _real_jev(handler):  # type: ignore[no-untyped-def]
+    import httpx
+
+    from lexora.decide.providers import JevProvider
+
+    return JevProvider(
+        _JEV_KEY,
+        timeout_ms=2000,
+        base_url="https://jev.test",
+        transport=httpx.MockTransport(handler),
+    )
+
+
+_BODY = {
+    "state": "s",
+    "questions": {"esc": {"type": "noul", "instructions": "Escalate?"}},
+    "policy": "mindwire.tier_c",
+}
+
+_UPSTREAM_COLS = ("provider_model", "provider_input_tokens", "provider_output_tokens")
+
+
+class TestJevRouting:
+    def test_create_app_registers_real_jev_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from lexora.decide.providers import JevProvider
+
+        monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+        settings = Settings(
+            decision=DecisionSettings(
+                primary="jev",
+                fallback="null",
+                mode="active",
+                log_path=":memory:",
+                jev_model="jev-1.13.0",
+            )
+        )
+        app = create_app(settings=settings)
+        provider = app.state.decision_providers["jev"]
+        assert isinstance(provider, JevProvider)
+        assert provider._model == "jev-1.13.0"  # noqa: SLF001
+        # The key is not parked on app.state / settings.
+        assert _JEV_KEY not in repr(vars(app.state))
+
+    def test_default_config_does_not_register_jev(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+        app = create_app(
+            settings=Settings(decision=DecisionSettings(log_path=":memory:"))
+        )
+        assert set(app.state.decision_providers) == {"null"}
+
+    def test_active_jev_success_logs_upstream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from lexora.decide.providers import UpstreamMeta
+
+        fake = _FakeJev(upstream=UpstreamMeta("jev-1.13.0", 120, 9))
+        app = _jev_app(monkeypatch, fake)
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["provider"] == "jev"
+        assert body["answers"] == {"esc": {"noul": 0.91}}
+        # DecideResponse contract unchanged: upstream meta is log-only.
+        assert set(body) == {"answers", "provider", "decision_id", "latency_ms"}
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "jev"
+        assert row["provider_error"] is None
+        assert row["provider_model"] == "jev-1.13.0"
+        assert row["provider_input_tokens"] == 120
+        assert row["provider_output_tokens"] == 9
+
+    @pytest.mark.parametrize(
+        ("code", "level"),
+        [
+            ("timeout", "warning"),
+            ("network", "warning"),
+            ("rate_limited", "warning"),
+            ("overloaded", "warning"),
+            ("http_status", "warning"),
+            ("auth", "error"),
+            ("invalid_request", "error"),
+            ("invalid_response", "error"),
+            ("internal_error", "error"),
+        ],
+    )
+    def test_active_jev_failure_falls_back_to_null(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        code: str,
+        level: str,
+    ) -> None:
+        fake = _FakeJev(error=_perr(code))
+        app = _jev_app(monkeypatch, fake)
+        capsys.readouterr()
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        captured = capsys.readouterr()
+        logs = captured.out + captured.err
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["provider"] == "null"
+        assert body["answers"] == {"esc": {"noul": 0.5}}
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "null"
+        assert row["provider_error"] == f"jev:{code}"
+        for col in _UPSTREAM_COLS:
+            assert row[col] is None, col
+        # Structlog renders to stderr; the renderer (console / json) is
+        # config-dependent, so assert on content, not layout.
+        fallback_lines = [ln for ln in logs.splitlines() if "decide_provider_fallback" in ln]
+        assert len(fallback_lines) == 1
+        assert "jev" in fallback_lines[0]
+        assert code in fallback_lines[0]
+        assert level in fallback_lines[0].lower()
+        assert _JEV_KEY not in logs
+        assert _JEV_KEY not in resp.text
+        assert _JEV_KEY not in repr(row)
+
+    def test_invalid_response_fallback_keeps_upstream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bohr msg-342 #2: ``provider="null"`` next to a billed Jev call."""
+        from lexora.decide.providers import UpstreamMeta
+
+        err = _perr("invalid_response", upstream=UpstreamMeta("jev-1.13.0", 50, 3))
+        app = _jev_app(monkeypatch, _FakeJev(error=err))
+        assert TestClient(app).post("/v1/decide", json=_BODY).status_code == 200
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "null"
+        assert row["provider_error"] == "jev:invalid_response"
+        assert row["provider_model"] == "jev-1.13.0"
+        assert (row["provider_input_tokens"], row["provider_output_tokens"]) == (50, 3)
+
+    def test_fallback_row_lands_on_disk(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        import sqlite3
+
+        db_path = tmp_path / "decisions.db"
+        app = _jev_app(monkeypatch, _FakeJev(error=_perr("network")), str(db_path))
+        assert TestClient(app).post("/v1/decide", json=_BODY).status_code == 200
+        with sqlite3.connect(str(db_path)) as ro:
+            assert ro.execute(
+                "SELECT provider, provider_error, provider_model FROM decisions"
+            ).fetchall() == [("null", "jev:network", None)]
+
+    def test_mode_off_never_calls_jev(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+        app = create_app(
+            settings=Settings(
+                decision=DecisionSettings(
+                    primary="jev", fallback="null", mode="off", log_path=":memory:"
+                )
+            )
+        )
+        fake = _FakeJev()
+        app.state.decision_providers["jev"] = fake
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.json()["provider"] == "null"
+        assert fake.calls == 0
+
+
+_MALFORMED_2XX = [
+    pytest.param({"model": "jev-1.13.0", "answers": [], "usage": {}}, id="answers-list"),
+    pytest.param(
+        {"model": "jev-1.13.0", "answers": {"esc": {"type": "noul", "noul": "high"}}},
+        id="noul-string",
+    ),
+    pytest.param("<html>not json", id="not-json"),
+]
+
+
+class TestRealJevProviderThroughRoute:
+    """Bohr msg-342 #1: a real JevProvider over MockTransport; every upstream
+    fault ends in a 200 with a NullProvider answer, never a 500."""
+
+    @pytest.mark.parametrize("payload", _MALFORMED_2XX)
+    def test_malformed_2xx_falls_back(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        payload: object,
+    ) -> None:
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if isinstance(payload, str):
+                return httpx.Response(200, text=payload)
+            return httpx.Response(200, json=payload)
+
+        app = _jev_app(monkeypatch, _real_jev(handler))
+        capsys.readouterr()
+        body = dict(_BODY, state=_STATE_SENTINEL)
+        resp = TestClient(app).post("/v1/decide", json=body)
+        captured = capsys.readouterr()
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["provider"] == "null"
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "null"
+        assert row["provider_error"] == "jev:invalid_response"
+        assert _STATE_SENTINEL not in captured.out + captured.err
+        assert _JEV_KEY not in captured.out + captured.err
+
+    def test_malformed_score_legend_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "jev-1.13.0",
+                    "answers": {
+                        "sev": {
+                            "type": "score",
+                            "score": 1.0,
+                            "legend": None,
+                            "confidence": 0.5,
+                        }
+                    },
+                    "usage": {"input_tokens": 11, "output_tokens": 1},
+                },
+            )
+
+        app = _jev_app(monkeypatch, _real_jev(handler))
+        body = {
+            "state": "s",
+            "questions": {"sev": {"type": "score", "instructions": "i"}},
+            "policy": "p",
+        }
+        resp = TestClient(app).post("/v1/decide", json=body)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["provider"] == "null"
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider_error"] == "jev:invalid_response"
+        # Billed but discarded: the SQL-visible trace (msg-342 #2).
+        assert row["provider_model"] == "jev-1.13.0"
+        assert (row["provider_input_tokens"], row["provider_output_tokens"]) == (11, 1)
+
+    def test_422_loc_logged_without_input(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                422,
+                json={
+                    "detail": [
+                        {
+                            "loc": ["body", "questions", "esc", "criteria"],
+                            "msg": f"bad value {_STATE_SENTINEL}",
+                            "input": _STATE_SENTINEL,
+                        }
+                    ]
+                },
+            )
+
+        app = _jev_app(monkeypatch, _real_jev(handler))
+        capsys.readouterr()
+        resp = TestClient(app).post("/v1/decide", json=dict(_BODY, state=_STATE_SENTINEL))
+        captured = capsys.readouterr()
+        logs = captured.out + captured.err
+        assert resp.status_code == 200, resp.text
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider_error"] == "jev:invalid_request"
+        (line,) = [ln for ln in logs.splitlines() if "decide_provider_fallback" in ln]
+        assert "criteria" in line
+        assert "error" in line.lower()
+        assert _STATE_SENTINEL not in logs
+        assert _JEV_KEY not in logs
+
+    def test_success_through_route(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "jev-1.13.0",
+                    "answers": {"esc": {"type": "noul", "noul": 0.95}},
+                    "usage": {"input_tokens": 30, "output_tokens": 2},
+                },
+            )
+
+        app = _jev_app(monkeypatch, _real_jev(handler))
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["provider"] == "jev"
+        assert resp.json()["answers"] == {"esc": {"type": "noul", "noul": 0.95}}
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "jev"
+        assert row["provider_model"] == "jev-1.13.0"
+        assert (row["provider_input_tokens"], row["provider_output_tokens"]) == (30, 2)

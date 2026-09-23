@@ -17,6 +17,21 @@ Contract (msg-237 / msg-244 / msg-246):
 * ``fallback``: which provider serves the answer when ``primary`` fails
   under ``active``, and which serves the caller under ``shadow``.
 * ``timeout_ms``: per-call upstream deadline in milliseconds.
+* ``jev_model``: the ``model`` value sent to Jev (default ``jev-latest``).
+  The version that actually served each request is logged in
+  ``provider_model``.
+
+Choosing Jev (T-decide-jev-provider, Bohr msg-258 §6): while
+``LlmEmulationProvider`` is not implemented, a config with
+``primary="jev"`` should also set ``fallback="null"``. ``fallback="llm"``
+names a provider that is not registered yet; the route then serves
+NullProvider anyway, so there is no functional harm, but the config no
+longer says what actually happens. Note also that under ``active`` the
+route's error fallback is always NullProvider (Fermi msg-257 §3) —
+``fallback`` only selects the caller-visible provider under ``shadow``
+in the current implementation. The defaults (``primary="null"``,
+``mode="off"``) never reach Jev, so no metered call happens until an
+operator opts in.
 
 Startup env check (msg-239 / msg-240):
 
@@ -106,6 +121,16 @@ class DecisionSettings(BaseSettings):
         default=2000,
         ge=1,
         description="Per-call upstream deadline in milliseconds.",
+    )
+    jev_model: str = Field(
+        default="jev-latest",
+        min_length=1,
+        description=(
+            "Value sent as the required ``model`` field to Jev's systemone "
+            "endpoint (Bohr msg-339 #2). ``jev-latest`` until the logged "
+            "``provider_model`` values show which version to pin. Env: "
+            "``LEXORA_DECISION__JEV_MODEL``."
+        ),
     )
     log_path: str = Field(
         default="data/decisions.db",
