@@ -307,8 +307,8 @@ class JevProvider:
 
     * httpx timeout / ``asyncio.timeout`` → ``timeout``; other
       ``httpx.RequestError`` → ``network``.
-    * Status codes → :func:`jev_client.classify_status` (422 also carries a
-      ``loc``).
+    * Status codes → :func:`jev_client.classify_status` (a 422 also carries
+      a ``loc``; a 400 is ``invalid_request`` too, but its body is not read).
     * Any exception while reading a 2xx → ``invalid_response``, with the
       leniently read :class:`UpstreamMeta` attached.
     * Any other exception (a Lexora bug while building the request, for
@@ -386,9 +386,11 @@ class JevProvider:
             )
             status_code = jev_client.classify_status(resp.status_code)
             if status_code is not None:
+                # Only a 422 body is read; a 400 is invalid_request too but
+                # its body is never touched (msg-368 v9).
                 loc = (
                     jev_client.extract_422_loc(resp)
-                    if status_code == "invalid_request"
+                    if resp.status_code == 422
                     else None
                 )
                 raise _Classified(_Failure(status_code, loc=loc))

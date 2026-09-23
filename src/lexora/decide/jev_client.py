@@ -24,12 +24,21 @@ msg-339 (v5) / msg-342 (v6) / msg-344 (v7) / msg-346 (v8).
 * Errors: 401 bad key / 422 validation (body names the field) / 429 rate
   limited / 529 overloaded.
 
-One part is NOT in the quoted spec: the 422 body layout. Fermi's quote
-says only that the body names the offending field. :func:`extract_422_loc`
-assumes the FastAPI-style ``{"detail": [{"loc": [...], ...}]}`` layout
-that Bohr's v8 test case uses. If the assumption is wrong, the 422 is
-still classified as ``invalid_request``; only the optional ``loc``
-detail is lost (``None``).
+MEASURED 2026-09-23 against the live API (operator, T-decide-jev-provider
+msg-367; neither call was billed, both are rejected before inference):
+
+* 422 body is the FastAPI layout ``{"detail": [{"type", "loc", "msg",
+  "input"}]}``, e.g. ``loc == ["body", "questions"]``. This confirms the
+  layout :func:`extract_422_loc` was written against (earlier it was an
+  assumption). Only ``loc`` is read.
+* 400 exists and is NOT in the msg-336 table: an invalid question type
+  gets ``{"detail": {"error_type": "api_usage_error", "message":
+  "Invalid request."}}``. It is classified ``invalid_request`` with the
+  422 (Bohr msg-368 v9). The body is never read: ``message`` could echo
+  input some day, so ``loc`` is ``None`` for a 400.
+* 403 is returned when the Authorization header is missing entirely; it
+  is classified ``auth`` with the 401 (msg-368 v9). The startup check
+  refuses to boot without a key, so production should not reach it.
 
 Everything here either returns plain data or raises. It never logs, and
 it never copies an upstream body or header into an exception. Turning a
@@ -125,12 +134,17 @@ async def call_systemone(
 
 
 def classify_status(status: int) -> StatusCode | None:
-    """Map a status code to its fixed code (msg-339 #4 table). 2xx → None."""
+    """Map a status code to its fixed code. 2xx → None.
+
+    Table: msg-339 #4, amended by msg-368 v9 (400 → ``invalid_request``,
+    403 → ``auth``; both measured in msg-367). Anything not listed here
+    and not 429 / 529 falls to ``http_status``.
+    """
     if 200 <= status < 300:
         return None
-    if status == 401:
+    if status in (401, 403):
         return "auth"
-    if status == 422:
+    if status in (400, 422):
         return "invalid_request"
     if status == 429:
         return "rate_limited"

@@ -228,13 +228,15 @@ class TestErrorClassification:
     @pytest.mark.parametrize(
         ("status", "code"),
         [
+            (400, "invalid_request"),  # msg-368 v9 (measured in msg-367)
             (401, "auth"),
+            (403, "auth"),  # msg-368 v9 (measured in msg-367)
             (422, "invalid_request"),
             (429, "rate_limited"),
             (529, "overloaded"),
             (500, "http_status"),
             (503, "http_status"),
-            (403, "http_status"),
+            (404, "http_status"),
         ],
     )
     async def test_status(self, status: int, code: str) -> None:
@@ -242,6 +244,30 @@ class TestErrorClassification:
         assert err.code == code
         assert err.upstream is None
         assert err.exc_type is None
+
+    async def test_classify_status_v9_table(self) -> None:
+        assert jev_client.classify_status(400) == "invalid_request"
+        assert jev_client.classify_status(403) == "auth"
+
+    async def test_400_body_is_not_read(self) -> None:
+        """msg-368 v9: a 400 is invalid_request with loc None, even if its
+        body happens to carry a FastAPI-style loc; the body is never read."""
+        body = {
+            "detail": {
+                "error_type": "api_usage_error",
+                "message": f"Invalid request. {STATE}",
+                "loc": ["body", "questions"],
+            }
+        }
+        err = await _raises(_provider(_respond(400, body)))
+        assert err.code == "invalid_request"
+        assert err.loc is None
+        assert STATE not in repr(vars(err))
+
+        listy = {"detail": [{"loc": ["body", "questions"], "input": STATE}]}
+        err = await _raises(_provider(_respond(400, listy)))
+        assert err.code == "invalid_request"
+        assert err.loc is None
 
     async def test_no_retry_on_429(self) -> None:
         calls = 0
@@ -438,7 +464,9 @@ def _status(n: int) -> Handler:
 _ALL_FAILURES: list[Any] = [
     pytest.param(_read_timeout, "timeout", id="timeout"),
     pytest.param(_connect_error, "network", id="network"),
+    pytest.param(_status(400), "invalid_request", id="400"),
     pytest.param(_status(401), "auth", id="401"),
+    pytest.param(_status(403), "auth", id="403"),
     pytest.param(_status(422), "invalid_request", id="422"),
     pytest.param(_status(429), "rate_limited", id="429"),
     pytest.param(_status(529), "overloaded", id="529"),
