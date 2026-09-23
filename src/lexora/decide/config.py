@@ -18,6 +18,18 @@ Contract (msg-237 / msg-244 / msg-246):
   under ``active``, and which serves the caller under ``shadow``.
 * ``timeout_ms``: per-call upstream deadline in milliseconds.
 
+Choosing Jev (T-decide-jev-provider, Bohr msg-258 §6): while
+``LlmEmulationProvider`` is not implemented, a config with
+``primary="jev"`` should also set ``fallback="null"``. ``fallback="llm"``
+names a provider that is not registered yet; the route then serves
+NullProvider anyway, so there is no functional harm, but the config no
+longer says what actually happens. Note also that under ``active`` the
+route's error fallback is always NullProvider (Fermi msg-257 §3) —
+``fallback`` only selects the caller-visible provider under ``shadow``
+in the current implementation. The defaults (``primary="null"``,
+``mode="off"``) never reach Jev, so no metered call happens until an
+operator opts in.
+
 Startup env check (msg-239 / msg-240):
 
 * If ``primary == "jev"`` **or** ``fallback == "jev"`` and the

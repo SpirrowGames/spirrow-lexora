@@ -41,6 +41,12 @@ packages = ["src/lexora"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Smoke tests hit the real Jev (TypeSafe) API and are metered; they are
+# skipped unless selected explicitly with `pytest -m smoke`.
+addopts = "-m 'not smoke'"
+markers = [
+    "smoke: calls a real external API (metered); run explicitly with -m smoke",
+]
 
 [tool.ruff]
 line-length = 100

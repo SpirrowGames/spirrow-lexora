@@ -5,7 +5,8 @@ write one decision-log row, return. It exists so the utilisation-side
 threads (mindwire / prismind / verimend) have a stable URL to point at;
 the interesting behaviour is in the provider layer.
 
-PR 1 scope (msg-246): only ``NullProvider`` is wired. The ``mode`` /
+PR 1 scope (msg-246): only ``NullProvider`` was wired. T-decide-jev-provider
+adds ``JevProvider`` and the NullProvider fallback on ``ProviderError``. The ``mode`` /
 ``primary`` / ``fallback`` settings *are* honoured — a config that
 selects Jev on PR 1 is refused at startup by
 :func:`lexora.decide.config.check_typesafe_api_key`, so the route never
@@ -26,7 +27,12 @@ from fastapi import APIRouter, Depends, Request
 from lexora.decide.config import DecisionSettings
 from lexora.decide.contract import DecideRequest, DecideResponse
 from lexora.decide.log import DecisionLog, build_decision_row
-from lexora.decide.providers import DecisionProvider, NullProvider
+from lexora.decide.providers import (
+    DecisionProvider,
+    JevProvider,
+    NullProvider,
+    ProviderError,
+)
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -98,7 +104,25 @@ async def decide(
 
     decision_id = uuid.uuid4().hex
     start = time.monotonic()
-    answers = await provider.evaluate(state=body.state, questions=body.questions)
+    provider_error: str | None = None
+    try:
+        answers = await provider.evaluate(state=body.state, questions=body.questions)
+    except ProviderError as exc:
+        # Safe-default, not fail-loud (Fermi msg-257 §3): the caller
+        # (e.g. mindwire's Tier-C gate, D20 fail-open) gets a well-formed
+        # NullProvider answer, and the row records who actually answered
+        # (``null``) plus why the primary did not (Bohr msg-258 §4).
+        # The warning carries the fixed code only — no body, no key.
+        provider_error = _format_provider_error(provider.name, exc)
+        logger.warning(
+            "decide_provider_fallback",
+            primary=provider.name,
+            code=exc.code,
+            discarded=exc.discarded,
+            decision_id=decision_id,
+        )
+        provider = providers["null"]
+        answers = await provider.evaluate(state=body.state, questions=body.questions)
     latency_ms = int((time.monotonic() - start) * 1000)
 
     row = build_decision_row(
@@ -110,6 +134,7 @@ async def decide(
         answers=_answers_for_log(answers),
         latency_ms=latency_ms,
         questions_version=body.questions_version,
+        provider_error=provider_error,
     )
     decision_log.write(row)
 
@@ -149,11 +174,28 @@ def _answers_for_log(answers: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def build_default_providers() -> dict[str, DecisionProvider]:
-    """Return the provider registry for this PR.
+def _format_provider_error(primary: str, exc: ProviderError) -> str:
+    """``"<primary>:<code>"`` plus ``";discarded=<n>"`` when ``n > 0``."""
+    text = f"{primary}:{exc.code}"
+    if exc.discarded:
+        text += f";discarded={exc.discarded}"
+    return text
 
-    PR 1 registers ``null`` only. LlmEmulation and Jev slots are added
-    by follow-up PRs (msg-246 T02 implementation order 2 / 3); once
-    added, this function is the one place the registration lands.
+
+def build_default_providers(
+    api_key: str | None = None,
+    *,
+    timeout_ms: int = 2000,
+) -> dict[str, DecisionProvider]:
+    """Return the provider registry.
+
+    ``null`` is always registered (it is the fallback). ``jev`` is
+    registered only when ``create_app`` passes an API key, which it does
+    only when the config references Jev — and in that case the startup
+    check has already refused a missing key, so a Jev-configured app
+    always gets a real JevProvider. ``llm`` is a follow-up PR.
     """
-    return {"null": NullProvider()}
+    providers: dict[str, DecisionProvider] = {"null": NullProvider()}
+    if api_key:
+        providers["jev"] = JevProvider(api_key, timeout_ms=timeout_ms)
+    return providers

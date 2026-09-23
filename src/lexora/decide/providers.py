@@ -3,14 +3,38 @@
 The interface is a Protocol rather than an abstract class so the tests
 can drop in an ad-hoc fake without inheriting; future ``LlmEmulation``
 and ``Jev`` providers will implement it directly. Only the ``null``
-implementation ships in this PR (msg-246 confirmed T02 PR 1 scope).
+implementation shipped in T02 PR 1 (msg-246); :class:`JevProvider` lands
+in T-decide-jev-provider.
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import Literal, Protocol, runtime_checkable
 
+import httpx
+
+from lexora.decide import jev_client
 from lexora.decide.contract import Answer, QuestionSpec
+
+ProviderErrorCode = Literal["timeout", "http_status", "network", "auth", "invalid_response"]
+
+
+class ProviderError(Exception):
+    """An upstream provider failed; the route falls back to NullProvider.
+
+    ``code`` is one of a fixed set. ``discarded`` counts sibling upstream
+    calls in the same request that had already completed — and so were
+    billed — when the failure was observed; their answers are thrown away
+    because a request is answered by exactly one provider (Bohr msg-260
+    #2). Deliberately holds no HTTP body, header, or API key.
+    """
+
+    def __init__(self, code: ProviderErrorCode, *, discarded: int = 0) -> None:
+        super().__init__(code if not discarded else f"{code};discarded={discarded}")
+        self.code: ProviderErrorCode = code
+        self.discarded = discarded
 
 
 @runtime_checkable
@@ -139,3 +163,94 @@ def _extract_score_legend(criteria: object) -> list[str]:
             if isinstance(name, str):
                 legend.append(name)
     return legend
+
+
+_JevCall = Callable[[httpx.AsyncClient, str, str, QuestionSpec], Awaitable[Answer]]
+
+_JEV_DISPATCH: dict[str, _JevCall] = {
+    "noul": jev_client.call_noul,
+    "choice": jev_client.call_choice,
+    "score": jev_client.call_score,
+}
+
+
+class JevProvider:
+    """Provider backed by the Jev (TypeSafe) judgment API.
+
+    API key (msg-240 §1 / Bohr msg-258 §2): passed in once by
+    ``create_app`` from the env and captured in a closure — not stored on
+    ``app.state``, on settings, or as a plain attribute, and never put in
+    an exception or log line. ``repr(provider)`` does not show it.
+
+    Failure semantics (Bohr msg-260 #2, Einstein msg-259 #2 / msg-261):
+    questions are dispatched concurrently under :class:`asyncio.TaskGroup`.
+    The first failure cancels the in-flight siblings (fail-fast, to limit
+    billed-but-discarded upstream calls) and the whole ``evaluate`` raises
+    one :class:`ProviderError`. There is no partial result: a request is
+    answered by exactly one provider, so the ``provider`` column never
+    mixes Jev answers with NullProvider answers.
+    """
+
+    name = "jev"
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        timeout_ms: int,
+        base_url: str = jev_client.DEFAULT_BASE_URL,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        def _key() -> str:
+            return api_key
+
+        self._key = _key
+        self._timeout_s = timeout_ms / 1000.0
+        self._base_url = base_url
+        self._transport = transport
+
+    def __repr__(self) -> str:
+        return f"JevProvider(base_url={self._base_url!r})"
+
+    async def evaluate(
+        self,
+        *,
+        state: str,
+        questions: dict[str, QuestionSpec],
+    ) -> dict[str, Answer]:
+        answers: dict[str, Answer] = {}
+        api_key = self._key()
+        async with httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=self._timeout_s,
+            transport=self._transport,
+        ) as client:
+
+            async def _one(name: str, question: QuestionSpec) -> None:
+                call = _JEV_DISPATCH[question.type]
+                answers[name] = await call(client, api_key, state, question)
+
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    for name, question in questions.items():
+                        tg.create_task(_one(name, question))
+            except BaseExceptionGroup as eg:
+                # Anything that is not a classified Jev failure is a bug;
+                # re-raise it unchanged rather than hide it behind a
+                # fallback.
+                matched, rest = eg.split(jev_client.JevCallError)
+                if rest is not None or matched is None:
+                    raise
+                first = _first_leaf(matched)
+                # ``answers`` holds exactly the calls that completed
+                # before cancellation: billed upstream, discarded here.
+                raise ProviderError(first.code, discarded=len(answers)) from None
+        return answers
+
+
+def _first_leaf(eg: BaseExceptionGroup[jev_client.JevCallError]) -> jev_client.JevCallError:
+    exc: BaseException = eg
+    while isinstance(exc, BaseExceptionGroup):
+        exc = exc.exceptions[0]
+    assert isinstance(exc, jev_client.JevCallError)
+    return exc

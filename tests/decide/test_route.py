@@ -229,3 +229,155 @@ class TestDecisionLogPathHonoured:
         with sqlite3.connect(str(db_path)) as ro:
             (count,) = ro.execute("SELECT COUNT(*) FROM decisions").fetchone()
         assert count == 1
+
+
+class _FakeJev:
+    """Stands in for JevProvider in the registry (route-level tests)."""
+
+    name = "jev"
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self._error = error
+        self.calls = 0
+
+    async def evaluate(self, *, state, questions):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        return {name: {"noul": 0.91} for name in questions}
+
+
+_JEV_KEY = "sk-route-SECRET-0123456789"
+
+
+def _jev_app(
+    monkeypatch: pytest.MonkeyPatch, fake: _FakeJev, log_path: str = ":memory:"
+):  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+    settings = Settings(
+        decision=DecisionSettings(
+            primary="jev", fallback="null", mode="active", log_path=log_path
+        )
+    )
+    app = create_app(settings=settings)
+    app.state.decision_providers["jev"] = fake
+    return app
+
+
+_BODY = {
+    "state": "s",
+    "questions": {"esc": {"type": "noul", "instructions": "Escalate?"}},
+    "policy": "mindwire.tier_c",
+}
+
+
+class TestJevRouting:
+    def test_create_app_registers_real_jev_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from lexora.decide.providers import JevProvider
+
+        monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+        settings = Settings(
+            decision=DecisionSettings(
+                primary="jev", fallback="null", mode="active", log_path=":memory:"
+            )
+        )
+        app = create_app(settings=settings)
+        assert isinstance(app.state.decision_providers["jev"], JevProvider)
+        # The key is not parked on app.state / settings.
+        assert _JEV_KEY not in repr(vars(app.state))
+
+    def test_default_config_does_not_register_jev(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+        app = create_app(
+            settings=Settings(decision=DecisionSettings(log_path=":memory:"))
+        )
+        assert set(app.state.decision_providers) == {"null"}
+
+    def test_active_jev_success(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeJev()
+        app = _jev_app(monkeypatch, fake)
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["provider"] == "jev"
+        assert body["answers"] == {"esc": {"noul": 0.91}}
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "jev"
+        assert row["provider_error"] is None
+
+    @pytest.mark.parametrize(
+        ("error_kwargs", "expected"),
+        [
+            ({"code": "timeout"}, "jev:timeout"),
+            ({"code": "auth"}, "jev:auth"),
+            ({"code": "http_status", "discarded": 2}, "jev:http_status;discarded=2"),
+        ],
+    )
+    def test_active_jev_failure_falls_back_to_null(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        error_kwargs,  # type: ignore[no-untyped-def]
+        expected,  # type: ignore[no-untyped-def]
+    ) -> None:
+        from lexora.decide.providers import ProviderError
+
+        code = error_kwargs.pop("code")
+        fake = _FakeJev(error=ProviderError(code, **error_kwargs))
+        app = _jev_app(monkeypatch, fake)
+        capsys.readouterr()
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        captured = capsys.readouterr()
+        logs = captured.out + captured.err
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["provider"] == "null"
+        assert body["answers"] == {"esc": {"noul": 0.5}}
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "null"
+        assert row["provider_error"] == expected
+        # Structlog renders to stderr; the renderer (console / json) is
+        # config-dependent, so assert on content, not layout.
+        fallback_lines = [ln for ln in logs.splitlines() if "decide_provider_fallback" in ln]
+        assert len(fallback_lines) == 1
+        assert "jev" in fallback_lines[0]
+        assert code in fallback_lines[0]
+        assert _JEV_KEY not in logs
+        assert _JEV_KEY not in resp.text
+        assert _JEV_KEY not in repr(row)
+
+    def test_fallback_row_lands_on_disk(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:  # type: ignore[no-untyped-def]
+        import sqlite3
+
+        from lexora.decide.providers import ProviderError
+
+        db_path = tmp_path / "decisions.db"
+        app = _jev_app(
+            monkeypatch, _FakeJev(error=ProviderError("network")), str(db_path)
+        )
+        assert TestClient(app).post("/v1/decide", json=_BODY).status_code == 200
+        with sqlite3.connect(str(db_path)) as ro:
+            assert ro.execute(
+                "SELECT provider, provider_error FROM decisions"
+            ).fetchall() == [("null", "jev:network")]
+
+    def test_mode_off_never_calls_jev(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+        app = create_app(
+            settings=Settings(
+                decision=DecisionSettings(
+                    primary="jev", fallback="null", mode="off", log_path=":memory:"
+                )
+            )
+        )
+        fake = _FakeJev()
+        app.state.decision_providers["jev"] = fake
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.json()["provider"] == "null"
+        assert fake.calls == 0

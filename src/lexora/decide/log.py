@@ -48,19 +48,85 @@ CREATE TABLE IF NOT EXISTS decisions (
     provider          TEXT NOT NULL,
     answers_json      TEXT NOT NULL,
     latency_ms        INTEGER NOT NULL,
-    timestamp         TEXT NOT NULL
+    timestamp         TEXT NOT NULL,
+    provider_error    TEXT NULL
 )
 """
 
 _INSERT_SQL = """
 INSERT INTO decisions (
     decision_id, policy, state_hash, questions_hash, questions_version,
-    provider, answers_json, latency_ms, timestamp
+    provider, answers_json, latency_ms, timestamp, provider_error
 ) VALUES (
     :decision_id, :policy, :state_hash, :questions_hash, :questions_version,
-    :provider, :answers_json, :latency_ms, :timestamp
+    :provider, :answers_json, :latency_ms, :timestamp, :provider_error
 )
 """
+
+#: Columns added after PR #43 shipped the table. Each entry is applied by
+#: :func:`_apply_schema_on_conn` only when ``PRAGMA table_info`` shows the
+#: column missing, so a DB created by PR #43 is up-migrated in place and a
+#: fresh DB (whose CREATE already carries the column) is left alone.
+_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("provider_error", "TEXT NULL"),
+)
+
+
+def _apply_schema_on_conn(conn: sqlite3.Connection) -> None:
+    """Idempotently ensure the ``decisions`` schema on ``conn``.
+
+    The caller owns the transaction / write lock. CREATE TABLE IF NOT
+    EXISTS runs first so a fresh DB has a table before ``PRAGMA
+    table_info`` is consulted — on a missing table that pragma returns an
+    empty list rather than raising, and an ALTER against it would fail
+    with ``no such table`` (Einstein msg-261).
+    """
+    conn.execute(_CREATE_TABLE_SQL)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(decisions)")}
+    for name, decl in _ADDED_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
+
+
+def apply_decision_log_migrations(path: Path | str) -> None:
+    """Race-safe schema migration for a file-backed decision log.
+
+    This is the **only** owner of the schema for file-backed paths
+    (Bohr msg-264 v4). ``create_app`` calls it before constructing
+    :class:`DecisionLog`; any other entrypoint (CLI, import tool) must do
+    the same.
+
+    Multi-worker safety (Einstein msg-259 #1): under ``uvicorn --workers
+    N`` every worker runs ``create_app``. ``BEGIN IMMEDIATE`` takes the
+    SQLite write lock before the column check, so workers are serialised
+    by the file lock and a late worker re-reads the table info *after*
+    the early one committed — it sees the column and no-ops instead of
+    hitting a duplicate-column error. ``busy_timeout`` makes a waiting
+    worker block up to 5 s; beyond that ``sqlite3.OperationalError``
+    propagates and the process crash-loops observably (fail-closed).
+
+    ``:memory:`` is per-connection, so a migration here would land on a
+    throwaway DB; it returns early and :class:`DecisionLog` applies the
+    schema on its own connection instead.
+    """
+    path_str = str(path)
+    if path_str == ":memory:":
+        return
+    parent = Path(path_str).parent
+    if str(parent) and str(parent) != ".":
+        parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path_str, timeout=5.0, isolation_level=None)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _apply_schema_on_conn(conn)
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +139,13 @@ class DecisionRow:
       (see :mod:`lexora.decide.contract`). Fixed width so the schema
       does not have to grow when a hash algorithm changes; the width is
       part of the writer's contract, not the dataclass's.
+    * ``provider_error`` — ``None`` when the provider in ``provider``
+      answered directly. When the primary failed and NullProvider served
+      the fallback, ``provider`` is ``"null"`` and this carries
+      ``"<primary>:<code>"`` plus ``";discarded=<n>"`` when ``n`` sibling
+      upstream calls had already completed (and been billed) before the
+      failure was observed (Bohr msg-260 #2). A fixed code, never an
+      upstream body or header.
     * ``answers_json`` — JSON-serialised ``answers`` object. Kept as a
       string rather than a nested dict because SQLite has no JSON
       column type and turning every read into a JSON parse in Python
@@ -94,6 +167,7 @@ class DecisionRow:
     latency_ms: int
     timestamp: str
     questions_version: str | None = None
+    provider_error: str | None = None
 
     def __post_init__(self) -> None:
         # Fixed-width hash discipline lives here so a caller who passes
@@ -121,6 +195,7 @@ def build_decision_row(
     latency_ms: int,
     questions_version: str | None,
     timestamp: datetime | None = None,
+    provider_error: str | None = None,
 ) -> DecisionRow:
     """Construct a :class:`DecisionRow` from the request/response shape.
 
@@ -143,6 +218,7 @@ def build_decision_row(
         ),
         latency_ms=latency_ms,
         timestamp=ts,
+        provider_error=provider_error,
     )
 
 
@@ -157,6 +233,15 @@ class DecisionLog:
     The database is opened with ``check_same_thread=False`` because
     FastAPI hands requests to an asyncio event loop and worker threads
     may share the connection. The lock is what makes that safe.
+
+    Schema ownership (Bohr msg-264 v4, Einstein msg-263 advisory): for a
+    file-backed path this class does NOT create or alter the schema —
+    call :func:`apply_decision_log_migrations` first. Forgetting to do so
+    makes the first :meth:`write` raise ``sqlite3.OperationalError: no
+    such table: decisions`` (fail-closed). A lock-free schema apply here
+    would be a safety net that silently reintroduces the multi-worker
+    ALTER race. Only ``:memory:`` DBs, which are per-connection and so
+    cannot race across processes, get their schema applied here.
     """
 
     def __init__(self, path: Path | str = ":memory:") -> None:
@@ -168,8 +253,12 @@ class DecisionLog:
                 parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._conn.execute(_CREATE_TABLE_SQL)
-        self._conn.commit()
+        if self._path == ":memory:":
+            # The ONLY place DecisionLog owns its schema: an external
+            # migration on a separate ``:memory:`` connection would land
+            # on a different, throwaway DB.
+            _apply_schema_on_conn(self._conn)
+            self._conn.commit()
 
     def write(self, row: DecisionRow) -> None:
         """Append a row. Raises :class:`sqlite3.Error` on failure.
@@ -202,7 +291,7 @@ class DecisionLog:
             cursor = self._conn.execute(
                 "SELECT decision_id, policy, state_hash, questions_hash, "
                 "questions_version, provider, answers_json, latency_ms, "
-                "timestamp FROM decisions ORDER BY timestamp, decision_id"
+                "timestamp, provider_error FROM decisions ORDER BY timestamp, decision_id"
             )
             columns = [c[0] for c in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -228,4 +317,5 @@ def _row_as_params(row: DecisionRow) -> dict[str, Any]:
         "answers_json": row.answers_json,
         "latency_ms": row.latency_ms,
         "timestamp": row.timestamp,
+        "provider_error": row.provider_error,
     }

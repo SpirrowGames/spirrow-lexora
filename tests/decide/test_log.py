@@ -22,7 +22,12 @@ from lexora.decide.contract import (
     compute_questions_hash,
     compute_state_hash,
 )
-from lexora.decide.log import DecisionLog, DecisionRow, build_decision_row
+from lexora.decide.log import (
+    DecisionLog,
+    DecisionRow,
+    apply_decision_log_migrations,
+    build_decision_row,
+)
 
 
 class TestDecisionRowShape:
@@ -45,6 +50,7 @@ class TestDecisionRowShape:
             "answers_json",
             "latency_ms",
             "timestamp",
+            "provider_error",
         }
         fields = {f for f in DecisionRow.__dataclass_fields__ if not f.startswith("_")}
         assert fields == allowed
@@ -155,6 +161,7 @@ class TestDecisionLogSqlite:
         wiring points this at a real file under ``data/``.
         """
         db_path = tmp_path / "sub" / "decisions.sqlite"
+        apply_decision_log_migrations(db_path)
         log = DecisionLog(db_path)
         log.write(_sample_row())
         log.close()
@@ -187,9 +194,158 @@ class TestDecisionLogSqlite:
             "answers_json",
             "latency_ms",
             "timestamp",
+            "provider_error",
         }
         # And to satisfy the type checker that sqlite3 is used.
         assert isinstance(log._conn, sqlite3.Connection)  # noqa: SLF001
+
+
+#: The ``decisions`` DDL exactly as PR #43 shipped it (before
+#: ``provider_error``). Used to prove up-migration of an existing DB.
+_PR43_CREATE_SQL = """
+CREATE TABLE decisions (
+    decision_id       TEXT PRIMARY KEY,
+    policy            TEXT NOT NULL,
+    state_hash        TEXT NOT NULL,
+    questions_hash    TEXT NOT NULL,
+    questions_version TEXT NULL,
+    provider          TEXT NOT NULL,
+    answers_json      TEXT NOT NULL,
+    latency_ms        INTEGER NOT NULL,
+    timestamp         TEXT NOT NULL
+)
+"""
+
+
+def _columns(db_path: Path) -> list[str]:
+    import sqlite3
+
+    with sqlite3.connect(str(db_path)) as conn:
+        return [r[1] for r in conn.execute("PRAGMA table_info(decisions)")]
+
+
+class TestDecisionLogMigrations:
+    """Schema ownership (Bohr msg-260/262/264, Einstein msg-259/261/263)."""
+
+    def test_provider_error_roundtrip(self) -> None:
+        log = DecisionLog(":memory:")
+        log.write(_sample_row(provider_error="jev:timeout;discarded=1"))
+        log.write(_sample_row(decision_id="did-2"))
+        rows = {r["decision_id"]: r for r in log.fetch_all()}
+        assert rows["did-1"]["provider_error"] == "jev:timeout;discarded=1"
+        assert rows["did-2"]["provider_error"] is None
+
+    def test_build_decision_row_carries_provider_error(self) -> None:
+        row = build_decision_row(
+            decision_id="d",
+            policy="p",
+            state="s",
+            questions={"q": QuestionSpec(type="noul", instructions="i")},
+            provider="null",
+            answers={"q": {"noul": 0.5}},
+            latency_ms=1,
+            questions_version=None,
+            provider_error="jev:auth",
+        )
+        assert row.provider_error == "jev:auth"
+
+    def test_migrations_on_fresh_file(self, tmp_path: Path) -> None:
+        """Einstein msg-261: a fresh file must get CREATE before any ALTER."""
+        db_path = tmp_path / "fresh" / "decisions.db"
+        apply_decision_log_migrations(str(db_path))
+        cols = _columns(db_path)
+        assert "decision_id" in cols
+        assert cols.count("provider_error") == 1
+        log = DecisionLog(str(db_path))
+        log.write(_sample_row())
+        assert len(log.fetch_all()) == 1
+        log.close()
+
+    def test_migrations_on_fresh_memory(self) -> None:
+        """``:memory:`` is a no-op for the migration; DecisionLog owns it."""
+        apply_decision_log_migrations(":memory:")
+        log = DecisionLog(":memory:")
+        log.write(_sample_row())
+        assert len(log.fetch_all()) == 1
+
+    def test_migrations_idempotent(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "decisions.db"
+        apply_decision_log_migrations(db_path)
+        apply_decision_log_migrations(db_path)
+        assert _columns(db_path).count("provider_error") == 1
+
+    def test_up_migration_from_pr43_schema(self, tmp_path: Path) -> None:
+        """An existing PR #43 DB gains the column; old rows are intact."""
+        import sqlite3
+
+        db_path = tmp_path / "decisions.db"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(_PR43_CREATE_SQL)
+            conn.execute(
+                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?)",
+                ("old-1", "p", "a" * 16, "b" * 16, None, "null", "{}", 3, "t0"),
+            )
+        assert "provider_error" not in _columns(db_path)
+
+        apply_decision_log_migrations(db_path)
+        log = DecisionLog(db_path)
+        log.write(_sample_row(decision_id="new-1", provider_error="jev:auth"))
+        rows = {r["decision_id"]: r for r in log.fetch_all()}
+        log.close()
+
+        assert rows["old-1"]["provider_error"] is None
+        assert rows["old-1"]["latency_ms"] == 3
+        assert rows["new-1"]["provider_error"] == "jev:auth"
+        assert _columns(db_path).count("provider_error") == 1
+
+    def test_concurrent_migrations_are_race_safe(self, tmp_path: Path) -> None:
+        """Einstein msg-259 #1: many workers migrating one PR #43 DB at once.
+
+        Every thread uses its own connection (as separate uvicorn workers
+        would). BEGIN IMMEDIATE serialises them; the late ones re-read
+        table_info under the lock and no-op instead of a duplicate ALTER.
+        """
+        import sqlite3
+        import threading
+
+        db_path = tmp_path / "decisions.db"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(_PR43_CREATE_SQL)
+            conn.execute(
+                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?)",
+                ("old-1", "p", "a" * 16, "b" * 16, None, "null", "{}", 3, "t0"),
+            )
+
+        barrier = threading.Barrier(8)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                apply_decision_log_migrations(db_path)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert _columns(db_path).count("provider_error") == 1
+        with sqlite3.connect(str(db_path)) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM decisions").fetchone() == (1,)
+
+    def test_decisionlog_file_backed_requires_migration(self, tmp_path: Path) -> None:
+        """Bohr msg-264 v4 contract: file-backed DecisionLog never owns the
+        schema, so skipping the migration fails closed on first write."""
+        import sqlite3
+
+        log = DecisionLog(tmp_path / "decisions.db")
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            log.write(_sample_row())
+        log.close()
 
 
 def _sample_row(**overrides: Any) -> DecisionRow:
