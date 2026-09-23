@@ -15,6 +15,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -884,3 +885,270 @@ class TestSourceFences:
                     if "auth.json" in node.value:
                         hits.append(f"{path.relative_to(SRC)}:{node.lineno}")
         assert hits == []
+
+
+
+# --------------------------------------------------------------------------
+# D-1e': write-ahead run log (msg-403, amended by msg-405)
+# --------------------------------------------------------------------------
+
+
+def _db_error(*_a: Any, **_k: Any) -> Any:
+    raise sqlite3.OperationalError("database is locked")
+
+
+def _failing(real: Any, times: int) -> Any:
+    """Wrap ``real`` so its first ``times`` calls raise, then delegate."""
+    calls = {"n": 0}
+
+    def wrapper(*a: Any, **k: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] <= times:
+            raise sqlite3.OperationalError("database is locked")
+        return real(*a, **k)
+
+    return wrapper
+
+
+def _restart(tmp_path: Path, backend: CodexBackend, scenario: str = "ok") -> CodexBackend:
+    """A new process: same DB, empty in-memory state."""
+    fresh = make_backend(tmp_path, scenario)
+    assert fresh.state_store.db_path == backend.state_store.db_path
+    return fresh
+
+
+async def _reason(backend: CodexBackend) -> str | None:
+    try:
+        await backend._ensure_verified()
+    except CodexNotVerifiedError as exc:
+        return exc.reason
+    return None
+
+
+class TestWriteAheadRunLog:
+    async def test_clean_run_is_paired(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        await backend.chat_completions(REQUEST)
+        runs = backend.state_store.runs()
+        assert len(runs) == 1 and runs[0].finished_seq is not None
+        assert runs[0].instance_id == codex_mod.INSTANCE_ID
+        assert backend.state_store.unfinished_runs() == []
+        assert await _reason(backend) is None
+
+    async def test_run_started_unwritable_starts_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+
+        async def boom(*a: Any, **k: Any) -> Any:
+            raise AssertionError("codex started without run_started")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+        monkeypatch.setattr(backend.state_store, "record_run_started", _db_error)
+        with pytest.raises(CodexNotVerifiedError) as exc:
+            await backend.chat_completions(REQUEST)
+        assert exc.value.reason == "state_unwritable"
+
+    async def test_latched_run_leaves_run_started_unpaired(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "tool_use")
+        record_pass(backend)
+        with pytest.raises(CodexToolUseViolation):
+            await backend.chat_completions(REQUEST)
+        assert len(backend.state_store.unfinished_runs()) == 1
+        # Both conditions hold; the violation is the reported reason.
+        assert await _reason(backend) == "tool_use_violation"
+        vid = backend.state_store.uncleared_violations()[0].id
+        backend.state_store.clear_violation(vid, "investigated")
+        # The clearance is newer than the run_started, so it covers it too.
+        assert backend.state_store.unfinished_runs() == []
+        assert await _reason(backend) == "verification_missing"
+        record_pass(backend)
+        assert await _reason(backend) is None
+
+    async def test_violation_and_finish_unwritable_closes_across_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = make_backend(tmp_path, "tool_use")
+        record_pass(backend)
+        monkeypatch.setattr(backend.state_store, "record_violation", _db_error)
+        monkeypatch.setattr(backend.state_store, "record_run_finished", _db_error)
+        with pytest.raises(CodexToolUseViolation) as exc:
+            await backend.chat_completions(REQUEST)
+        assert "NOT written" in str(exc.value)
+        # Not queued for re-writing: a latching outcome never self-recovers.
+        assert backend.finish_pending_count() == 0
+        assert await _reason(backend) == "state_unwritable"  # in-process poison
+        monkeypatch.undo()
+        assert await _reason(backend) == "state_unwritable"  # poison survives a healthy DB
+        fresh = _restart(tmp_path, backend)
+        assert await _reason(fresh) == "run_unfinished"  # condition 0, after restart
+
+    async def test_finish_fails_once_then_opens_without_a_human(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        store = backend.state_store
+        monkeypatch.setattr(store, "record_run_finished", _failing(store.record_run_finished, 2))
+        response = await backend.chat_completions(REQUEST)  # the clean answer is still returned
+        assert response["choices"][0]["message"]["content"].startswith("REVIEW: ")
+        assert backend.finish_pending_count() == 1
+        # 2nd attempt (inside _ensure_verified) fails too -> closed, pending.
+        assert await _reason(backend) == "run_finish_pending"
+        # 3rd attempt succeeds -> open, no clearance, no new pass.
+        assert await _reason(backend) is None
+        assert backend.finish_pending_count() == 0
+        await backend.close()
+
+    async def test_background_retry_writes_the_finish(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        store = backend.state_store
+        monkeypatch.setattr(store, "record_run_finished", _failing(store.record_run_finished, 1))
+        await backend.chat_completions(REQUEST)
+        assert backend.finish_pending_count() == 1
+        for _ in range(40):
+            if backend.finish_pending_count() == 0:
+                break
+            await asyncio.sleep(0.1)
+        assert backend.finish_pending_count() == 0
+        assert store.unfinished_runs() == []
+        await backend.close()
+
+    async def test_pending_finish_then_restart_stays_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        monkeypatch.setattr(backend.state_store, "record_run_finished", _db_error)
+        await backend.chat_completions(REQUEST)
+        assert await _reason(backend) == "run_finish_pending"
+        await backend.close()  # the process ends before the finish is written
+        fresh = _restart(tmp_path, backend)
+        assert await _reason(fresh) == "run_unfinished"
+
+    async def test_crash_mid_run_needs_clearance_and_a_new_pass(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        # What a process that died inside codex exec leaves behind.
+        run_seq = backend.state_store.record_run_started("codex", "dead-instance")
+        fresh = _restart(tmp_path, backend)
+        assert await _reason(fresh) == "run_unfinished"
+        with pytest.raises(ClearViolationError):
+            fresh.state_store.clear_unfinished_run(run_seq, " ")
+        fresh.state_store.clear_unfinished_run(run_seq, "deploy restarted lexora mid-review")
+        assert await _reason(fresh) == "verification_missing"  # the old pass no longer counts
+        record_pass(fresh)
+        assert await _reason(fresh) is None
+        with pytest.raises(ClearViolationError):
+            fresh.state_store.clear_unfinished_run(run_seq, "again")
+
+    async def test_own_in_flight_run_does_not_close_the_gate(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "sleep", timeout=30.0)
+        record_pass(backend)
+        task = asyncio.create_task(backend.chat_completions(REQUEST))
+        await _until_ticking(backend)
+        assert len(backend.state_store.unfinished_runs()) == 1
+        assert await _reason(backend) is None  # same process: excused
+        other = _restart(tmp_path, backend)
+        assert await _reason(other) == "run_unfinished"  # another process: not excused
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_cancel_while_queued_pairs_the_run(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        backend._semaphore = asyncio.Semaphore(0)
+        task = asyncio.create_task(backend.chat_completions(REQUEST))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert backend.state_store.unfinished_runs() == []
+        assert backend.state_store.uncleared_violations() == []
+
+    async def test_quota_and_spawn_failure_pair_the_run(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "quota")
+        record_pass(backend)
+        with pytest.raises(CodexQuotaError):
+            await backend.chat_completions(REQUEST)
+        backend._wrap = lambda inner, workdir: [str(tmp_path / "no-such-bwrap")]  # type: ignore[method-assign]
+        with pytest.raises(CodexLaunchError):
+            await backend.chat_completions(REQUEST)
+        assert backend.state_store.unfinished_runs() == []
+        assert await _reason(backend) is None
+
+    async def test_lock_within_busy_timeout_does_not_close(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        holder = sqlite3.connect(backend.state_store.db_path, check_same_thread=False, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        release = threading.Timer(0.5, holder.execute, args=("COMMIT",))
+        release.start()
+        try:
+            await backend.chat_completions(REQUEST)
+        finally:
+            release.join()
+            holder.close()
+        assert backend.finish_pending_count() == 0
+        assert await _reason(backend) is None
+
+
+def _row_run_started_fails(backend: CodexBackend, mp: pytest.MonkeyPatch) -> None:
+    mp.setattr(backend.state_store, "record_run_started", _db_error)
+
+
+def _row_violation_written(backend: CodexBackend, mp: pytest.MonkeyPatch) -> None:
+    backend._scenario = "tool_use"  # type: ignore[attr-defined]
+
+
+def _row_nothing_writable(backend: CodexBackend, mp: pytest.MonkeyPatch) -> None:
+    backend._scenario = "tool_use"  # type: ignore[attr-defined]
+    mp.setattr(backend.state_store, "record_violation", _db_error)
+    mp.setattr(backend.state_store, "record_run_finished", _db_error)
+
+
+def _row_finish_transient(backend: CodexBackend, mp: pytest.MonkeyPatch) -> None:
+    mp.setattr(backend.state_store, "record_run_finished", _db_error)
+
+
+class TestStateTable:
+    """msg-403's table, with msg-405's rows. Columns: what happened ->
+    (reason in this process, reason after a restart)."""
+
+    @pytest.mark.parametrize(
+        ("setup", "here", "after_restart"),
+        [
+            pytest.param(_row_run_started_fails, "state_unwritable", None, id="run_started-unwritable"),
+            pytest.param(_row_violation_written, "tool_use_violation", "tool_use_violation", id="violation-written"),
+            pytest.param(_row_nothing_writable, "state_unwritable", "run_unfinished", id="violation-and-finish-unwritable"),
+            pytest.param(_row_finish_transient, "run_finish_pending", "run_unfinished", id="finish-pending-then-restart"),
+        ],
+    )
+    async def test_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setup: Any, here: str, after_restart: str | None
+    ) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        setup(backend, monkeypatch)
+        try:
+            await backend.chat_completions(REQUEST)
+        except (CodexToolUseViolation, CodexNotVerifiedError):
+            pass
+        if here == "state_unwritable" and after_restart is None:
+            # The request itself was refused before any run; the gate is fine.
+            monkeypatch.undo()
+            assert backend.state_store.runs() == []
+            assert await _reason(backend) is None
+        else:
+            assert await _reason(backend) == here
+            monkeypatch.undo()
+            await backend.close()
+            assert await _reason(_restart(tmp_path, backend)) == after_restart
+
+    async def test_row_crash_mid_run(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        backend.state_store.record_run_started("codex", "dead-instance")
+        assert await _reason(_restart(tmp_path, backend)) == "run_unfinished"

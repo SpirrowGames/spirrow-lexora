@@ -337,6 +337,18 @@ class TestClearViolationCli:
         with pytest.raises(ClearViolationError):
             vc.clear_violation(backend.state_store, v.id, "again")
 
+    def test_clear_unfinished_run_by_its_id(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """msg-403 D-1e'-6: the same command clears an unpaired run_started."""
+        cfg = self._config(tmp_path)
+        backend = vc._load_backend(str(cfg), None)
+        record_pass(backend, VERSION)
+        run_seq = backend.state_store.record_run_started("codex", "dead-instance")
+        assert vc.main(["--config", str(cfg), "--clear-violation", str(run_seq)]) == 2
+        assert vc.main(["--config", str(cfg), "--clear-violation", str(run_seq), "--reason", "restart mid-run"]) == 0
+        assert f"cleared run {run_seq}" in capsys.readouterr().out
+        assert backend.state_store.unfinished_runs() == []
+        assert vc.main(["--config", str(cfg), "--clear-violation", "9999", "--reason", "x"]) == 2
+
 
 # --------------------------------------------------------------------------
 # V-1 evaluation

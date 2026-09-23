@@ -70,6 +70,16 @@ from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+#: Random per process start; written into every ``run_started`` row so an
+#: operator can tell which process left an unfinished run (msg-403).
+INSTANCE_ID = uuid.uuid4().hex
+
+#: Backoff ceiling for re-writing a ``run_finished`` (msg-405 D-1e'-2'.3).
+FINISH_RETRY_MAX_S = 30.0
+#: A ``run_finished`` still pending after this long is logged as WARNING
+#: (msg-405 D-1e'-2'.7).
+FINISH_PENDING_WARN_S = 60.0
+
 #: Bumped whenever ``_build_exec_argv`` / ``_wrap`` / ``build_env`` change
 #: shape, so a code change to the command closes the gate like a config
 #: change does.
@@ -144,8 +154,14 @@ class CodexNotVerifiedError(CodexError):
     ``reason`` is one of ``verification_missing`` (no record, the latest
     record is not ``pass``, or the pass predates the latest clearance),
     ``verification_stale`` (CLI version or config hash changed since the
-    pass), ``tool_use_violation`` (an uncleared runtime violation exists) or
-    ``state_unreadable`` (the state DB could not be read; fail-closed).
+    pass), ``tool_use_violation`` (an uncleared runtime violation exists),
+    ``state_unreadable`` (the state DB could not be read; fail-closed),
+    ``state_unwritable`` (``run_started`` could not be written, so codex was
+    not started -- or, for the rest of the process, a latch write failed),
+    ``run_unfinished`` (a ``run_started`` with no ``run_finished``: human
+    clearance needed) or ``run_finish_pending`` (the only unpaired runs are
+    ones this process knows ended normally and is still re-writing; opens by
+    itself once written). D-1e', msg-403/405.
     """
 
     def __init__(self, message: str, reason: str) -> None:
@@ -621,6 +637,15 @@ class CodexBackend(Backend):
         self.timeout = timeout
         self.name = name
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        # D-1e' in-process state (msg-403/405). None of it can OPEN the gate:
+        # ``_in_flight`` only excuses this process's own running runs from
+        # condition 0, ``_finish_pending`` only chooses the closed reason,
+        # ``_poisoned`` only closes.
+        self._in_flight: set[int] = set()
+        self._finish_pending: dict[int, float] = {}
+        self._finish_warned: set[int] = set()
+        self._finish_retry_task: asyncio.Task[None] | None = None
+        self._poisoned: str | None = None
 
     # ---- configuration identity -------------------------------------
 
@@ -725,10 +750,23 @@ class CodexBackend(Backend):
            ``AUTOINCREMENT`` seq, never a clock or an in-memory counter.
         3. Its config hash and ``codex --version`` equal the current ones.
 
+        Before them (D-1e', msg-403/405): a latch write that failed in this
+        process closes it for good (``state_unwritable``); pending
+        ``run_finished`` writes are retried once; then condition 0 -- any
+        ``run_started`` newer than the latest clearance, without a
+        ``run_finished``, and not running in this process, closes the gate
+        (``run_finish_pending`` if every such run is one this process is
+        still re-writing, else ``run_unfinished``).
+
         A state DB that cannot be read closes the gate (``state_unreadable``);
         it is never treated as "no violations".
         """
+        if self._poisoned is not None:
+            raise CodexNotVerifiedError(self._poisoned, reason="state_unwritable")
+        if self._finish_pending:
+            self._flush_finish_pending()
         try:
+            unfinished = self.state_store.unfinished_runs()
             uncleared = self.state_store.uncleared_violations()
             record = self.state_store.latest_verification(self.name)
             threshold = self.state_store.clearance_threshold()
@@ -736,6 +774,9 @@ class CodexBackend(Backend):
             raise CodexNotVerifiedError(
                 f"codex state DB unreadable ({exc}); gate closed", reason="state_unreadable"
             ) from exc
+        # Condition 0 and condition 1 both close; when both hold, the violation
+        # is reported (it is the specific diagnosis, and its clearance also
+        # covers the latched run's unpaired run_started).
         if uncleared:
             ids = ", ".join(str(v.id) for v in uncleared)
             raise CodexNotVerifiedError(
@@ -743,6 +784,22 @@ class CodexBackend(Backend):
                 f"a human must investigate and run `verify_codex --clear-violation <id> "
                 f"--reason ...`, then verify_codex must pass again",
                 reason="tool_use_violation",
+            )
+        unpaired = [r for r in unfinished if r.seq not in self._in_flight]
+        if unpaired:
+            ids = ", ".join(str(r.id) for r in unpaired)
+            if all(r.seq in self._finish_pending for r in unpaired):
+                raise CodexNotVerifiedError(
+                    f"codex run(s) [{ids}] ended normally but run_finished is not written yet; "
+                    f"retrying, the gate reopens by itself once written",
+                    reason="run_finish_pending",
+                )
+            raise CodexNotVerifiedError(
+                f"codex run(s) [{ids}] started but never finished normally (crash, restart, or an "
+                f"unwritable latch); a human must investigate and run `verify_codex "
+                f"--clear-violation <id> --reason ...` (for a latched run, clearing its "
+                f"violation is enough), then verify_codex must pass again",
+                reason="run_unfinished",
             )
         if record is None or record.result != "pass":
             raise CodexNotVerifiedError(
@@ -874,52 +931,151 @@ class CodexBackend(Backend):
         timeout / cancellation is re-raised after the latch is written. A
         launch failure from the spawn (``CodexLaunchError``) and a
         cancellation before the spawn never latch: codex did not run.
+
+        Write-ahead (D-1e', msg-403/405): ``run_started`` is written before
+        ``_execute``; if that write fails, codex is not started
+        (``state_unwritable``). ``run_finished`` is written only for a
+        non-latching outcome (clean verdict, quota / launch / classified
+        failure, spawn failure, cancellation before the spawn). A latching
+        outcome writes only the violation; any other exception after the
+        spawn writes nothing -- in both cases the unpaired ``run_started``
+        keeps the gate closed (condition 0). If the violation write fails,
+        this process's gate is also poisoned (``state_unwritable``).
         """
         version = await self._ensure_verified()
-        progress = ExecProgress()
-        run: CodexRun | None = None
-        latch: list[str] | None
-        pending: BaseException | None
         try:
-            run, findings = await self._execute(prompt, model, progress=progress)
-        except CodexTimeout as exc:
-            latch, pending = ["aborted:timeout"], exc
-        except asyncio.CancelledError as exc:
-            if not progress.spawned:
+            run_seq = self.state_store.record_run_started(self.name, INSTANCE_ID)
+        except sqlite3.Error as exc:
+            raise CodexNotVerifiedError(
+                f"codex run_started could not be written ({exc}); codex not started",
+                reason="state_unwritable",
+            ) from exc
+        self._in_flight.add(run_seq)
+        try:
+            progress = ExecProgress()
+            run: CodexRun | None = None
+            latch: list[str] | None
+            pending: BaseException | None
+            try:
+                run, findings = await self._execute(prompt, model, progress=progress)
+            except CodexTimeout as exc:
+                latch, pending = ["aborted:timeout"], exc
+            except asyncio.CancelledError as exc:
+                if not progress.spawned:
+                    self._finish_run(run_seq)
+                    raise
+                latch, pending = ["aborted:cancelled"], exc
+            except CodexLaunchError:
+                self._finish_run(run_seq)  # the spawn itself failed: codex never ran
                 raise
-            latch, pending = ["aborted:cancelled"], exc
-        else:
-            latch, pending = run_verdict(run, findings)
-        if latch is not None:
-            detail = json.dumps(latch)
-            violation = self.state_store.record_violation(
-                self.name, detail, codex_version=version, config_hash=self.config_hash()
-            )
-            logger.error(
-                "codex_tool_use_violation", backend=self.name, events=detail, violation_id=violation.id
-            )
-            if pending is None:
-                message = (
-                    f"codex exec ran a tool, emitted an unrecognised event, or left a stream that "
-                    f"cannot show it did not ({detail}); answer discarded, codex disabled "
-                    f"(violation {violation.id})"
-                )
-                if run is not None and latch[0].startswith("aborted:"):
-                    cause = None if latch == ["aborted:signal"] else classify_failure(
-                        run.returncode, run.stderr, run.events
+            except BaseException:
+                if not progress.spawned:
+                    self._finish_run(run_seq)
+                raise  # after the spawn: run_started stays unpaired (condition 0)
+            else:
+                latch, pending = run_verdict(run, findings)
+            if latch is not None:
+                detail = json.dumps(latch)
+                violation_note: str
+                try:
+                    violation = self.state_store.record_violation(
+                        self.name, detail, codex_version=version, config_hash=self.config_hash()
                     )
-                    pending = CodexUnverifiableRun(message, cause)
+                except sqlite3.Error as exc:
+                    self._poisoned = (
+                        f"a codex runtime violation ({detail}, run {run_seq}) could not be written "
+                        f"({exc}); codex disabled in this process, and run {run_seq} stays unfinished"
+                    )
+                    logger.error(
+                        "codex_latch_write_failed", backend=self.name, events=detail, run_seq=run_seq, error=str(exc)
+                    )
+                    violation_note = f"violation NOT written: {exc}; run {run_seq} left unfinished"
                 else:
-                    pending = CodexToolUseViolation(message)
-            raise pending
-        if pending is not None:
-            raise pending
-        assert run is not None
-        text = run.last_message if run.last_message is not None else last_agent_message(run.events)
-        if text is None:
-            raise CodexFailed("codex exec exited 0 without a final message")
-        prompt_tokens, completion_tokens = usage_from_events(run.events)
-        return text, prompt_tokens, completion_tokens
+                    logger.error(
+                        "codex_tool_use_violation", backend=self.name, events=detail, violation_id=violation.id
+                    )
+                    violation_note = f"violation {violation.id}"
+                if pending is None:
+                    message = (
+                        f"codex exec ran a tool, emitted an unrecognised event, or left a stream that "
+                        f"cannot show it did not ({detail}); answer discarded, codex disabled "
+                        f"({violation_note})"
+                    )
+                    if run is not None and latch[0].startswith("aborted:"):
+                        cause = None if latch == ["aborted:signal"] else classify_failure(
+                            run.returncode, run.stderr, run.events
+                        )
+                        pending = CodexUnverifiableRun(message, cause)
+                    else:
+                        pending = CodexToolUseViolation(message)
+                raise pending
+            self._finish_run(run_seq)
+            if pending is not None:
+                raise pending
+            assert run is not None
+            text = run.last_message if run.last_message is not None else last_agent_message(run.events)
+            if text is None:
+                raise CodexFailed("codex exec exited 0 without a final message")
+            prompt_tokens, completion_tokens = usage_from_events(run.events)
+            return text, prompt_tokens, completion_tokens
+        finally:
+            self._in_flight.discard(run_seq)
+
+    # ---- run_finished write + self-recovery (msg-405 D-1e'-2') ----------
+
+    def _finish_run(self, run_seq: int) -> None:
+        """Write ``run_finished`` for a NON-latching outcome. On failure the
+        run is queued for re-writing: the gate stays closed
+        (``run_finish_pending``) until it is written, then opens by itself.
+        Latching outcomes never come here (msg-405 D-1e'-2'.5)."""
+        try:
+            self.state_store.record_run_finished(self.name, run_seq)
+        except sqlite3.Error as exc:
+            self._finish_pending.setdefault(run_seq, time.monotonic())
+            logger.warning("codex_run_finish_pending", backend=self.name, run_seq=run_seq, error=str(exc))
+            self._ensure_finish_retry()
+
+    def _flush_finish_pending(self) -> None:
+        """One write attempt per pending ``run_finished``."""
+        now = time.monotonic()
+        for run_seq, since in list(self._finish_pending.items()):
+            try:
+                self.state_store.record_run_finished(self.name, run_seq)
+            except sqlite3.Error as exc:
+                if now - since > FINISH_PENDING_WARN_S and run_seq not in self._finish_warned:
+                    self._finish_warned.add(run_seq)
+                    logger.warning(
+                        "codex_run_finish_pending_long",
+                        backend=self.name,
+                        run_seq=run_seq,
+                        pending_s=round(now - since),
+                        error=str(exc),
+                    )
+            else:
+                del self._finish_pending[run_seq]
+                self._finish_warned.discard(run_seq)
+                logger.info("codex_run_finish_recovered", backend=self.name, run_seq=run_seq)
+
+    def _ensure_finish_retry(self) -> None:
+        if self._finish_retry_task is not None and not self._finish_retry_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop: the next _ensure_verified() retries instead
+        self._finish_retry_task = loop.create_task(self._finish_retry_loop())
+
+    async def _finish_retry_loop(self) -> None:
+        delay = 1.0
+        while self._finish_pending:
+            await asyncio.sleep(delay)
+            self._flush_finish_pending()
+            delay = min(delay * 2, FINISH_RETRY_MAX_S)
+
+    def finish_pending_count(self) -> int:
+        """Runs whose ``run_finished`` is still being re-written (msg-405
+        D-1e'-2'.7 -- for a status surface)."""
+        return len(self._finish_pending)
 
     def control_clone(self, codex_home: str) -> CodexBackend:
         """A copy for V-2'-control: dummy ``CODEX_HOME``, tool-disabling overrides removed.
@@ -1037,4 +1193,13 @@ class CodexBackend(Backend):
         return process.returncode == 0
 
     async def close(self) -> None:
-        return None
+        """Stops the run_finished retry task. Anything still pending stays
+        unpaired in the DB, so the gate stays closed after a restart
+        (msg-405 D-1e'-2'.6)."""
+        task = self._finish_retry_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass

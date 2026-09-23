@@ -48,9 +48,11 @@ Nothing here writes a runtime violation (msg-319): the control executes tools
 on purpose, and a tool executed under the production config is recorded as a
 ``fail`` verification (``tool_executed_under_prod_config``).
 
-``--clear-violation ID --reason TEXT`` clears one runtime violation (a human
-act, non-empty reason required). It never opens the gate on its own: a
-``pass`` recorded afterwards is still required (msg-317).
+``--clear-violation ID --reason TEXT`` clears one runtime violation -- or,
+when ID is not a violation, one unfinished run (a ``run_started`` with no
+``run_finished``, msg-403 D-1e'-6) -- a human act, non-empty reason
+required. It never opens the gate on its own: a ``pass`` recorded afterwards
+is still required (msg-317).
 
 **V-2'/tool_stderr_isolated (msg-396, measured on the control run).** The
 D-1d-3' exemption (a no-terminal run that the classifier reads as quota is
@@ -104,7 +106,12 @@ from lexora.backends.codex import (
     _error_text,
     is_terminal_event,
 )
-from lexora.backends.codex_verification import ClearViolationError, CodexStateStore, ViolationRecord
+from lexora.backends.codex_verification import (
+    ClearViolationError,
+    CodexStateStore,
+    RunRecord,
+    ViolationRecord,
+)
 
 #: Timeout for the V-2' ``codex exec`` run (the mock answers instantly).
 V2_TIMEOUT_S = 120.0
@@ -855,10 +862,14 @@ def _load_backend(config: str | None, backend_name: str | None) -> CodexBackend:
     return backend
 
 
-def clear_violation(store: CodexStateStore, violation_id: int, reason: str) -> ViolationRecord:
-    """Human release of one runtime violation (msg-317). Does not open the
-    gate by itself: a ``pass`` recorded after this is still required."""
-    return store.clear_violation(violation_id, reason)
+def clear_violation(store: CodexStateStore, violation_id: int, reason: str) -> ViolationRecord | RunRecord:
+    """Human release of one runtime violation (msg-317) or of one unfinished
+    run (``run_started`` with no ``run_finished``, msg-403 D-1e'-6). The id
+    is looked up as a violation first, then as a run. Does not open the gate
+    by itself: a ``pass`` recorded after this is still required."""
+    if any(v.seq == violation_id for v in store.violations()):
+        return store.clear_violation(violation_id, reason)
+    return store.clear_unfinished_run(violation_id, reason)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -867,7 +878,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--backend", help="name of the codex backend (required if several)")
     parser.add_argument("--wire-api", choices=("responses", "chat"), default="responses")
     parser.add_argument("--hidden", action="append", default=[], help="extra path that must be invisible (repeatable)")
-    parser.add_argument("--clear-violation", type=int, metavar="ID", help="clear one runtime violation, then exit")
+    parser.add_argument("--clear-violation", type=int, metavar="ID", help="clear one runtime violation or unfinished run, then exit")
     parser.add_argument("--reason", help="required with --clear-violation: why V-2' missed it")
     args = parser.parse_args(argv)
     backend = _load_backend(args.config, args.backend)
@@ -877,7 +888,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ClearViolationError as exc:
             print(f"refused: {exc}", file=sys.stderr)
             return 2
-        print(f"cleared violation {cleared.id} at {cleared.cleared_at}; run verify_codex again to reopen the gate")
+        kind = "run" if isinstance(cleared, RunRecord) else "violation"
+        print(f"cleared {kind} {cleared.id} at {cleared.cleared_at}; run verify_codex again to reopen the gate")
         return 0
     result, checks = asyncio.run(verify(backend, args.wire_api, args.hidden))
     for check in checks:
