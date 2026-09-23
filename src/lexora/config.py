@@ -758,9 +758,14 @@ def _apply_frontier_model_override(
 
 
 def create_settings(config_path: Path | None = None) -> Settings:
-    """Create settings from YAML config and environment variables.
+    """Create settings from the YAML config.
 
-    Environment variables take precedence over YAML config.
+    Each section's values are built from YAML and passed to ``Settings``
+    as init arguments, which take precedence over the environment, so
+    nested env variables (``LEXORA_<SECTION>__*``) have no effect here.
+    The only env overrides are specifically named variables such as
+    ``LEXORA_FRONTIER_MODEL``. (Bohr msg-390 v4; docstring corrected to
+    the actual behaviour, the loader itself is unchanged.)
 
     Args:
         config_path: Optional path to YAML config file.

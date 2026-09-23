@@ -125,7 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Decision-endpoint startup check (msg-239 / msg-240):
     #
     # This runs before the app object is even built. A config that
-    # names ``jev`` for ``primary`` or ``fallback`` while
+    # names ``primary = "jev"`` while
     # ``TYPESAFE_API_KEY`` is unset does not produce a partially-
     # constructed FastAPI application — it raises during ``create_app``
     # so uvicorn refuses to bind the port, which under
