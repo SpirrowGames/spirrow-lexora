@@ -5,9 +5,13 @@ Both read sites (``_to_openai_response`` and the streaming loop) now read
 counts they already read. What is fixed here:
 
 - the OpenAI-facing ``usage`` keeps ``completion_tokens`` =
-  ``candidatesTokenCount`` (thinking EXCLUDED). mindwire's
-  ``naysayer/preflight.py`` probes with ``max_tokens=16`` and gets back a
-  thinking-exhausted answer as ``completion_tokens=0``; that must stay 0;
+  ``candidatesTokenCount`` (thinking EXCLUDED), so the ledger's
+  ``tokens_output`` (read from ``completion_tokens``) and ``tokens_thinking``
+  (read from ``lexora_thinking_tokens``) do not bill thinking twice
+  (rationale corrected in msg-455; mindwire's preflight does not read usage);
+- ``total_tokens`` is Gemini's ``totalTokenCount`` passed through, thinking
+  INCLUDED, so it may exceed ``prompt_tokens + completion_tokens`` by
+  exactly the thinking count (msg-455 (a), a known deviation);
 - there is NO ``completion_tokens_details``: OpenAI defines its
   ``reasoning_tokens`` as a part of ``completion_tokens``, and here it would
   exceed it. Thinking rides ``usage.lexora_thinking_tokens`` instead;
@@ -159,3 +163,24 @@ class TestTheTwoReadSitesDoNotDrift:
             usage["lexora_thinking_tokens"],
             usage["prompt_tokens_details"]["cached_tokens"],
         )
+
+
+def test_total_tokens_passes_through_billed_total_including_thinking() -> None:
+    """msg-455 (a): ``total_tokens`` is the billed total, not recomputed.
+
+    With thinking present, ``total_tokens`` stays Gemini's
+    ``totalTokenCount`` (19) and is NOT ``prompt + completion`` (3); the gap
+    is exactly ``lexora_thinking_tokens``.
+    """
+    md = _metadata(prompt=3, candidates=0, thoughts=16, cached=None)
+    md["totalTokenCount"] = 19
+    usage = _non_streaming(md)["usage"]
+
+    assert usage["total_tokens"] == 19
+    assert usage["prompt_tokens"] == 3
+    assert usage["completion_tokens"] == 0
+    assert usage["lexora_thinking_tokens"] == 16
+    assert (
+        usage["total_tokens"] - usage["prompt_tokens"] - usage["completion_tokens"]
+        == usage["lexora_thinking_tokens"]
+    )
