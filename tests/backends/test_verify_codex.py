@@ -74,7 +74,12 @@ class TestFixtures:
             await backend.chat_completions(REQUEST)
         result, checks = await vc.verify(backend)
         assert result == "pass", [c for c in checks if not c.ok]
-        assert {"V-2c/tool_executed_under_control", "V-2/0c_refusal_evidence", "V-2/2_no_tool_events"} <= _names(checks, True)
+        assert {
+            "V-2c/tool_executed_under_control",
+            "V-2c/tool_execution_events_present",
+            "V-2/0c_refusal_evidence",
+            "V-2/2_no_tool_events",
+        } <= _names(checks, True)
         backend._scenario = "ok"  # type: ignore[attr-defined]
         response = await backend.chat_completions(REQUEST)
         assert response["choices"][0]["message"]["content"].startswith("REVIEW: ")
@@ -113,7 +118,7 @@ class TestFixtures:
         backend = v2_backend(tmp_path, "wrong_names")
         result, checks = await vc.verify(backend)
         assert result == "fail"
-        assert "V-2c/tool_executed_under_control" in _names(checks, False)
+        assert {"V-2c/tool_executed_under_control", "V-2c/tool_execution_events_present"} <= _names(checks, False)
         assert "V-2/not_run_control_failed" in _names(checks, False)
         assert not any(c.name.startswith("V-2/0c") for c in checks)
         assert "control_tool_not_executed" in _note(backend)["fail_reasons"]

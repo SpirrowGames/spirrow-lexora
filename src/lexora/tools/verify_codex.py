@@ -557,18 +557,25 @@ def _terminated_normally(events: Sequence[dict[str, Any]], returncode: int | Non
     return (not crashed and terminal), detail
 
 
-def evaluate_control(state: MockState, canary_value: str) -> list[Check]:
-    """V-2'-control verdict: the tools must ACTUALLY have run (msg-315 #3).
+def evaluate_control(state: MockState, findings: EventFindings, canary_value: str) -> list[Check]:
+    """V-2'-control verdict: the tools must ACTUALLY have run.
 
-    Positive evidence only: the canary value, which exists solely in the
-    dummy CODEX_HOME, came back to the mock in a later request. A CLI that
-    refused, did not know the tool names, never connected or crashed all
-    fail here -- and then the production-config result is not looked at.
+    Positive evidence only, two kinds, both required: the canary value --
+    which exists solely in the dummy CODEX_HOME -- came back to the mock in
+    a later request (msg-315 #3), and the side-effect-free ``findings`` show
+    tool-execution events (msg-319: "ツールの実行がある"). A CLI that refused,
+    did not know the tool names, never connected or crashed fails here, and
+    then the production-config result is not looked at.
     """
     later = state.requests[1:] if state.requests else []
     executed = state.tool_calls_sent and any(canary_value in raw for raw in later)
     names = sorted({t.name for t in state.tools})
     return [
+        Check(
+            "V-2c/tool_execution_events_present",
+            bool(findings.executions),
+            f"{len(findings.executions)} execution events",
+        ),
         Check("V-2c/0a_nonce_request_received", state.nonce_seen),
         Check("V-2c/0b_tool_calls_sent", state.tool_calls_sent, f"tools={names}"),
         Check(
@@ -673,8 +680,8 @@ async def run_v2_control(backend: CodexBackend, wire_api: str = "responses") -> 
             return tools, calls_for(tools, canary_posix)
 
         state = MockState(nonce=nonce, planner=plan)
-        _, _, error = await _drive(backend.control_clone(dummy_home), state, wire_api)
-        checks = evaluate_control(state, canary_value)
+        _, findings, error = await _drive(backend.control_clone(dummy_home), state, wire_api)
+        checks = evaluate_control(state, findings, canary_value)
         if error:
             checks.append(Check("V-2c/cli_run", False, error))
         return checks, list(state.tools)
