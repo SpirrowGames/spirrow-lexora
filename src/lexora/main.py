@@ -1,5 +1,6 @@
 """Main FastAPI application entry point."""
 
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -13,8 +14,12 @@ from lexora.api.routes import router
 from lexora.backends.base import ModelNotFoundError
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import create_settings, Settings
-from lexora.decide.config import check_typesafe_api_key
-from lexora.decide.log import DecisionLog
+from lexora.decide.config import (
+    TYPESAFE_API_KEY_ENV,
+    check_typesafe_api_key,
+    references_jev,
+)
+from lexora.decide.log import DecisionLog, apply_decision_log_migrations
 from lexora.decide.routes import build_default_providers, router as decide_router
 from lexora.services.metrics import MetricsCollector
 from lexora.services.model_registry import ModelRegistry
@@ -149,7 +154,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ships only NullProvider (msg-246), but the mount point does not
     # need to change when llm / jev arrive in follow-up PRs.
     app.state.decision_settings = settings.decision
-    app.state.decision_providers = build_default_providers()
+    # Startup order (Bohr msg-266): env check (above) → migration →
+    # DecisionLog → providers. The API key is read from the env exactly
+    # once, here, and only when the config references Jev; it is handed
+    # straight to the provider registry and not kept on app.state or
+    # settings (msg-240 §1 / msg-258 §2).
+    #
+    # apply_decision_log_migrations is the sole schema owner for a
+    # file-backed log and is race-safe across uvicorn workers
+    # (BEGIN IMMEDIATE, Einstein msg-259 #1); for ``:memory:`` it is a
+    # no-op and DecisionLog applies the schema on its own connection.
+    apply_decision_log_migrations(settings.decision.log_path)
     # On-disk by default (msg-251 blocking objection): the shadow-mode
     # data-collection story msg-237 requires — "較正曲線とリプレイ評価
     # はここから引く" / "mindwire の 116 判断点リプレイもこの
@@ -160,6 +175,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ``:memory:``. The parent directory is created by DecisionLog
     # itself.
     app.state.decision_log = DecisionLog(path=settings.decision.log_path)
+    app.state.decision_providers = build_default_providers(
+        os.environ.get(TYPESAFE_API_KEY_ENV) if references_jev(settings.decision) else None,
+        timeout_ms=settings.decision.timeout_ms,
+    )
 
     # Include API routes
     app.include_router(router)
