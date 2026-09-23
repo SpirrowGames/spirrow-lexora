@@ -33,14 +33,17 @@ from lexora.backends.codex import (
     CodexTimeout,
     CodexToolUseViolation,
     CodexUnsupportedInputError,
+    CodexUnverifiableRun,
     EventFindings,
     build_env,
     classify_events,
     classify_failure,
     parse_reset_at,
     request_to_prompt,
+    run_verdict,
     usage_from_events,
 )
+from lexora.backends.codex import CodexRun
 from lexora.backends.codex_verification import ClearViolationError, CodexStateStore
 from lexora.backends.factory import create_backend
 from lexora.config import BackendSettings, CodexSettings
@@ -448,17 +451,15 @@ class TestClassification:
         delta = exc.value.reset_at - before
         assert timedelta(hours=2, minutes=4) < delta < timedelta(hours=2, minutes=6)
 
-    async def test_auth(self, tmp_path: Path) -> None:
+    async def test_auth_without_terminal_event_latches(self, tmp_path: Path) -> None:
+        """msg-396 D-1d-3': auth is not an exemption; the classification is
+        kept in the detail and on the exception."""
         backend = make_backend(tmp_path, "auth")
         record_pass(backend)
-        with pytest.raises(CodexAuthError):
+        with pytest.raises(CodexUnverifiableRun) as exc:
             await backend.chat_completions(REQUEST)
-
-    async def test_timeout_kills_the_process(self, tmp_path: Path) -> None:
-        backend = make_backend(tmp_path, "sleep", timeout=1.0)
-        record_pass(backend)
-        with pytest.raises(CodexTimeout):
-            await backend.chat_completions(REQUEST)
+        assert isinstance(exc.value.cause, CodexAuthError)
+        assert backend.state_store.uncleared_violations()[0].detail == '["aborted:no_terminal:auth"]'
 
     async def test_launch_failure(self, tmp_path: Path) -> None:
         backend = make_backend(tmp_path)
@@ -494,6 +495,170 @@ class TestClassification:
             {"type": "turn.completed", "usage": {"input_tokens": 9, "output_tokens": 2}},
         ]
         assert usage_from_events(events) == (9, 2)
+
+
+# --------------------------------------------------------------------------
+# D-1d: runs that cannot show no tool ran (msg-394 / msg-396)
+# --------------------------------------------------------------------------
+
+
+def _ticks(backend: CodexBackend) -> int:
+    path = Path(backend.codex_home) / "ticks"
+    return path.stat().st_size if path.exists() else 0
+
+
+async def _until_ticking(backend: CodexBackend) -> None:
+    for _ in range(200):
+        if _ticks(backend) > 0:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("fake codex never started")
+
+
+async def _assert_dead(backend: CodexBackend) -> None:
+    before = _ticks(backend)
+    await asyncio.sleep(0.5)
+    assert _ticks(backend) == before, "codex process still running after the call returned"
+
+
+def _detail(backend: CodexBackend) -> list[str]:
+    return [v.detail for v in backend.state_store.uncleared_violations()]
+
+
+class TestUnverifiableRuns:
+    async def test_timeout_latches_kills_and_closes_the_gate(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "sleep", timeout=1.0)
+        record_pass(backend)
+        with pytest.raises(CodexTimeout):
+            await backend.chat_completions(REQUEST)
+        assert _detail(backend) == ['["aborted:timeout"]']
+        await _assert_dead(backend)
+        backend._scenario = "ok"  # type: ignore[attr-defined]
+        with pytest.raises(CodexNotVerifiedError) as exc:
+            await backend.chat_completions(REQUEST)
+        assert exc.value.reason == "tool_use_violation"
+
+    async def test_cancellation_latches_and_leaves_no_child(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "sleep", timeout=30.0)
+        record_pass(backend)
+        task = asyncio.create_task(backend.chat_completions(REQUEST))
+        await _until_ticking(backend)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert _detail(backend) == ['["aborted:cancelled"]']
+        await _assert_dead(backend)
+
+    async def test_cancellation_while_queued_does_not_latch(self, tmp_path: Path) -> None:
+        """codex never ran (waiting on the semaphore) -> nothing to latch."""
+        backend = make_backend(tmp_path, "ok")
+        record_pass(backend)
+        backend._semaphore = asyncio.Semaphore(0)
+        task = asyncio.create_task(backend.chat_completions(REQUEST))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert backend.state_store.uncleared_violations() == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal exit status")
+    async def test_signal_death_latches(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "signal")
+        record_pass(backend)
+        with pytest.raises(CodexUnverifiableRun) as exc:
+            await backend.chat_completions(REQUEST)
+        assert exc.value.cause is None
+        assert _detail(backend) == ['["aborted:signal"]']
+
+    async def test_exit0_without_terminal_event_latches(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "exit0_no_terminal")
+        record_pass(backend)
+        with pytest.raises(CodexUnverifiableRun):
+            await backend.chat_completions(REQUEST)
+        assert _detail(backend) == ['["aborted:no_terminal:failed"]']
+
+    async def test_quota_without_terminal_or_tool_does_not_latch(self, tmp_path: Path) -> None:
+        """The fallback's reset-wait must keep working (msg-267 scope 2)."""
+        backend = make_backend(tmp_path, "quota")
+        record_pass(backend)
+        with pytest.raises(CodexQuotaError):
+            await backend.chat_completions(REQUEST)
+        assert backend.state_store.uncleared_violations() == []
+
+    async def test_quota_with_tool_event_latches(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "quota_with_tool")
+        record_pass(backend)
+        with pytest.raises(CodexToolUseViolation):
+            await backend.chat_completions(REQUEST)
+        assert _detail(backend) == ['["command_execution"]']
+
+    async def test_launch_failure_without_events_does_not_latch(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "launch_no_events")
+        record_pass(backend)
+        with pytest.raises(CodexLaunchError):
+            await backend.chat_completions(REQUEST)
+        assert backend.state_store.uncleared_violations() == []
+
+    async def test_launch_failure_with_events_latches(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "launch_with_events")
+        record_pass(backend)
+        with pytest.raises(CodexUnverifiableRun) as exc:
+            await backend.chat_completions(REQUEST)
+        assert isinstance(exc.value.cause, CodexLaunchError)
+        assert _detail(backend) == ['["aborted:no_terminal:launch"]']
+
+    async def test_spawn_failure_does_not_latch(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        backend._wrap = lambda inner, workdir: [str(tmp_path / "no-such-bwrap")]  # type: ignore[method-assign]
+        with pytest.raises(CodexLaunchError):
+            await backend.chat_completions(REQUEST)
+        assert backend.state_store.uncleared_violations() == []
+
+
+def _run(rc: int | None, stderr: str = "", events: list[dict[str, Any]] | None = None) -> CodexRun:
+    return CodexRun(returncode=rc, stdout="", stderr=stderr, events=events or [])
+
+
+TERMINAL = {"type": "turn.completed", "usage": {}}
+STARTED = {"type": "turn.started"}
+TOOL = {"type": "item.started", "item": {"type": "command_execution"}}
+QUOTA = "ERROR: You've hit your usage limit."
+
+
+class TestRunVerdict:
+    """Pure table of msg-396 D-1d-3' (first match wins)."""
+
+    @pytest.mark.parametrize(
+        ("run", "latch", "error"),
+        [
+            # 1. tool event -> latch, however it ended
+            (_run(0, "", [TOOL, TERMINAL]), ["command_execution"], None),
+            (_run(1, QUOTA, [TOOL]), ["command_execution"], None),
+            (_run(-9, "", [TOOL]), ["command_execution"], None),
+            # 2. signal
+            (_run(-9, QUOTA, [TERMINAL]), ["aborted:signal"], None),
+            (_run(-15), ["aborted:signal"], None),
+            # 3. no terminal event
+            (_run(0, "", [STARTED]), ["aborted:no_terminal:failed"], None),
+            (_run(0, QUOTA, [STARTED]), ["aborted:no_terminal:quota"], None),  # exit 0 never exempt
+            (_run(0, "bwrap: x"), ["aborted:no_terminal:launch"], None),
+            (_run(1, QUOTA, [STARTED]), None, CodexQuotaError),
+            (_run(1, QUOTA), None, CodexQuotaError),
+            (_run(1, "bwrap: Can't find source path"), None, CodexLaunchError),
+            (_run(1, "bwrap: Can't find source path", [STARTED]), ["aborted:no_terminal:launch"], None),
+            (_run(1, "Not logged in", [STARTED]), ["aborted:no_terminal:auth"], None),
+            (_run(1, "boom"), ["aborted:no_terminal:failed"], None),
+            # 4. terminal present
+            (_run(0, "", [TERMINAL]), None, None),
+            (_run(1, "", [{"type": "turn.failed", "error": {"message": QUOTA}}]), None, CodexQuotaError),
+            (_run(1, "Not logged in", [TERMINAL]), None, CodexAuthError),
+        ],
+    )
+    def test_table(self, run: CodexRun, latch: list[str] | None, error: type | None) -> None:
+        got_latch, got_error = run_verdict(run, classify_events(run.events))
+        assert got_latch == latch
+        assert (type(got_error) if got_error is not None else None) is error
 
 
 # --------------------------------------------------------------------------

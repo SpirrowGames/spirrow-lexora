@@ -28,6 +28,16 @@ Safety structure, in the order a request meets it:
    ``CodexToolUseViolation``. Only ``_run_gated`` writes the latch. Release:
    a human clears each violation with ``verify_codex --clear-violation``,
    THEN ``verify_codex`` must pass again (msg-317).
+5. **Unverifiable runs (D-1d, msg-394/396)** -- a run whose ``--json``
+   stream was cut short cannot show that no tool ran, so it latches too:
+   timeout (``aborted:timeout``), cancellation after the spawn
+   (``aborted:cancelled``), death by signal (``aborted:signal``) and a
+   stream with no terminal event (``aborted:no_terminal:<class>``). The only
+   no-terminal runs that do NOT latch are a usage-window exhaustion or a
+   sandbox launch failure with a non-zero exit and no tool/UNKNOWN event (a
+   launch failure additionally with no event at all) -- see
+   ``run_verdict``. ``_execute`` kills the process on ANY exception,
+   cancellation included, so no orphan keeps running tools.
 
 Wire-format facts marked **ASSUMED** below (event names, error wording) were
 not measured: no Codex login exists yet (msg-269). They are to be re-verified
@@ -145,6 +155,18 @@ class CodexNotVerifiedError(CodexError):
 
 class CodexToolUseViolation(CodexError):
     """The CLI executed a tool (D-1c). The answer was discarded."""
+
+
+class CodexUnverifiableRun(CodexToolUseViolation):
+    """D-1d: the stream cannot show that no tool ran (signal death, or no
+    terminal event). Latched and handled exactly like
+    ``CodexToolUseViolation`` (msg-394 #4); ``cause`` keeps the class the
+    failure classifier read, for the operator (``None`` for a signal death).
+    """
+
+    def __init__(self, message: str, cause: CodexError | None = None) -> None:
+        super().__init__(message)
+        self.cause = cause
 
 
 class CodexUnsupportedInputError(CodexError):
@@ -436,6 +458,55 @@ def classify_failure(
     return CodexFailed(f"codex exec failed (exit {returncode}): {snippet}")
 
 
+def failure_label(error: CodexError) -> str:
+    """``<class>`` of ``aborted:no_terminal:<class>`` (msg-396)."""
+    if isinstance(error, CodexQuotaError):
+        return "quota"
+    if isinstance(error, CodexLaunchError):
+        return "launch"
+    if isinstance(error, CodexAuthError):
+        return "auth"
+    return "failed"
+
+
+def run_verdict(run: CodexRun, findings: EventFindings) -> tuple[list[str] | None, CodexError | None]:
+    """Pure D-1c / D-1d-3' decision for a run whose process has exited.
+
+    Returns ``(latch_detail, error)``. A non-``None`` ``latch_detail`` means
+    latch a violation with that detail. Otherwise a non-``None`` ``error``
+    is raised without latching. Both ``None``: the run succeeded. Rules,
+    first match wins (msg-396):
+
+    1. A tool or UNKNOWN event -> latch (``findings.kinds()``), however the
+       process ended.
+    2. Killed by a signal (``returncode < 0``) -> latch ``aborted:signal``.
+    3. No terminal event -> latch ``aborted:no_terminal:<class>``, exit 0
+       included, UNLESS all of: the classifier says quota or launch failure;
+       ``returncode != 0``; no tool/UNKNOWN event (guaranteed by rule 1);
+       and, for a launch failure only, no event at all.
+    4. Terminal event present -> a non-zero exit is classified, not latched.
+
+    Timeout and cancellation never reach here (``_execute`` raised them);
+    ``_run_gated`` latches those itself.
+    """
+    if findings.executions_or_unknown:
+        return findings.kinds(), None
+    if run.returncode is not None and run.returncode < 0:
+        return ["aborted:signal"], None
+    if not any(is_terminal_event(e) for e in run.events):
+        error = classify_failure(run.returncode, run.stderr, run.events)
+        exempt = run.returncode != 0 and (
+            isinstance(error, CodexQuotaError)
+            or (isinstance(error, CodexLaunchError) and not run.events)
+        )
+        if exempt:
+            return None, error
+        return [f"aborted:no_terminal:{failure_label(error)}"], None
+    if run.returncode != 0:
+        return None, classify_failure(run.returncode, run.stderr, run.events)
+    return None, None
+
+
 def _content_to_text(content: Any) -> str:
     """Text of an OpenAI message ``content``; refuses non-text blocks."""
     if content is None:
@@ -509,6 +580,13 @@ class CodexRun:
     stderr: str
     events: list[dict[str, Any]] = field(default_factory=list)
     last_message: str | None = None
+
+
+@dataclass
+class ExecProgress:
+    """How far ``_execute`` got; read by ``_run_gated`` on cancellation."""
+
+    spawned: bool = False
 
 
 class CodexBackend(Backend):
@@ -700,11 +778,20 @@ class CodexBackend(Backend):
         model: str,
         extra_overrides: Sequence[str] = (),
         timeout: float | None = None,
+        progress: ExecProgress | None = None,
     ) -> tuple[CodexRun, EventFindings]:
         """Start ``codex exec`` and collect its output. NO side effects.
 
         Launch, timeout and collection only; writes neither the state DB nor
         the latch (msg-319). Called by ``_run_gated`` and ``_run_unverified``.
+
+        D-1d-1 (msg-394): ANY exception while the process runs --
+        ``TimeoutError`` and ``CancelledError`` included -- kills and reaps
+        the process before it propagates, so no orphan keeps running tools.
+        A timeout becomes ``CodexTimeout``; anything else is re-raised as is.
+        ``progress.spawned`` is set just before the spawn is attempted, so
+        the caller can tell "cancelled while queued" (codex never ran) from
+        "cancelled while running".
         """
         workdir = tempfile.mkdtemp(prefix="lexora-codex-")
         last_message_path = str(Path(workdir) / LAST_MESSAGE_FILE)
@@ -712,6 +799,8 @@ class CodexBackend(Backend):
         limit = timeout if timeout is not None else self.timeout
         try:
             async with self._semaphore:
+                if progress is not None:
+                    progress.spawned = True
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *argv,
@@ -728,13 +817,20 @@ class CodexBackend(Backend):
                     stdout_b, stderr_b = await asyncio.wait_for(
                         process.communicate(input=prompt.encode("utf-8")), timeout=limit
                     )
-                except asyncio.TimeoutError as exc:
+                except BaseException as exc:
                     try:
                         process.kill()
                     except ProcessLookupError:
                         pass
-                    await process.wait()
-                    raise CodexTimeout(f"codex exec timed out after {limit}s") from exc
+                    try:
+                        await asyncio.shield(process.wait())
+                    except asyncio.CancelledError:
+                        # Cancelled again while reaping: the kill is already
+                        # sent; the original exception still propagates.
+                        pass
+                    if isinstance(exc, asyncio.TimeoutError):
+                        raise CodexTimeout(f"codex exec timed out after {limit}s") from exc
+                    raise
             stdout = stdout_b.decode("utf-8", errors="replace")
             last_message: str | None = None
             path = Path(last_message_path)
@@ -769,27 +865,56 @@ class CodexBackend(Backend):
         return await self._execute(prompt, model, extra_overrides, timeout)
 
     async def _run_gated(self, prompt: str, model: str) -> tuple[str, int, int]:
-        """The production path: gate -> ``_execute`` -> D-1c latch -> classify.
+        """The production path: gate -> ``_execute`` -> D-1c/D-1d latch -> classify.
 
         The one place that writes a runtime violation (a test greps for it).
-        Executions and UNKNOWN events both trip D-1c (msg-315 #4).
+        Executions and UNKNOWN events both trip D-1c (msg-315 #4). A run cut
+        short (timeout; cancellation after the spawn) or whose stream cannot
+        be trusted (``run_verdict``) latches too (D-1d, msg-394/396); the
+        timeout / cancellation is re-raised after the latch is written. A
+        launch failure from the spawn (``CodexLaunchError``) and a
+        cancellation before the spawn never latch: codex did not run.
         """
         version = await self._ensure_verified()
-        run, findings = await self._execute(prompt, model)
-        if findings.executions_or_unknown:
-            detail = json.dumps(findings.kinds())
+        progress = ExecProgress()
+        run: CodexRun | None = None
+        latch: list[str] | None
+        pending: BaseException | None
+        try:
+            run, findings = await self._execute(prompt, model, progress=progress)
+        except CodexTimeout as exc:
+            latch, pending = ["aborted:timeout"], exc
+        except asyncio.CancelledError as exc:
+            if not progress.spawned:
+                raise
+            latch, pending = ["aborted:cancelled"], exc
+        else:
+            latch, pending = run_verdict(run, findings)
+        if latch is not None:
+            detail = json.dumps(latch)
             violation = self.state_store.record_violation(
                 self.name, detail, codex_version=version, config_hash=self.config_hash()
             )
             logger.error(
                 "codex_tool_use_violation", backend=self.name, events=detail, violation_id=violation.id
             )
-            raise CodexToolUseViolation(
-                f"codex exec ran a tool or emitted an unrecognised event ({detail}); "
-                f"answer discarded, codex disabled (violation {violation.id})"
-            )
-        if run.returncode != 0:
-            raise classify_failure(run.returncode, run.stderr, run.events)
+            if pending is None:
+                message = (
+                    f"codex exec ran a tool, emitted an unrecognised event, or left a stream that "
+                    f"cannot show it did not ({detail}); answer discarded, codex disabled "
+                    f"(violation {violation.id})"
+                )
+                if run is not None and latch[0].startswith("aborted:"):
+                    cause = None if latch == ["aborted:signal"] else classify_failure(
+                        run.returncode, run.stderr, run.events
+                    )
+                    pending = CodexUnverifiableRun(message, cause)
+                else:
+                    pending = CodexToolUseViolation(message)
+            raise pending
+        if pending is not None:
+            raise pending
+        assert run is not None
         text = run.last_message if run.last_message is not None else last_agent_message(run.events)
         if text is None:
             raise CodexFailed("codex exec exited 0 without a final message")

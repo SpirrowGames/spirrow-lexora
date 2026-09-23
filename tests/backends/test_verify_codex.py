@@ -21,6 +21,7 @@ V-1 needs bwrap and Linux, so its evaluation is tested on probe output here.
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -222,6 +223,81 @@ def test_evaluate_v2_without_calls_cannot_pass() -> None:
     state.nonce_seen = state.tool_calls_sent = True
     checks = vc.evaluate_v2(state, EventFindings(), [{"type": "turn.completed"}], 0, "", "C")
     assert "V-2/0c_refusal_evidence" in _names(checks, False)
+
+
+# --------------------------------------------------------------------------
+# V-2'/tool_stderr_isolated (msg-396, assumptions (a) and (b))
+# --------------------------------------------------------------------------
+
+ISOLATION = "V-2'/tool_stderr_isolated"
+
+
+@pytest.mark.usefixtures("v1_ok", "flag_registered")
+class TestStderrIsolation:
+    async def test_contained_cli_passes_the_isolation_check(self, tmp_path: Path) -> None:
+        result, checks = await vc.verify(v2_backend(tmp_path, "contained"))
+        assert result == "pass"
+        assert ISOLATION in _names(checks, True)
+
+    async def test_tool_stderr_on_cli_stderr_fails_verification(self, tmp_path: Path) -> None:
+        """(a): a tool's stderr in the classifier's text keeps the gate closed."""
+        backend = v2_backend(tmp_path, "stderr_leak")
+        result, checks = await vc.verify(backend)
+        assert result == "fail"
+        assert _names(checks, False) == {ISOLATION}
+        assert "tool_stderr_not_isolated" in _note(backend)["fail_reasons"]
+        with pytest.raises(CodexNotVerifiedError):
+            await backend.chat_completions(REQUEST)
+
+    async def test_tool_run_without_item_started_fails_verification(self, tmp_path: Path) -> None:
+        """(b): a tool run not announced by item.started keeps the gate closed."""
+        backend = v2_backend(tmp_path, "no_item_started")
+        result, checks = await vc.verify(backend)
+        assert result == "fail"
+        assert _names(checks, False) == {ISOLATION}
+
+    async def test_v2_timeout_is_recorded_as_fail(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """msg-394 #5: a timed-out verification run is a ``fail`` record and
+        never a runtime violation (msg-319)."""
+        monkeypatch.setattr(vc, "V2_TIMEOUT_S", 1.0)
+        backend = v2_backend(tmp_path, "sleep")
+        result, checks = await vc.verify(backend)
+        assert result == "fail"
+        assert any(c.name == "V-2c/cli_run" and "CodexTimeout" in c.detail for c in checks)
+        assert backend.state_store.latest_verification("codex").result == "fail"  # type: ignore[union-attr]
+        assert backend.state_store.violations() == []
+
+
+def test_isolation_without_positive_evidence_fails() -> None:
+    state = vc.MockState(nonce="n", planner=lambda raw: ([], []))
+    run = codex_mod.CodexRun(0, "", "", [{"type": "item.started", "item": {"type": "command_execution"}}])
+    check = vc.evaluate_stderr_isolation(state, run, "n")
+    assert not check.ok and "probe_ran=False" in check.detail
+    assert not vc.evaluate_stderr_isolation(state, None, "n").ok
+
+
+def test_isolation_reads_error_events_too() -> None:
+    state = vc.MockState(nonce="n", planner=lambda raw: ([], []))
+    state.requests = ["first", f"tool result {vc.STDERR_PROBE_OUT}n"]
+    started = {"type": "item.started", "item": {"type": "command_execution"}}
+    leak = {"type": "error", "message": f"{vc.STDERR_PROBE_ERR}n"}
+    assert vc.evaluate_stderr_isolation(state, codex_mod.CodexRun(0, "", "", [started]), "n").ok
+    assert not vc.evaluate_stderr_isolation(state, codex_mod.CodexRun(0, "", "", [started, leak]), "n").ok
+
+
+def test_probe_command_never_contains_the_markers() -> None:
+    argv = vc.stderr_probe_argv("abc123")
+    joined = " ".join(argv)
+    assert f"{vc.STDERR_PROBE_OUT}abc123" not in joined
+    assert f"{vc.STDERR_PROBE_ERR}abc123" not in joined
+    tool = vc.ToolSpec("function", "shell", "shell", {"properties": {"command": {"type": "string"}}})
+    command = vc.calls_for([tool], "/c", stderr_probe_nonce="abc123")[2].arguments["command"]
+    assert shlex.split(command) == argv
+
+
+def test_production_run_gets_no_stderr_probe() -> None:
+    tool = vc.ToolSpec("function", "shell", "shell")
+    assert len(vc.calls_for([tool], "/c")) == 2
 
 
 # --------------------------------------------------------------------------
