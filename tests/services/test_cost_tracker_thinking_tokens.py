@@ -15,8 +15,8 @@ without either extension prices exactly as before.
 
 The rates used below are TEST rates, picked so each term is separately
 visible in the result. They are not Google's prices and say nothing about
-them; ``gemini-3.1-pro-preview`` has no entry in ``DEFAULT_PRICING`` (see the
-NOTE there for why).
+them; the real ``gemini-3.1-pro-preview`` entry is tested in
+``test_cost_tracker.py``.
 """
 
 import sqlite3

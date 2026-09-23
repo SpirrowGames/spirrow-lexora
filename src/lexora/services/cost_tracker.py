@@ -69,24 +69,35 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     # and the schema — not just the numbers — has to change.
     "claude-fable-5": {"input": 10.0, "output": 50.0},
     "claude-opus-5": {"input": 5.0, "output": 25.0},
-    # NOTE: `gemini-3.1-pro-preview` (the naysayer tier) is still absent.
-    # The reason changed on 2026-09-23 (T-ledger-gemini-thinking-tokens D-2).
-    # It used to be the schema: Google prices this model on a prompt-size
-    # step, and a flat {input, output} pair could not say that. The table now
-    # takes an optional `tiers` list and a `cached_input` rate (see
-    # `ModelPricing` above), so the schema no longer blocks it.
-    #
-    # What blocks it now is the numbers. The design (msg-307) requires the
-    # per-tier rates, the cached-input rates AND the tier boundary to be read
-    # from ai.google.dev/gemini-api/docs/pricing on the day the entry is
-    # written, with that date and the boundary quoted here. On 2026-09-23 the
-    # page was not reachable from the implementing host (the HTTPS proxy
-    # refused the CONNECT with 403). The earlier note here recorded
-    # $2.00/$12.00 up to 200k and $4.00/$18.00 above it, read 2026-09-01, but
-    # the boundary has since been disputed on the thread (128k vs 200k) and no
-    # cached-input rate was ever recorded, so copying it forward would be the
-    # invented price this table exists to avoid. Until the entry is added this
-    # model keeps landing on `pricing_known=0` -- "unpriced", not "free".
+    # Gemini 3.1 Pro (the naysayer tier). Added 2026-09-23
+    # (T-ledger-gemini-thinking-tokens D-2, msg-335 / msg-341).
+    # read 2026-09-23 from ai.google.dev/gemini-api/docs/pricing (Standard);
+    # boundary 200,000 (`<=` lower tier). The page text, as quoted on the
+    # thread (msg-335), per 1M tokens:
+    #   Input:           "$2.00, prompts <= 200k tokens" / "$4.00, prompts > 200k tokens"
+    #   Output:          "$12.00, prompts <= 200k tokens" / "$18.00, prompts > 200k"
+    #                    (thinking tokens included -- charged at the output rate)
+    #   Context caching: "$0.20, prompts <= 200k tokens" / "$0.40, prompts > 200k"
+    # `above_prompt_tokens: 200_000` means the upper tier applies only when
+    # prompt tokens are strictly above 200,000, i.e. exactly 200,000 is the
+    # lower tier -- matching the page's `<=` / `>`. Cache storage
+    # ($4.50/MTok/hour) is not modelled: Lexora rejects explicit
+    # `cachedContent` requests, so no storage is ever billed through it.
+    # Standard tier only; Batch / Flex / Priority rates differ and are not
+    # what the naysayer calls today.
+    "gemini-3.1-pro-preview": {
+        "input": 2.00,
+        "output": 12.00,
+        "cached_input": 0.20,
+        "tiers": [
+            {
+                "above_prompt_tokens": 200_000,
+                "input": 4.00,
+                "output": 18.00,
+                "cached_input": 0.40,
+            },
+        ],
+    },
     #
     # NOTE: `claude-code-opus` / `claude-code-sonnet` are absent, and not by
     # oversight. They are not upstream model IDs: `config/lexora_config.yaml`
