@@ -35,6 +35,8 @@ from lexora.api.models import (
     StatsResponse,
 )
 from lexora.backends.base import BackendError, BackendUpstreamError, UsageSink
+from lexora.backends.codex import CodexBackend
+from lexora.backends.gemini import GeminiBackend
 from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
 from lexora.services.metrics import STREAM_USAGE_MISSING_TOTAL, MetricsCollector
@@ -1610,6 +1612,59 @@ async def health(
         version=__version__,
         vllm_status=vllm_status,
     )
+
+
+#: The tier ``GET /v1/naysayer/status`` reports on.
+NAYSAYER_TIER = "naysayer"
+
+
+@router.get("/v1/naysayer/status")
+async def naysayer_status(
+    backend_router: BackendRouter = Depends(get_backend_router),
+) -> dict[str, Any]:
+    """Which backend answers the naysayer tier, and why codex is closed.
+
+    T-naysayer-codex-backend msg-421 S-1, amended by msg-424 S-1' and
+    msg-429 S-1''. Authentication is the same as the other read-only
+    operator endpoints (``/health``, ``/stats``, ``/stats/costs``): none in
+    Lexora itself. The body carries no prompt, no answer and nothing from
+    the CLI's login directory.
+
+    ``codex`` is ``null`` unless the tier's backend is a codex backend. When
+    it is, ``codex_disabled_reason`` is ``CodexBackend.codex_availability()``'s
+    ``reason`` as is -- the same function the request path calls, so the
+    two cannot disagree (msg-424 #1) -- and the endpoint writes nothing: no
+    DB row, no ``_in_flight`` change. It may start ``codex --version`` once
+    (not during a quota hold), never the model. A state DB that cannot be
+    read is ``state_unreadable`` with 200, not a 5xx (msg-423).
+    ``inflight_runs`` is the operator's pre-deploy check: restart only at 0
+    (msg-421 S-2).
+
+    Fields that describe the Gemini fallback (``mode``, ``fallback_since``,
+    the fallback's call count and cost) belong to the fallback itself and
+    arrive with it (PR-2b); they are absent here, not null-filled.
+    """
+    if not backend_router.is_tier(NAYSAYER_TIER):
+        raise HTTPException(status_code=404, detail=f"tier '{NAYSAYER_TIER}' is not configured")
+    backend_name = backend_router.get_backend_name_for_model(NAYSAYER_TIER)
+    backend = backend_router.get_backend_by_name(backend_name)
+    primary: str | None
+    if isinstance(backend, CodexBackend):
+        primary = "codex"
+    elif isinstance(backend, GeminiBackend):
+        primary = "gemini"
+    else:
+        primary = None
+    codex: dict[str, Any] | None = None
+    if isinstance(backend, CodexBackend):
+        availability = await backend.codex_availability()
+        hold = availability.quota_hold_until
+        codex = {
+            "codex_disabled_reason": availability.reason,
+            "quota_hold_until": hold.isoformat() if hold is not None else None,
+            "inflight_runs": backend.inflight_runs(),
+        }
+    return {"tier": NAYSAYER_TIER, "backend": backend_name, "primary": primary, "codex": codex}
 
 
 @router.get("/stats", response_model=StatsResponse)

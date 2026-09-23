@@ -867,8 +867,12 @@ class TestSourceFences:
     def test_run_gated_checks_the_gate_first(self) -> None:
         tree = ast.parse((SRC / "backends" / "codex.py").read_text(encoding="utf-8"))
         func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_gated")
-        first = func.body[1] if isinstance(func.body[0], ast.Expr) and isinstance(func.body[0].value, ast.Constant) else func.body[0]
-        assert "_ensure_verified" in ast.unparse(first)
+        body = func.body[1:] if isinstance(func.body[0], ast.Expr) and isinstance(func.body[0].value, ast.Constant) else func.body
+        # S-1'' (msg-429): the gate is codex_availability() -- evaluated here
+        # unless the caller passes this request's evaluation in -- and a
+        # closed result raises before anything else runs.
+        assert "self.codex_availability()" in ast.unparse(body[0])
+        assert ast.unparse(body[1]) == "if availability.error is not None:\n    raise availability.error"
 
     def test_nothing_opens_the_login_file(self) -> None:
         """No string literal outside docstrings names the CLI's credential file."""
@@ -1067,6 +1071,9 @@ class TestWriteAheadRunLog:
         record_pass(backend)
         with pytest.raises(CodexQuotaError):
             await backend.chat_completions(REQUEST)
+        # PR-2: the quota failure set a hold that would refuse the next call
+        # before any spawn; this test is about pairing, so lift it.
+        backend._quota_hold_until = None
         backend._wrap = lambda inner, workdir: [str(tmp_path / "no-such-bwrap")]  # type: ignore[method-assign]
         with pytest.raises(CodexLaunchError):
             await backend.chat_completions(REQUEST)
