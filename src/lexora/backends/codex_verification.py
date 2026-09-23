@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS codex_run_clearance (
 """
 
 
+#: gate_log kinds the D-1e' run log needs; an older table lacks them.
+_RUN_LOG_KINDS = ("'run_started'", "'run_finished'")
+
 #: SQLite busy timeout for every connection (msg-405 D-1e'-2'.1): lock
 #: contention shorter than this is absorbed by SQLite itself.
 BUSY_TIMEOUT_S = 5.0
@@ -166,6 +169,13 @@ class CodexStateStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'codex_gate_log'"
+            ).fetchone()
+        #: False when ``codex_gate_log`` was created by an older schema whose
+        #: ``kind`` CHECK does not admit the D-1e' run log (msg-408 #5). No
+        #: migration: the gate closes as ``schema_outdated`` instead.
+        self.schema_current = bool(row) and all(k in row[0] for k in _RUN_LOG_KINDS)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
