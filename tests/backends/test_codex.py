@@ -32,13 +32,15 @@ from lexora.backends.codex import (
     CodexTimeout,
     CodexToolUseViolation,
     CodexUnsupportedInputError,
+    EventFindings,
     build_env,
+    classify_events,
     classify_failure,
     parse_reset_at,
     request_to_prompt,
     usage_from_events,
 )
-from lexora.backends.codex_verification import CodexStateStore
+from lexora.backends.codex_verification import ClearViolationError, CodexStateStore
 from lexora.backends.factory import create_backend
 from lexora.config import BackendSettings, CodexSettings
 
@@ -58,7 +60,9 @@ def _host_env(backend: CodexBackend) -> dict[str, str]:
     return env
 
 
-def make_backend(tmp_path: Path, scenario: str = "ok", timeout: float = 30.0) -> CodexBackend:
+def make_backend(
+    tmp_path: Path, scenario: str = "ok", timeout: float = 30.0, cli_overrides: list[str] | None = None
+) -> CodexBackend:
     home = tmp_path / "codex-home"
     home.mkdir(exist_ok=True)
     backend = CodexBackend(
@@ -66,6 +70,7 @@ def make_backend(tmp_path: Path, scenario: str = "ok", timeout: float = 30.0) ->
         state_store=CodexStateStore(tmp_path / "codex.db"),
         models=["gpt-5-codex"],
         timeout=timeout,
+        cli_overrides=cli_overrides or [],
         name="codex",
     )
     backend._wrap = lambda inner, workdir: [sys.executable, FAKE_CLI, backend._scenario, *inner[1:]]  # type: ignore[method-assign]
@@ -195,23 +200,31 @@ class TestGate:
 
 
 class TestToolUseViolation:
-    async def test_tool_event_discards_answer_and_latches(self, tmp_path: Path) -> None:
-        backend = make_backend(tmp_path, "tool_use")
-        record_pass(backend)
+    """D-1c + the msg-317 release rules: global latch, clear THEN pass."""
+
+    async def _trip(self, backend: CodexBackend) -> int:
+        backend._scenario = "tool_use"  # type: ignore[attr-defined]
         with pytest.raises(CodexToolUseViolation):
             await backend.chat_completions(REQUEST)
-        # Latched: even a clean CLI is now refused, before any subprocess.
         backend._scenario = "ok"  # type: ignore[attr-defined]
+        return backend.state_store.uncleared_violations()[-1].id
+
+    async def _assert_closed(self, backend: CodexBackend, reason: str | None = None) -> None:
         with pytest.raises(CodexNotVerifiedError) as exc:
             await backend.chat_completions(REQUEST)
-        assert exc.value.reason == "tool_use_violation"
-        # Stream path never yields the discarded answer.
+        if reason:
+            assert exc.value.reason == reason
+
+    async def test_tool_event_discards_answer_and_latches(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        vid = await self._trip(backend)
+        violation = backend.state_store.violations()[0]
+        assert (violation.id, violation.codex_version, violation.config_hash) == (vid, VERSION, backend.config_hash())
+        assert "command_execution" in violation.detail
+        await self._assert_closed(backend, "tool_use_violation")
         with pytest.raises(CodexNotVerifiedError):
             await _drain(backend.chat_completions_stream(REQUEST))
-        # Manual release: a human re-runs verify_codex, which records a pass.
-        record_pass(backend)
-        response = await backend.chat_completions(REQUEST)
-        assert response["choices"][0]["message"]["content"].startswith("REVIEW: ")
 
     async def test_stream_tool_event_yields_nothing(self, tmp_path: Path) -> None:
         backend = make_backend(tmp_path, "tool_use")
@@ -221,6 +234,99 @@ class TestToolUseViolation:
             async for chunk in backend.chat_completions_stream(REQUEST):
                 received.append(chunk)
         assert received == []
+
+    async def test_unknown_event_trips_d1c(self, tmp_path: Path) -> None:
+        """msg-315 #4: an event nobody recognises is treated as an execution."""
+        backend = make_backend(tmp_path, "unknown_event")
+        record_pass(backend)
+        with pytest.raises(CodexToolUseViolation):
+            await backend.chat_completions(REQUEST)
+        assert "mystery_capability" in backend.state_store.violations()[0].detail
+
+    async def test_repass_with_same_config_does_not_release(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        await self._trip(backend)
+        record_pass(backend)
+        await self._assert_closed(backend, "tool_use_violation")
+
+    async def test_hash_change_and_pass_does_not_release(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        await self._trip(backend)
+        backend.cli_overrides = ["features.harmless=true"]
+        record_pass(backend)
+        await self._assert_closed(backend, "tool_use_violation")
+
+    async def test_a_b_a_toggle_does_not_release(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        await self._trip(backend)
+        backend.cli_overrides = ["features.harmless=true"]
+        record_pass(backend)
+        backend.cli_overrides = []
+        record_pass(backend)
+        await self._assert_closed(backend, "tool_use_violation")
+
+    async def test_clear_then_pass_releases(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        vid = await self._trip(backend)
+        backend.state_store.clear_violation(vid, "V-2' did not script tool X; added")
+        # Cleared but no pass after the clearance: still closed.
+        await self._assert_closed(backend, "verification_missing")
+        record_pass(backend)
+        response = await backend.chat_completions(REQUEST)
+        assert response["choices"][0]["message"]["content"].startswith("REVIEW: ")
+        cleared = backend.state_store.violations()[0]
+        assert cleared.cleared_reason == "V-2' did not script tool X; added"
+
+    async def test_pass_before_clear_does_not_count(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        vid = await self._trip(backend)
+        record_pass(backend)  # order wrong: pass first ...
+        backend.state_store.clear_violation(vid, "investigated")  # ... then clear
+        await self._assert_closed(backend, "verification_missing")
+
+    async def test_one_of_two_cleared_stays_closed(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        first = await self._trip(backend)
+        backend.state_store.record_violation("other-codex", "[]", codex_version="x", config_hash="y")
+        backend.state_store.clear_violation(first, "investigated")
+        record_pass(backend)
+        # The second violation belongs to another backend: the latch is global.
+        await self._assert_closed(backend, "tool_use_violation")
+
+    def test_empty_reason_is_refused(self, tmp_path: Path) -> None:
+        store = CodexStateStore(tmp_path / "s.db")
+        v = store.record_violation("codex", "[]", codex_version="v", config_hash="h")
+        for reason in ("", "   "):
+            with pytest.raises(ClearViolationError):
+                store.clear_violation(v.id, reason)
+        store.clear_violation(v.id, "ok")
+        with pytest.raises(ClearViolationError):
+            store.clear_violation(v.id, "again")
+        with pytest.raises(ClearViolationError):
+            store.clear_violation(999, "nope")
+
+
+class TestClassifyEvents:
+    def test_asymmetry(self) -> None:
+        refusal = {"type": "error", "message": "tool call declined: shell is disabled (call_1)"}
+        unknown = {"type": "tool.declined", "call_id": "call_1", "message": "declined"}
+        execution = {"type": "item.completed", "item": {"type": "command_execution"}}
+        benign = [{"type": "turn.started"}, {"type": "item.completed", "item": {"type": "agent_message", "text": "declined"}}]
+        f = classify_events([refusal, unknown, execution, *benign])
+        assert f.refusals == (refusal,)
+        assert f.unknown == (unknown,)  # never refusal evidence ...
+        assert f.executions == (execution,)
+        assert f.executions_or_unknown == (execution, unknown)  # ... always counted as execution
+
+    def test_plain_error_is_neither(self) -> None:
+        f = classify_events([{"type": "error", "message": "stream disconnected"}])
+        assert f == EventFindings()
 
 
 # --------------------------------------------------------------------------
@@ -383,6 +489,41 @@ class TestConfig:
         assert BackendSettings(type="codex", codex={"codex_home": "/x"}).timeout == 600.0
         assert BackendSettings(type="codex", codex={"codex_home": "/x"}, timeout=42).timeout == 42
 
+    @pytest.mark.parametrize(
+        "ro_bind",
+        ["opt/codex", "/opt/../home/x", "/home", "/home/sgadmin/.local/bin", "/root/x", "/", "/srv",
+         "/srv/codex/sub"],
+    )
+    def test_ro_binds_that_widen_the_sandbox_are_refused(self, ro_bind: str) -> None:
+        # codex_home /srv/codex/home -> its parent /srv/codex is sensitive;
+        # "/" and "/srv" contain it, "/srv/codex/sub" lies under it.
+        with pytest.raises(ValueError):
+            CodexSettings(codex_home="/srv/codex/home", ro_binds=[ro_bind])
+
+    def test_ro_bind_outside_sensitive_roots_is_accepted(self) -> None:
+        assert CodexSettings(codex_home="/srv/codex/home", ro_binds=["/opt/codex"]).ro_binds == ["/opt/codex"]
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            'model_provider="x"',
+            "model_providers.x.base_url=http://evil",
+            'sandbox_mode="danger-full-access"',
+            "sandbox_workspace_write.network_access=true",
+            'approval_policy="never"',
+            "shell_environment_policy.inherit=all",
+            'profile="loose"',
+            "no_equals_sign",
+            "=value",
+        ],
+    )
+    def test_forbidden_cli_overrides_are_refused(self, override: str) -> None:
+        with pytest.raises(ValueError):
+            CodexSettings(codex_home="/srv/codex/home", cli_overrides=[override])
+
+    def test_other_cli_overrides_are_accepted(self) -> None:
+        assert CodexSettings(codex_home="/x/h", cli_overrides=["features.foo=false"]).cli_overrides == ["features.foo=false"]
+
     def test_codex_settings_ignore_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CODEX_BIN", "/tmp/evil")
         assert CodexSettings(codex_home="/x").codex_bin == "codex"
@@ -414,8 +555,8 @@ def _py_files() -> list[Path]:
 
 
 class TestSourceFences:
-    def test_run_unverified_callers(self) -> None:
-        """Only verify_codex and the gated path may start an ungated run."""
+    @staticmethod
+    def _callers(attr: str) -> dict[str, list[str]]:
         callers: dict[str, list[str]] = {}
         for path in _py_files():
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -423,13 +564,24 @@ class TestSourceFences:
                 if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 for node in ast.walk(func):
-                    if isinstance(node, ast.Attribute) and node.attr == "_run_unverified" and isinstance(node.ctx, ast.Load):
+                    if isinstance(node, ast.Attribute) and node.attr == attr and isinstance(node.ctx, ast.Load):
                         callers.setdefault(path.relative_to(SRC).as_posix(), []).append(func.name)
-        assert callers == {"backends/codex.py": ["_gated_run"], "tools/verify_codex.py": ["run_v2"]}
+        return callers
 
-    def test_gated_run_checks_the_gate_first(self) -> None:
+    def test_run_unverified_callers(self) -> None:
+        """Only verify_codex starts an ungated run (msg-294)."""
+        assert self._callers("_run_unverified") == {"tools/verify_codex.py": ["_drive"]}
+
+    def test_execute_callers(self) -> None:
+        assert self._callers("_execute") == {"backends/codex.py": ["_run_unverified", "_run_gated"]}
+
+    def test_only_run_gated_writes_the_latch(self) -> None:
+        """msg-319: the violation writer is called from _run_gated only."""
+        assert self._callers("record_violation") == {"backends/codex.py": ["_run_gated"]}
+
+    def test_run_gated_checks_the_gate_first(self) -> None:
         tree = ast.parse((SRC / "backends" / "codex.py").read_text(encoding="utf-8"))
-        func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_gated_run")
+        func = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_gated")
         first = func.body[1] if isinstance(func.body[0], ast.Expr) and isinstance(func.body[0].value, ast.Constant) else func.body[0]
         assert "_ensure_verified" in ast.unparse(first)
 

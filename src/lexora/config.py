@@ -2,7 +2,7 @@
 
 import os
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
 import yaml
@@ -184,6 +184,34 @@ ModelsList = Annotated[list[ModelInfo], BeforeValidator(_normalize_models_list)]
 CODEX_DEFAULT_TIMEOUT_S: float = 600.0
 
 
+#: ``cli_overrides`` keys refused at load time (msg-315 #2). ``model_provider``
+#: / ``model_providers.*`` would make production talk to a different endpoint
+#: than the one V-2' checked (V-2' adds its own provider override);
+#: ``sandbox*`` / ``approval*`` / ``shell_environment_policy*`` would loosen
+#: the containment the gate vouches for. ``profile`` / ``profiles.*`` are
+#: refused too because selecting a profile can set any of the above
+#: indirectly (added by the implementer, not in msg-315 -- see PR #46).
+CODEX_FORBIDDEN_OVERRIDE_PREFIXES: tuple[str, ...] = (
+    "model_provider",
+    "sandbox",
+    "approval",
+    "shell_environment_policy",
+    "profile",
+)
+
+#: Lexora's own source tree; ``ro_binds`` may not reach it.
+_LEXORA_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _posix(path: str | Path) -> PurePosixPath:
+    return PurePosixPath(Path(path).as_posix() if isinstance(path, Path) else path)
+
+
+def _overlaps(a: PurePosixPath, b: PurePosixPath) -> bool:
+    """True when ``a`` equals ``b``, lies under it, or contains it."""
+    return a == b or b in a.parents or a in b.parents
+
+
 class CodexSettings(BaseModel):
     """Settings for a ``codex`` backend (``codex exec`` under bwrap).
 
@@ -231,6 +259,49 @@ class CodexSettings(BaseModel):
     max_concurrency: int = Field(
         default=2, ge=1, description="Concurrent ``codex exec`` processes."
     )
+
+    @model_validator(mode="after")
+    def _restrict_sandbox_widening(self) -> "CodexSettings":
+        """Refuse settings that would widen the sandbox (msg-315 #2).
+
+        ``ro_binds``: absolute, normalised paths only, and none may overlap
+        ``/home``, ``/root``, the parent of ``codex_home`` or Lexora's source
+        tree (working directory and package root). "Overlap" includes being
+        an ancestor: binding ``/`` or ``/srv`` would expose what lies under
+        it, so refusing only paths *under* the sensitive roots is not enough
+        (the ancestor half is the implementer's reading, see PR #46).
+
+        ``cli_overrides``: ``key=value`` only; keys starting with any
+        ``CODEX_FORBIDDEN_OVERRIDE_PREFIXES`` entry are refused.
+        """
+        sensitive = [
+            PurePosixPath("/home"),
+            PurePosixPath("/root"),
+            PurePosixPath(self.codex_home).parent,
+            _posix(_LEXORA_REPO_ROOT),
+            _posix(Path.cwd()),
+        ]
+        for raw in self.ro_binds:
+            path = PurePosixPath(raw)
+            if not raw.startswith("/") or ".." in path.parts or str(path) != raw.rstrip("/"):
+                raise ValueError(f"codex.ro_binds entry {raw!r} must be an absolute, normalised path")
+            for root in sensitive:
+                if root.is_absolute() and _overlaps(path, root):
+                    raise ValueError(
+                        f"codex.ro_binds entry {raw!r} overlaps {str(root)!r}; binding it "
+                        f"would widen the sandbox"
+                    )
+        for override in self.cli_overrides:
+            key, sep, _ = override.partition("=")
+            key = key.strip().lower()
+            if not sep or not key:
+                raise ValueError(f"codex.cli_overrides entry {override!r} must be key=value")
+            if key.startswith(CODEX_FORBIDDEN_OVERRIDE_PREFIXES):
+                raise ValueError(
+                    f"codex.cli_overrides key {key!r} is refused: it would change the "
+                    f"provider, sandbox or approval policy the verification vouches for"
+                )
+        return self
     state_db_path: str = Field(
         default="data/codex.db",
         description=(

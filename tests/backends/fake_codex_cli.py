@@ -8,20 +8,28 @@ shape the backend reads.
 
 Scenarios for the backend:
 
-* ``ok``           -- final message + ``turn.completed`` with usage.
-* ``tool_use``     -- reports a ``command_execution`` item (D-1c).
-* ``quota``        -- ASSUMED usage-limit wording on stderr, exit 1.
-* ``auth``         -- ASSUMED not-logged-in wording on stderr, exit 1.
-* ``sleep``        -- never finishes (timeout path).
+* ``ok``            -- final message + ``turn.completed`` with usage.
+* ``tool_use``      -- reports a ``command_execution`` item (D-1c).
+* ``unknown_event`` -- an item type nobody recognises, then a normal answer
+                       (D-1c must treat it as an execution, msg-315 #4).
+* ``quota``         -- ASSUMED usage-limit wording on stderr, exit 1.
+* ``auth``          -- ASSUMED not-logged-in wording on stderr, exit 1.
+* ``sleep``         -- never finishes (timeout path).
 
-Scenarios for V-2' (talk to the mock model given by the provider override):
+Scenarios for V-2'-control and V-2' (talk to the mock model named by the
+provider override). The CLI declares ``shell`` and ``read_file`` in its first
+request. ``DISABLE_FLAG`` among the ``-c`` overrides is the stand-in for the
+real (unmeasured) tool-disabling setting; the control run drops it.
 
-* ``contained``    -- receives the tool calls, runs none, reports a refusal
-                      as the tool result on the next turn, finishes.
-* ``executes``     -- actually runs them (reads the canary file, dumps env)
-                      and sends the output back: must FAIL.
-* ``no_connect``   -- ignores the override and never contacts the mock.
-* ``crash``        -- receives the tool calls, then panics: must FAIL.
+* ``contained``   -- runs its tools only when the flag is absent: control
+                     executes, production refuses -> pass.
+* ``executes``    -- always runs its tools -> production run fails.
+* ``no_connect``  -- never contacts the mock -> control fails.
+* ``crash``       -- runs tools in the control; with the flag it panics
+                     right after receiving the calls -> production fails.
+* ``wrong_names`` -- declares no tools and knows only a tool the mock cannot
+                     guess, so every call is "unknown tool" -> control fails
+                     (fixture 5, msg-315).
 """
 
 from __future__ import annotations
@@ -32,6 +40,13 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+DISABLE_FLAG = "lexora_test.tools_disabled"
+KNOWN_TOOLS = {"shell", "read_file", "local_shell"}
+TOOL_DECLARATIONS = [
+    {"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}}}},
+    {"type": "function", "name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+]
 
 
 def emit(event: dict) -> None:
@@ -105,18 +120,27 @@ def v2(scenario: str, overrides: dict[str, str], prompt: str, last_message: str 
         emit({"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": "ok"}})
         emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
         return 0
+    disabled = DISABLE_FLAG in overrides
     base = overrides["model_providers.lexora_verify.base_url"]
     chat = overrides.get("model_providers.lexora_verify.wire_api") == "chat"
     url = base + ("/chat/completions" if chat else "/responses")
-    first = post(url, {"messages": [{"role": "user", "content": prompt}]} if chat else {"input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}]})
-    calls = tool_calls_from(first, chat)
-    if scenario == "crash":
+    known = {"exec_real"} if scenario == "wrong_names" else KNOWN_TOOLS
+    decls = [] if scenario == "wrong_names" else TOOL_DECLARATIONS
+    if chat:
+        first_body = {"messages": [{"role": "user", "content": prompt}], "tools": [{"type": "function", "function": {k: v for k, v in d.items() if k != "type"}} for d in decls]}
+    else:
+        first_body = {"input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}], "tools": decls}
+    calls = tool_calls_from(post(url, first_body), chat)
+    if scenario == "crash" and disabled:
         sys.stderr.write("thread 'main' panicked at codex-rs/core/src/tool.rs:1:1\n")
         sys.stderr.flush()
         os._exit(101)
+    run_tools = scenario in ("executes", "crash") or (scenario == "contained" and not disabled)
     results = []
     for call in calls:
-        if scenario == "executes":
+        if call["name"] not in known:
+            output = f"unknown tool: {call['name']}"
+        elif run_tools:
             output = really_run(call)
             emit({"type": "item.completed", "item": {"id": call["call_id"], "type": "command_execution", "command": call["name"], "aggregated_output": "", "exit_code": 0, "status": "completed"}})
         else:
@@ -138,7 +162,7 @@ def main() -> int:
     scenario = sys.argv[1]
     overrides, last_message = parse_args(sys.argv[2:])
     prompt = sys.stdin.read()
-    if scenario in ("contained", "executes", "no_connect", "crash"):
+    if scenario in ("contained", "executes", "no_connect", "crash", "wrong_names"):
         return v2(scenario, overrides, prompt, last_message)
     if scenario == "sleep":
         time.sleep(60)
@@ -158,6 +182,13 @@ def main() -> int:
         emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
         if last_message:
             Path(last_message).write_text("leaked")
+        return 0
+    if scenario == "unknown_event":
+        emit({"type": "item.completed", "item": {"id": "i1", "type": "mystery_capability", "status": "completed"}})
+        emit({"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "fine"}})
+        emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
+        if last_message:
+            Path(last_message).write_text("fine")
         return 0
     if scenario == "quota":
         sys.stderr.write("ERROR: You've hit your usage limit. Try again in 2 hours 5 minutes.\n")

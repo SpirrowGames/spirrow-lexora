@@ -14,19 +14,20 @@ Safety structure, in the order a request meets it:
    taken against the same ``codex --version`` and the same config hash
    (``config_hash``) as now, and no runtime tool-use violation has been
    latched since. Otherwise ``CodexNotVerifiedError``. The gate has no
-   config switch. The only ungated entry is ``_run_unverified``, and the
-   only caller outside ``_gated_run`` is ``lexora/tools/verify_codex.py``
-   (pinned by a test).
+   config switch. The only ungated entry is ``_run_unverified``, whose only
+   caller is ``lexora/tools/verify_codex.py`` (pinned by a test).
 2. **Input gate** -- non-text content blocks, ``tools`` / ``functions`` and
    tool-role messages are refused (``CodexUnsupportedInputError``).
 3. **Blast radius (D-1e)** -- ``_wrap``: bwrap with ``/home`` covered by a
    tmpfs, only the dedicated ``CODEX_HOME`` bound, ``/usr`` read-only, and an
    environment built from an allow-list (``PATH``, ``HOME``, ``CODEX_HOME``,
    locale).
-4. **Runtime detection (D-1c)** -- any tool-execution event in the ``--json``
-   stream discards the answer, latches a violation in the state DB (which
-   closes the gate until a human re-runs ``verify_codex``) and raises
-   ``CodexToolUseViolation``.
+4. **Runtime detection (D-1c)** -- any tool-execution or unrecognised event
+   in the ``--json`` stream (``classify_events``, pure) discards the answer,
+   latches a global violation in the state DB and raises
+   ``CodexToolUseViolation``. Only ``_run_gated`` writes the latch. Release:
+   a human clears each violation with ``verify_codex --clear-violation``,
+   THEN ``verify_codex`` must pass again (msg-317).
 
 Wire-format facts marked **ASSUMED** below (event names, error wording) were
 not measured: no Codex login exists yet (msg-269). They are to be re-verified
@@ -37,6 +38,7 @@ go/no-go conditions listed in msg-294.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -68,6 +70,18 @@ COMMAND_TEMPLATE_VERSION = "codex-exec-v1"
 LOCALE_ENV_ALLOWLIST: tuple[str, ...] = ("LANG", "LC_ALL", "LC_CTYPE", "LANGUAGE")
 
 SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+#: ``-c`` override keys that disable the CLI's tools. EMPTY until measured
+#: after login (msg-294 go/no-go: the tool-disabling CLI setting exists). The
+#: V-2'-control run drops exactly these keys; while the set is empty the
+#: control equals production, so verification cannot pass -- by design.
+TOOL_DISABLE_OVERRIDE_KEYS: frozenset[str] = frozenset()
+
+
+def override_key(override: str) -> str:
+    """Key part of a ``key=value`` ``-c`` override, stripped and lowercased."""
+    return override.split("=", 1)[0].strip().lower()
+
 
 #: Output file name inside the per-request working directory.
 LAST_MESSAGE_FILE = "last_message.txt"
@@ -197,6 +211,20 @@ _TOOL_ITEM_TYPES = frozenset(
 )
 _TOOL_MSG_PREFIXES = ("exec_command", "patch_apply", "mcp_tool_call", "web_search")
 
+#: ASSUMED event types known to be neither a tool run nor a refusal. Anything
+#: outside this set, the tool set and the refusal shape is UNKNOWN.
+_BENIGN_EVENT_TYPES = frozenset(
+    {"thread.started", "turn.started", "turn.completed", "turn.failed", "task_complete"}
+)
+_ITEM_EVENT_TYPES = frozenset({"item.started", "item.updated", "item.completed"})
+_BENIGN_ITEM_TYPES = frozenset({"agent_message", "reasoning", "todo_list"})
+
+#: ASSUMED wording of a CLI-side refusal of a tool call.
+REFUSAL_RE = re.compile(
+    r"declin|reject|denied|not allowed|disabled|unsupported|unknown tool|not available|no such tool",
+    re.IGNORECASE,
+)
+
 
 def _event_type_and_item_type(event: Mapping[str, Any]) -> tuple[str, str]:
     etype = str(event.get("type", ""))
@@ -208,19 +236,64 @@ def _event_type_and_item_type(event: Mapping[str, Any]) -> tuple[str, str]:
     return etype, itype
 
 
-def is_tool_execution_event(event: Mapping[str, Any]) -> bool:
-    """True when the event records a tool actually being run (D-1c, V-2' 条件 2)."""
-    etype, itype = _event_type_and_item_type(event)
-    if itype in _TOOL_ITEM_TYPES:
-        # A declined call that the CLI reports as an item is still recorded
-        # as an item of that type; treat every such item as execution. The
-        # V-2' refusal evidence is looked for elsewhere (see verify_codex).
-        return True
-    return any(etype.startswith(p) for p in _TOOL_MSG_PREFIXES)
+@dataclass(frozen=True)
+class EventFindings:
+    """Side-effect-free classification of a ``--json`` stream (msg-319).
+
+    ``executions`` -- events recording a tool being run.
+    ``refusals``   -- events recording the CLI refusing a tool call.
+    ``unknown``    -- everything this code does not recognise.
+
+    The asymmetry of msg-315 #4 lives here and in the two readers: an unknown
+    event counts as an execution for D-1c and for V-2' 条件 2
+    (``executions_or_unknown``), and never as refusal evidence for 条件 0(c)
+    (only ``refusals`` is). Either way an unrecognised event makes the
+    outcome fail.
+    """
+
+    executions: tuple[Mapping[str, Any], ...] = ()
+    refusals: tuple[Mapping[str, Any], ...] = ()
+    unknown: tuple[Mapping[str, Any], ...] = ()
+
+    @property
+    def executions_or_unknown(self) -> tuple[Mapping[str, Any], ...]:
+        return self.executions + self.unknown
+
+    def kinds(self) -> list[str]:
+        """Event kinds of executions + unknown, for records (no content)."""
+        out = set()
+        for event in self.executions_or_unknown:
+            etype, itype = _event_type_and_item_type(event)
+            out.add(itype or etype or "?")
+        return sorted(out)
 
 
-def tool_execution_events(events: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    return [e for e in events if is_tool_execution_event(e)]
+def _is_refusal(etype: str, itype: str, event: Mapping[str, Any]) -> bool:
+    if etype == "error" or itype == "error":
+        return bool(REFUSAL_RE.search(json.dumps(event)))
+    return False
+
+
+def classify_events(events: Sequence[Mapping[str, Any]]) -> EventFindings:
+    """Pure: no DB, no latch, no I/O. See ``EventFindings``."""
+    executions: list[Mapping[str, Any]] = []
+    refusals: list[Mapping[str, Any]] = []
+    unknown: list[Mapping[str, Any]] = []
+    for event in events:
+        etype, itype = _event_type_and_item_type(event)
+        if itype in _TOOL_ITEM_TYPES or any(etype.startswith(p) for p in _TOOL_MSG_PREFIXES):
+            # A declined call reported as an item of a tool type is still
+            # counted as an execution (fail-closed).
+            executions.append(event)
+        elif _is_refusal(etype, itype, event):
+            refusals.append(event)
+        elif etype in _BENIGN_EVENT_TYPES or etype == "error":
+            continue
+        elif etype in _ITEM_EVENT_TYPES and itype in _BENIGN_ITEM_TYPES | {"error"}:
+            continue
+        else:
+            unknown.append(event)
+    return EventFindings(tuple(executions), tuple(refusals), tuple(unknown))
 
 
 #: ASSUMED terminal event types (a finished, non-truncated stream).
@@ -558,11 +631,19 @@ class CodexBackend(Backend):
             raise CodexLaunchError(f"codex --version exited {process.returncode}")
         return stdout.decode("utf-8", errors="replace").strip()
 
-    async def _ensure_verified(self) -> None:
-        """Open the gate or raise ``CodexNotVerifiedError``.
+    async def _ensure_verified(self) -> str:
+        """Open the gate or raise ``CodexNotVerifiedError``; return the CLI version.
 
         Record checks come first and need no subprocess, so a backend that
-        was never verified starts nothing at all.
+        was never verified starts nothing at all. Order of conditions:
+
+        1. The latest verification record for this backend is ``pass``.
+        2. No runtime violation is uncleared -- in the whole store, not per
+           config hash (msg-317: a global latch; no automatic release by a
+           version or hash change, so A -> B -> A cannot re-arm).
+        3. That ``pass`` was recorded AFTER the most recent clearance (msg-317:
+           "clear, then pass"). A pass taken before a clearance does not count.
+        4. Config hash and ``codex --version`` equal those of the pass.
         """
         record = self.state_store.latest_verification(self.name)
         if record is None or record.result != "pass":
@@ -571,12 +652,21 @@ class CodexBackend(Backend):
                 f"run `python -m lexora.tools.verify_codex --backend {self.name}`",
                 reason="verification_missing",
             )
-        violation = self.state_store.latest_violation(self.name)
-        if violation is not None and violation.at >= record.at:
+        uncleared = self.state_store.uncleared_violations()
+        if uncleared:
+            ids = ", ".join(str(v.id) for v in uncleared)
             raise CodexNotVerifiedError(
-                f"codex backend '{self.name}' executed a tool at {violation.at}; "
-                f"disabled until a human re-runs verify_codex",
+                f"codex is disabled by uncleared runtime tool-use violation(s) [{ids}]; "
+                f"a human must investigate and run `verify_codex --clear-violation <id> "
+                f"--reason ...`, then verify_codex must pass again",
                 reason="tool_use_violation",
+            )
+        last_clear = self.state_store.latest_clearance_seq()
+        if last_clear is not None and record.seq <= last_clear:
+            raise CodexNotVerifiedError(
+                f"codex backend '{self.name}': the latest pass predates the most recent "
+                f"violation clearance; run verify_codex again",
+                reason="verification_missing",
             )
         if record.config_hash != self.config_hash():
             raise CodexNotVerifiedError(
@@ -590,21 +680,21 @@ class CodexBackend(Backend):
                 f"({record.codex_version!r} -> {version!r})",
                 reason="verification_stale",
             )
+        return version
 
     # ---- execution ---------------------------------------------------
 
-    async def _run_unverified(
+    async def _execute(
         self,
         prompt: str,
         model: str,
         extra_overrides: Sequence[str] = (),
         timeout: float | None = None,
-    ) -> CodexRun:
-        """Run ``codex exec`` WITHOUT the gate.
+    ) -> tuple[CodexRun, EventFindings]:
+        """Start ``codex exec`` and collect its output. NO side effects.
 
-        Callers: ``_gated_run`` (after ``_ensure_verified``) and
-        ``lexora/tools/verify_codex.py`` (which cannot pass a gate it is
-        there to open). Nothing else -- a test greps for it.
+        Launch, timeout and collection only; writes neither the state DB nor
+        the latch (msg-319). Called by ``_run_gated`` and ``_run_unverified``.
         """
         workdir = tempfile.mkdtemp(prefix="lexora-codex-")
         last_message_path = str(Path(workdir) / LAST_MESSAGE_FILE)
@@ -640,31 +730,53 @@ class CodexBackend(Backend):
             path = Path(last_message_path)
             if path.is_file():
                 last_message = path.read_text(encoding="utf-8", errors="replace")
-            return CodexRun(
+            events = parse_events(stdout)
+            run = CodexRun(
                 returncode=process.returncode,
                 stdout=stdout,
                 stderr=stderr_b.decode("utf-8", errors="replace"),
-                events=parse_events(stdout),
+                events=events,
                 last_message=last_message,
             )
+            return run, classify_events(events)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-    async def _gated_run(self, prompt: str, model: str) -> tuple[str, int, int]:
-        """Gate, run, enforce D-1c, classify. Returns (text, prompt_tok, completion_tok)."""
-        await self._ensure_verified()
-        run = await self._run_unverified(prompt, model)
-        violations = tool_execution_events(run.events)
-        if violations:
-            kinds = set()
-            for event in violations:
-                etype, itype = _event_type_and_item_type(event)
-                kinds.add(itype or etype)
-            detail = json.dumps(sorted(kinds))
-            self.state_store.record_violation(self.name, detail)
-            logger.error("codex_tool_use_violation", backend=self.name, events=detail)
+    async def _run_unverified(
+        self,
+        prompt: str,
+        model: str,
+        extra_overrides: Sequence[str] = (),
+        timeout: float | None = None,
+    ) -> tuple[CodexRun, EventFindings]:
+        """``_execute`` WITHOUT the gate and WITHOUT the latch.
+
+        The only caller is ``lexora/tools/verify_codex.py``, which cannot
+        pass a gate it is there to open, and whose control run executes tools
+        on purpose (msg-318/319) -- so this path must never latch. A test
+        greps for the caller.
+        """
+        return await self._execute(prompt, model, extra_overrides, timeout)
+
+    async def _run_gated(self, prompt: str, model: str) -> tuple[str, int, int]:
+        """The production path: gate -> ``_execute`` -> D-1c latch -> classify.
+
+        The one place that writes a runtime violation (a test greps for it).
+        Executions and UNKNOWN events both trip D-1c (msg-315 #4).
+        """
+        version = await self._ensure_verified()
+        run, findings = await self._execute(prompt, model)
+        if findings.executions_or_unknown:
+            detail = json.dumps(findings.kinds())
+            violation = self.state_store.record_violation(
+                self.name, detail, codex_version=version, config_hash=self.config_hash()
+            )
+            logger.error(
+                "codex_tool_use_violation", backend=self.name, events=detail, violation_id=violation.id
+            )
             raise CodexToolUseViolation(
-                f"codex exec ran a tool ({detail}); answer discarded, backend disabled"
+                f"codex exec ran a tool or emitted an unrecognised event ({detail}); "
+                f"answer discarded, codex disabled (violation {violation.id})"
             )
         if run.returncode != 0:
             raise classify_failure(run.returncode, run.stderr, run.events)
@@ -673,6 +785,20 @@ class CodexBackend(Backend):
             raise CodexFailed("codex exec exited 0 without a final message")
         prompt_tokens, completion_tokens = usage_from_events(run.events)
         return text, prompt_tokens, completion_tokens
+
+    def control_clone(self, codex_home: str) -> CodexBackend:
+        """A copy for V-2'-control: dummy ``CODEX_HOME``, tool-disabling overrides removed.
+
+        Everything else (bwrap layout, env allow-list, the rest of the
+        overrides) is kept, so the control differs from production only in
+        the setting whose effect is being measured (msg-315 #3).
+        """
+        clone = copy.copy(self)
+        clone.codex_home = codex_home
+        clone.cli_overrides = [
+            o for o in self.cli_overrides if override_key(o) not in TOOL_DISABLE_OVERRIDE_KEYS
+        ]
+        return clone
 
     # ---- Backend interface -------------------------------------------
 
@@ -695,7 +821,7 @@ class CodexBackend(Backend):
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
         prompt = request_to_prompt(request)
         requested = request.get("model")
-        text, p, c = await self._gated_run(prompt, self.resolve_model(requested))
+        text, p, c = await self._run_gated(prompt, self.resolve_model(requested))
         return self._response(text, requested or self.resolve_model(None), p, c)
 
     async def chat_completions_stream(
@@ -709,7 +835,7 @@ class CodexBackend(Backend):
         """
         prompt = request_to_prompt(request)
         requested = request.get("model")
-        text, p, c = await self._gated_run(prompt, self.resolve_model(requested))
+        text, p, c = await self._run_gated(prompt, self.resolve_model(requested))
         if usage_sink is not None:
             usage_sink.prompt_tokens, usage_sink.completion_tokens = p, c
         model = requested or self.resolve_model(None)
