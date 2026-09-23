@@ -257,7 +257,7 @@ class TestClearViolationCli:
         assert vc.main(["--config", str(cfg), "--clear-violation", str(v.id), "--reason", "V-2' missed X"]) == 0
         assert backend.state_store.uncleared_violations() == []
         # The pass above predates the clearance -> still closed.
-        assert backend.state_store.latest_clearance_seq() > backend.state_store.latest_verification("codex").seq  # type: ignore[union-attr,operator]
+        assert backend.state_store.clearance_threshold() > backend.state_store.latest_verification("codex").seq  # type: ignore[union-attr]
         with pytest.raises(ClearViolationError):
             vc.clear_violation(backend.state_store, v.id, "again")
 

@@ -44,6 +44,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import uuid
@@ -130,10 +131,11 @@ class CodexFailed(CodexError):
 class CodexNotVerifiedError(CodexError):
     """The verification gate is closed; no subprocess was started.
 
-    ``reason`` is one of ``verification_missing`` (no record, or the latest
-    record is not ``pass``), ``verification_stale`` (CLI version or config
-    hash changed since the pass) or ``tool_use_violation`` (a runtime
-    violation was latched after the pass).
+    ``reason`` is one of ``verification_missing`` (no record, the latest
+    record is not ``pass``, or the pass predates the latest clearance),
+    ``verification_stale`` (CLI version or config hash changed since the
+    pass), ``tool_use_violation`` (an uncleared runtime violation exists) or
+    ``state_unreadable`` (the state DB could not be read; fail-closed).
     """
 
     def __init__(self, message: str, reason: str) -> None:
@@ -634,25 +636,28 @@ class CodexBackend(Backend):
     async def _ensure_verified(self) -> str:
         """Open the gate or raise ``CodexNotVerifiedError``; return the CLI version.
 
-        Record checks come first and need no subprocess, so a backend that
-        was never verified starts nothing at all. Order of conditions:
+        The msg-324/326 conditions, in order. Record checks come first and
+        need no subprocess, so a never-verified backend starts nothing.
 
-        1. The latest verification record for this backend is ``pass``.
-        2. No runtime violation is uncleared -- in the whole store, not per
-           config hash (msg-317: a global latch; no automatic release by a
-           version or hash change, so A -> B -> A cannot re-arm).
-        3. That ``pass`` was recorded AFTER the most recent clearance (msg-317:
-           "clear, then pass"). A pass taken before a clearance does not count.
-        4. Config hash and ``codex --version`` equal those of the pass.
+        1. No uncleared runtime violation, in the whole store (global latch,
+           msg-317 -- no release by a version or hash change).
+        2. The latest ``verification`` row for this backend is ``pass`` and
+           its ``seq`` is greater than ``threshold = COALESCE(MAX(seq) of
+           clearances, 0)`` (msg-326). Ordering is SQLite's persisted
+           ``AUTOINCREMENT`` seq, never a clock or an in-memory counter.
+        3. Its config hash and ``codex --version`` equal the current ones.
+
+        A state DB that cannot be read closes the gate (``state_unreadable``);
+        it is never treated as "no violations".
         """
-        record = self.state_store.latest_verification(self.name)
-        if record is None or record.result != "pass":
+        try:
+            uncleared = self.state_store.uncleared_violations()
+            record = self.state_store.latest_verification(self.name)
+            threshold = self.state_store.clearance_threshold()
+        except sqlite3.Error as exc:
             raise CodexNotVerifiedError(
-                f"codex backend '{self.name}' has no passing verification; "
-                f"run `python -m lexora.tools.verify_codex --backend {self.name}`",
-                reason="verification_missing",
-            )
-        uncleared = self.state_store.uncleared_violations()
+                f"codex state DB unreadable ({exc}); gate closed", reason="state_unreadable"
+            ) from exc
         if uncleared:
             ids = ", ".join(str(v.id) for v in uncleared)
             raise CodexNotVerifiedError(
@@ -661,8 +666,13 @@ class CodexBackend(Backend):
                 f"--reason ...`, then verify_codex must pass again",
                 reason="tool_use_violation",
             )
-        last_clear = self.state_store.latest_clearance_seq()
-        if last_clear is not None and record.seq <= last_clear:
+        if record is None or record.result != "pass":
+            raise CodexNotVerifiedError(
+                f"codex backend '{self.name}' has no passing verification; "
+                f"run `python -m lexora.tools.verify_codex --backend {self.name}`",
+                reason="verification_missing",
+            )
+        if not record.seq > threshold:
             raise CodexNotVerifiedError(
                 f"codex backend '{self.name}': the latest pass predates the most recent "
                 f"violation clearance; run verify_codex again",

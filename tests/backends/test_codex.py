@@ -13,6 +13,7 @@ import ast
 import asyncio
 import os
 import re
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -312,6 +313,108 @@ class TestToolUseViolation:
             store.clear_violation(999, "nope")
 
 
+class TestGateLogSequence:
+    """msg-324/326: one persisted AUTOINCREMENT numbering source, and the
+    COALESCE(..., 0) clearance threshold."""
+
+    def test_seq_survives_a_restart(self, tmp_path: Path) -> None:
+        db = tmp_path / "codex.db"
+        first = CodexStateStore(db)
+        before = [first.record_verification("codex", "pass", "v", "h", []).seq for _ in range(3)]
+        restarted = CodexStateStore(db)  # new instance on the same file = process restart
+        after = restarted.record_violation("codex", "[]", codex_version="v", config_hash="h").seq
+        assert after > max(before)
+
+    async def test_old_pass_restart_violation_clear_stays_closed(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)  # pre-restart pass
+        restarted = make_backend(tmp_path)  # same DB file, fresh objects
+        restarted._scenario = "tool_use"  # type: ignore[attr-defined]
+        with pytest.raises(CodexToolUseViolation):
+            await restarted.chat_completions(REQUEST)
+        again = make_backend(tmp_path)
+        again.state_store.clear_violation(again.state_store.violations()[0].seq, "investigated")
+        with pytest.raises(CodexNotVerifiedError) as exc:
+            await make_backend(tmp_path).chat_completions(REQUEST)
+        assert exc.value.reason == "verification_missing"
+
+    def test_deleted_rows_are_not_reused(self, tmp_path: Path) -> None:
+        db = tmp_path / "codex.db"
+        store = CodexStateStore(db)
+        top = store.record_verification("codex", "fail", "v", "h", []).seq
+        conn = sqlite3.connect(db)
+        with conn:
+            conn.execute("DELETE FROM codex_verification WHERE seq = ?", (top,))
+            conn.execute("DELETE FROM codex_gate_log WHERE seq = ?", (top,))
+        conn.close()
+        assert CodexStateStore(db).record_verification("codex", "pass", "v", "h", []).seq > top
+
+    def test_every_kind_shares_one_sequence(self, tmp_path: Path) -> None:
+        store = CodexStateStore(tmp_path / "codex.db")
+        a = store.record_verification("codex", "pass", "v", "h", []).seq
+        b = store.record_violation("codex", "[]", codex_version="v", config_hash="h").seq
+        c = store.clear_violation(b, "r").cleared_seq
+        d = store.record_verification("codex", "pass", "v", "h", []).seq
+        assert a < b < c < d  # type: ignore[operator]
+
+    async def test_fresh_db_with_one_pass_opens(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        assert backend.state_store.clearance_threshold() == 0
+        record_pass(backend)
+        response = await backend.chat_completions(REQUEST)
+        assert response["choices"][0]["message"]["content"].startswith("REVIEW: ")
+
+    async def test_fresh_db_with_no_rows_is_closed(self, tmp_path: Path) -> None:
+        with pytest.raises(CodexNotVerifiedError) as exc:
+            await make_backend(tmp_path).chat_completions(REQUEST)
+        assert exc.value.reason == "verification_missing"
+
+    async def test_violation_without_clearance_then_pass_is_closed(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        backend.state_store.record_violation("codex", "[]", codex_version=VERSION, config_hash="h")
+        record_pass(backend)
+        assert backend.state_store.clearance_threshold() == 0
+        with pytest.raises(CodexNotVerifiedError) as exc:
+            await backend.chat_completions(REQUEST)
+        assert exc.value.reason == "tool_use_violation"
+
+    async def test_unreadable_state_closes_the_gate(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+
+        def broken() -> int:
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        monkeypatch.setattr(backend.state_store, "clearance_threshold", broken)
+        with pytest.raises(CodexNotVerifiedError) as exc:
+            await backend.chat_completions(REQUEST)
+        assert exc.value.reason == "state_unreadable"
+
+    def test_numbering_is_left_to_sqlite(self) -> None:
+        """msg-324 fence, on code only (docstrings excluded): the store's one
+        MAX is the COALESCE clearance threshold; no Python max() call and no
+        seq arithmetic anywhere; gate-log SQL lives in the store only."""
+        store_path = SRC / "backends" / "codex_verification.py"
+        sql_with_max = [c for c in _code_strings(store_path) if "max(" in c.lower()]
+        assert len(sql_with_max) == 1
+        assert "COALESCE" in sql_with_max[0] and "kind = 'clearance'" in sql_with_max[0]
+        for path in _py_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "max":
+                    args = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)} | {
+                        n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                    }
+                    assert not args & {"seq", "cleared_seq"}, f"{path}:{node.lineno}"
+                if isinstance(node, ast.BinOp):
+                    names = {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)} | {
+                        n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                    }
+                    assert not names & {"seq", "cleared_seq"}, f"{path}:{node.lineno}"
+            if path != store_path:
+                assert not any("codex_gate_log" in c for c in _code_strings(path)), path
+
+
 class TestClassifyEvents:
     def test_asymmetry(self) -> None:
         refusal = {"type": "error", "message": "tool call declined: shell is disabled (call_1)"}
@@ -552,6 +655,21 @@ class TestConfig:
 
 def _py_files() -> list[Path]:
     return sorted(SRC.rglob("*.py"))
+
+
+def _code_strings(path: Path) -> list[str]:
+    """String literals of a module, docstrings excluded."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                docstrings.add(id(body[0].value))
+    return [
+        n.value for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docstrings
+    ]
 
 
 class TestSourceFences:
