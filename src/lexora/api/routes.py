@@ -36,6 +36,7 @@ from lexora.api.models import (
 )
 from lexora.backends.base import BackendError, BackendUpstreamError, UsageSink
 from lexora.backends.codex import CodexBackend
+from lexora.backends.fallback import FallbackBackend
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
@@ -1640,31 +1641,57 @@ async def naysayer_status(
     ``inflight_runs`` is the operator's pre-deploy check: restart only at 0
     (msg-421 S-2).
 
-    Fields that describe the Gemini fallback (``mode``, ``fallback_since``,
-    the fallback's call count and cost) belong to the fallback itself and
-    arrive with it (PR-2b); they are absent here, not null-filled.
+    PR-2b (msg-448 B-1 / B-6): when the tier's backend is a ``type:
+    fallback`` wrapper, the ``codex`` block describes its ``primary`` and
+    ``primary`` is ``codex`` (``gemini`` in shadow mode, where Gemini
+    answers); ``mode`` / ``fallback_since`` / ``fallback_calls`` /
+    ``fallback_cost_usd`` / ``shadow_skipped`` come from the wrapper
+    (``FallbackBackend.status_fields``), the counts from the ledger. For a
+    backend that is not a wrapper they are null, except ``mode``, which is
+    ``codex`` for a plain codex backend.
     """
     if not backend_router.is_tier(NAYSAYER_TIER):
         raise HTTPException(status_code=404, detail=f"tier '{NAYSAYER_TIER}' is not configured")
     backend_name = backend_router.get_backend_name_for_model(NAYSAYER_TIER)
     backend = backend_router.get_backend_by_name(backend_name)
+    wrapper = backend if isinstance(backend, FallbackBackend) else None
+    codex_backend = wrapper.primary if wrapper is not None else backend
     primary: str | None
-    if isinstance(backend, CodexBackend):
+    if wrapper is not None:
+        primary = "gemini" if wrapper.mode == "shadow" else "codex"
+    elif isinstance(backend, CodexBackend):
         primary = "codex"
     elif isinstance(backend, GeminiBackend):
         primary = "gemini"
     else:
         primary = None
     codex: dict[str, Any] | None = None
-    if isinstance(backend, CodexBackend):
-        availability = await backend.codex_availability()
+    extra: dict[str, Any] = {
+        "mode": None,
+        "fallback_since": None,
+        "fallback_calls": None,
+        "fallback_cost_usd": None,
+        "shadow_skipped": None,
+    }
+    if isinstance(codex_backend, CodexBackend):
+        availability = await codex_backend.codex_availability()
         hold = availability.quota_hold_until
         codex = {
             "codex_disabled_reason": availability.reason,
             "quota_hold_until": hold.isoformat() if hold is not None else None,
-            "inflight_runs": backend.inflight_runs(),
+            "inflight_runs": codex_backend.inflight_runs(),
         }
-    return {"tier": NAYSAYER_TIER, "backend": backend_name, "primary": primary, "codex": codex}
+        if wrapper is not None:
+            extra = wrapper.status_fields(availability)
+        else:
+            extra["mode"] = "codex"
+    return {
+        "tier": NAYSAYER_TIER,
+        "backend": backend_name,
+        "primary": primary,
+        "codex": codex,
+        **extra,
+    }
 
 
 @router.get("/stats", response_model=StatsResponse)

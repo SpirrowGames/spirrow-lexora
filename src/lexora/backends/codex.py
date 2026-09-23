@@ -1182,14 +1182,21 @@ class CodexBackend(Backend):
             },
         }
 
-    async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
+    async def chat_completions(
+        self, request: dict[str, Any], availability: CodexAvailability | None = None
+    ) -> dict[str, Any]:
+        """``availability``: this request's ``codex_availability()`` result,
+        when the caller (the fallback wrapper) already evaluated it."""
         prompt = request_to_prompt(request)
         requested = request.get("model")
-        text, p, c = await self._run_gated(prompt, self.resolve_model(requested))
+        text, p, c = await self._run_gated(prompt, self.resolve_model(requested), availability)
         return self._response(text, requested or self.resolve_model(None), p, c)
 
     async def chat_completions_stream(
-        self, request: dict[str, Any], usage_sink: UsageSink | None = None
+        self,
+        request: dict[str, Any],
+        usage_sink: UsageSink | None = None,
+        availability: CodexAvailability | None = None,
     ) -> AsyncIterator[bytes]:
         """Run to completion, then emit the answer as one SSE burst.
 
@@ -1199,7 +1206,7 @@ class CodexBackend(Backend):
         """
         prompt = request_to_prompt(request)
         requested = request.get("model")
-        text, p, c = await self._run_gated(prompt, self.resolve_model(requested))
+        text, p, c = await self._run_gated(prompt, self.resolve_model(requested), availability)
         if usage_sink is not None:
             usage_sink.prompt_tokens, usage_sink.completion_tokens = p, c
         model = requested or self.resolve_model(None)

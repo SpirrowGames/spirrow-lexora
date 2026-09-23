@@ -23,3 +23,8 @@ LEXORA_RETRY__MAX_DELAY=30.0
 # Logging
 LEXORA_LOGGING__LEVEL=INFO
 LEXORA_LOGGING__FORMAT=json
+
+# naysayer fallback notifications (T-naysayer-codex-backend msg-448 B-3).
+# Discord webhook URL; treat it as a credential. Unset = no notifications
+# (one WARNING at startup). See deploy/RUNBOOK.md section 6.
+# LEXORA_FALLBACK_WEBHOOK_URL=https://discord.com/api/webhooks/...
