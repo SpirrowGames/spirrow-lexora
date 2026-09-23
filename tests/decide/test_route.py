@@ -556,6 +556,39 @@ class TestRealJevProviderThroughRoute:
         assert _STATE_SENTINEL not in logs
         assert _JEV_KEY not in logs
 
+    def test_400_is_error_level_invalid_request_without_body(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """msg-368 v9: 400 (measured in msg-367) → invalid_request at error
+        level, loc None, and nothing from the 400 body reaches the log."""
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400,
+                json={
+                    "detail": {
+                        "error_type": "api_usage_error",
+                        "message": f"Invalid request. {_STATE_SENTINEL}",
+                    }
+                },
+            )
+
+        app = _jev_app(monkeypatch, _real_jev(handler))
+        capsys.readouterr()
+        resp = TestClient(app).post("/v1/decide", json=dict(_BODY, state=_STATE_SENTINEL))
+        captured = capsys.readouterr()
+        logs = captured.out + captured.err
+        assert resp.status_code == 200, resp.text
+        (row,) = app.state.decision_log.fetch_all()
+        assert row["provider"] == "null"
+        assert row["provider_error"] == "jev:invalid_request"
+        (line,) = [ln for ln in logs.splitlines() if "decide_provider_fallback" in ln]
+        assert "error" in line.lower()
+        assert "api_usage_error" not in logs
+        assert _STATE_SENTINEL not in logs
+        assert _JEV_KEY not in logs
+
     def test_success_through_route(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import httpx
 
