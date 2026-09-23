@@ -1,51 +1,40 @@
 """Decision endpoint settings and startup env checks.
 
-Contract (msg-237 / msg-244 / msg-246):
+Contract (msg-237 / msg-244 / msg-246, narrowed by Bohr msg-387 v3):
 
-* ``primary``: which provider Lexora asks first (``null`` | ``llm`` | ``jev``).
-* ``mode``: ``off`` returns from :class:`NullProvider` unconditionally;
-  ``shadow`` returns ``fallback``'s answer to the caller while also running
-  ``primary`` in the background for logging; ``active`` returns
-  ``primary``'s answer and only falls back on error / timeout / 429. The
-  mode selects behaviour, it does NOT re-select provider identity — a
-  ``mode=off`` config that names ``primary=jev`` is still a config
-  intending to use Jev, and it still fails closed if the key is missing
-  when the operator later flips to shadow / active. (PR 1 only implements
-  ``NullProvider``; the mode field is validated up front so a future PR
-  that adds ``LlmEmulationProvider`` / ``JevProvider`` does not have to
-  revisit the schema.)
-* ``fallback``: which provider serves the answer when ``primary`` fails
-  under ``active``, and which serves the caller under ``shadow``.
+* ``primary``: which provider answers under ``active`` (``null`` | ``jev``
+  — Fermi msg-257 scope 2).
+* ``mode``: ``off`` answers from :class:`NullProvider` unconditionally;
+  ``active`` answers from ``primary`` and falls back to NullProvider on
+  error / timeout / 429 (Fermi msg-257 §3). There is no other mode.
 * ``timeout_ms``: per-call upstream deadline in milliseconds.
 * ``jev_model``: the ``model`` value sent to Jev (default ``jev-latest``).
   The version that actually served each request is logged in
   ``provider_model``.
 
-Choosing Jev (T-decide-jev-provider, Bohr msg-258 §6): while
-``LlmEmulationProvider`` is not implemented, a config with
-``primary="jev"`` should also set ``fallback="null"``. ``fallback="llm"``
-names a provider that is not registered yet; the route then serves
-NullProvider anyway, so there is no functional harm, but the config no
-longer says what actually happens. Note also that under ``active`` the
-route's error fallback is always NullProvider (Fermi msg-257 §3) —
-``fallback`` only selects the caller-visible provider under ``shadow``
-in the current implementation. The defaults (``primary="null"``,
-``mode="off"``) never reach Jev, so no metered call happens until an
-operator opts in.
+The schema accepts only what the code implements (msg-387 v3). ``shadow``
+(answer from one provider, run another in the background for logging),
+``llm`` (``LlmEmulationProvider``) and a ``fallback`` provider selector are
+not implemented, so they are not in the schema: a config naming any of
+them fails validation at load instead of being accepted and silently
+doing nothing. ``DecisionSettings`` forbids unknown keys (the
+pydantic-settings default, pinned by a test), so a leftover ``fallback``
+key in ``[decision]`` stops start-up too. The PR that implements shadow /
+LlmEmulation adds the value back together with the behaviour. This
+withdraws the earlier "validate the mode up front so a later PR does not
+have to revisit the schema" policy.
+
+The defaults (``primary="null"``, ``mode="off"``) never reach Jev, so no
+metered call happens until an operator opts in.
 
 Startup env check (msg-239 / msg-240):
 
-* If ``primary == "jev"`` **or** ``fallback == "jev"`` and the
-  ``TYPESAFE_API_KEY`` environment variable is unset (or empty), start-up
-  is **refused** with a fixed error message that does not leak the value,
-  its length, or a prefix. ``mode == "off"`` does not soften this: the
-  operator has still declared intent to use Jev, and the value they set
-  ``mode`` to next is not something startup can observe.
-
-  Bohr endorsed by Einstein in msg-243 / msg-245: examining both
-  ``primary`` and ``fallback`` is not overzealous — a config that names
-  ``fallback=jev`` without an API key is a time bomb that goes off only
-  when the primary is already failing.
+* If ``primary == "jev"`` and the ``TYPESAFE_API_KEY`` environment
+  variable is unset (or empty), start-up is **refused** with a fixed
+  error message that does not leak the value, its length, or a prefix.
+  ``mode == "off"`` does not soften this: the operator has still declared
+  intent to use Jev, and the value they set ``mode`` to next is not
+  something startup can observe.
 
 Nothing else in this module talks to Jev or reads the env variable. The
 provider implementation only accesses the value through an injected HTTP
@@ -75,13 +64,12 @@ TYPESAFE_API_KEY_ENV = "TYPESAFE_API_KEY"
 #: derivative facts about the value only widens what a stack trace or log
 #: capture exposes.
 _MISSING_KEY_MESSAGE = (
-    f"{TYPESAFE_API_KEY_ENV} is required when [decision].primary or "
-    f'[decision].fallback is "jev"'
+    f'{TYPESAFE_API_KEY_ENV} is required when [decision].primary is "jev"'
 )
 
 
-DecisionProviderName = Literal["null", "llm", "jev"]
-DecisionMode = Literal["off", "shadow", "active"]
+DecisionProviderName = Literal["null", "jev"]
+DecisionMode = Literal["off", "active"]
 
 
 class DecisionSettings(BaseSettings):
@@ -90,31 +78,23 @@ class DecisionSettings(BaseSettings):
     Defaults are deliberately safe: ``primary="null"`` + ``mode="off"``
     means an operator who ships this branch without touching
     ``[decision]`` gets the NullProvider on every call and never talks to
-    an external service. A config that names ``jev`` for either slot must
+    an external service. A config that names ``primary="jev"`` must
     ship the env variable too (see :func:`check_typesafe_api_key`).
     """
 
     primary: DecisionProviderName = Field(
         default="null",
         description=(
-            "Which provider Lexora asks first. In shadow mode this is the "
-            "one whose answer is logged but NOT returned to the caller; in "
-            "active mode this is the one whose answer is returned."
+            "Provider that answers under mode=active (null | jev). "
+            "Ignored under mode=off."
         ),
     )
     mode: DecisionMode = Field(
         default="off",
         description=(
-            "off = always answer from NullProvider (safest); shadow = "
-            "return fallback's answer, log primary in the background; "
-            "active = return primary's answer, fall back on error/timeout/429."
-        ),
-    )
-    fallback: DecisionProviderName = Field(
-        default="llm",
-        description=(
-            "Provider used when primary fails under active, and used as "
-            "the caller-facing provider under shadow."
+            "off = always answer from NullProvider (safest); active = "
+            "answer from primary, fall back to NullProvider on "
+            "error/timeout/429."
         ),
     )
     timeout_ms: int = Field(
@@ -153,12 +133,11 @@ class DecisionSettings(BaseSettings):
 def references_jev(settings: DecisionSettings) -> bool:
     """Whether the current config would ever call the Jev provider.
 
-    A ``mode=off`` config that still names ``jev`` for ``primary`` or
-    ``fallback`` is treated as referencing Jev on purpose (see the
-    startup-check rationale in the module docstring). The one and only
-    exception is a config where neither slot is ``jev``.
+    A ``mode=off`` config that still names ``primary="jev"`` is treated
+    as referencing Jev on purpose (see the startup-check rationale in the
+    module docstring).
     """
-    return settings.primary == "jev" or settings.fallback == "jev"
+    return settings.primary == "jev"
 
 
 def check_typesafe_api_key(

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import pytest
 
+from pydantic import ValidationError
+
+from lexora.config import create_settings
 from lexora.decide.config import (
     TYPESAFE_API_KEY_ENV,
     DecisionSettings,
@@ -19,7 +22,7 @@ from lexora.decide.config import (
 
 
 class TestDecisionSettingsDefaults:
-    def test_default_is_null_off_llm(self) -> None:
+    def test_default_is_null_off(self) -> None:
         """Fresh settings default to the safest configuration.
 
         ``primary=null`` + ``mode=off`` means an operator who ships
@@ -29,7 +32,7 @@ class TestDecisionSettingsDefaults:
         settings = DecisionSettings()
         assert settings.primary == "null"
         assert settings.mode == "off"
-        assert settings.fallback == "llm"
+        assert not hasattr(settings, "fallback")
         assert settings.timeout_ms == 2000
 
     def test_default_log_path_is_on_disk(self) -> None:
@@ -59,20 +62,10 @@ class TestDecisionSettingsDefaults:
 
 class TestReferencesJev:
     def test_neither_slot_is_jev(self) -> None:
-        assert references_jev(DecisionSettings(primary="null", fallback="llm")) is False
+        assert references_jev(DecisionSettings(primary="null")) is False
 
     def test_primary_is_jev(self) -> None:
-        assert references_jev(DecisionSettings(primary="jev", fallback="llm")) is True
-
-    def test_fallback_is_jev(self) -> None:
-        """The fallback slot triggers the reference just like primary.
-
-        Endorsed by Einstein msg-243: catching a fallback-only Jev
-        reference is not overzealous — a config that names ``jev`` only
-        for fallback but omits the key is a time bomb that goes off the
-        moment the primary starts failing.
-        """
-        assert references_jev(DecisionSettings(primary="llm", fallback="jev")) is True
+        assert references_jev(DecisionSettings(primary="jev")) is True
 
     def test_mode_off_still_references(self) -> None:
         """``mode=off`` does not soften the reference detection.
@@ -83,7 +76,7 @@ class TestReferencesJev:
         it should not depend on happening to remember the env variable
         at that moment.
         """
-        settings = DecisionSettings(primary="jev", fallback="llm", mode="off")
+        settings = DecisionSettings(primary="jev", mode="off")
         assert references_jev(settings) is True
 
 
@@ -91,7 +84,7 @@ class TestCheckTypesafeApiKey:
     def test_no_jev_reference_passes_without_env(self) -> None:
         """A config that never mentions Jev never needs the env variable."""
         check_typesafe_api_key(
-            DecisionSettings(primary="null", fallback="llm"),
+            DecisionSettings(primary="null"),
             environ={},
         )
 
@@ -99,21 +92,13 @@ class TestCheckTypesafeApiKey:
         """primary=jev + missing env → startup fails."""
         with pytest.raises(RuntimeError) as excinfo:
             check_typesafe_api_key(
-                DecisionSettings(primary="jev", fallback="llm", mode="active"),
+                DecisionSettings(primary="jev", mode="active"),
                 environ={},
             )
         # Fixed message shape (msg-240 §1); do not check the value at
         # all because the check must never receive one.
         assert TYPESAFE_API_KEY_ENV in str(excinfo.value)
         assert "required" in str(excinfo.value).lower()
-
-    def test_fallback_jev_missing_env_raises(self) -> None:
-        """fallback=jev alone (primary=llm) also fails at startup."""
-        with pytest.raises(RuntimeError):
-            check_typesafe_api_key(
-                DecisionSettings(primary="llm", fallback="jev", mode="active"),
-                environ={},
-            )
 
     def test_mode_off_with_jev_still_raises(self) -> None:
         """Even ``mode=off`` fails when a config names Jev without the env.
@@ -124,7 +109,7 @@ class TestCheckTypesafeApiKey:
         """
         with pytest.raises(RuntimeError):
             check_typesafe_api_key(
-                DecisionSettings(primary="jev", fallback="llm", mode="off"),
+                DecisionSettings(primary="jev", mode="off"),
                 environ={},
             )
 
@@ -137,7 +122,7 @@ class TestCheckTypesafeApiKey:
         catch.
         """
         check_typesafe_api_key(
-            DecisionSettings(primary="jev", fallback="llm", mode="active"),
+            DecisionSettings(primary="jev", mode="active"),
             environ={TYPESAFE_API_KEY_ENV: "sk-anything-nonempty"},
         )
 
@@ -151,7 +136,7 @@ class TestCheckTypesafeApiKey:
         """
         with pytest.raises(RuntimeError):
             check_typesafe_api_key(
-                DecisionSettings(primary="jev", fallback="llm", mode="active"),
+                DecisionSettings(primary="jev", mode="active"),
                 environ={TYPESAFE_API_KEY_ENV: ""},
             )
 
@@ -168,7 +153,7 @@ class TestCheckTypesafeApiKey:
         2. No length / prefix / suffix / char-count adjective slips
            in — those are the derivative facts msg-240 §1 also bars.
         """
-        settings = DecisionSettings(primary="jev", fallback="llm", mode="active")
+        settings = DecisionSettings(primary="jev", mode="active")
         # Sentinel a real leak would show; the message must not
         # contain it because the check refuses BEFORE reading the
         # value, and the fixed text was crafted without it.
@@ -184,3 +169,63 @@ class TestCheckTypesafeApiKey:
         # log-capture pipeline may forward downstream.
         for banned in ("length", "prefix", "suffix", "char", "byte"):
             assert banned not in lowered
+
+
+class TestSchemaMatchesImplementation:
+    """Values the code does not implement fail validation (Bohr msg-387 v3).
+
+    ``shadow``, ``llm`` and a ``fallback`` selector used to be accepted and
+    then silently did nothing (msg-383 / msg-384 / msg-386). The PR that
+    implements one of them puts it back into the schema and rewrites the
+    matching test here on purpose.
+    """
+
+    def test_mode_shadow_is_rejected(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            DecisionSettings(mode="shadow")  # type: ignore[arg-type]
+        assert "mode" in str(excinfo.value)
+
+    @pytest.mark.parametrize("primary", ["null", "jev"])
+    def test_mode_shadow_rejected_regardless_of_primary(self, primary: str) -> None:
+        with pytest.raises(ValidationError):
+            DecisionSettings(primary=primary, mode="shadow")  # type: ignore[arg-type]
+
+    def test_primary_llm_is_rejected(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            DecisionSettings(primary="llm")  # type: ignore[arg-type]
+        assert "primary" in str(excinfo.value)
+
+    @pytest.mark.parametrize("value", ["null", "llm", "jev"])
+    def test_fallback_key_is_rejected(self, value: str) -> None:
+        """A leftover ``fallback`` key stops load instead of being ignored.
+
+        Relies on pydantic-settings' ``BaseSettings`` default
+        ``extra="forbid"`` (measured 2026-09-23; plain pydantic
+        ``BaseModel`` defaults to ``ignore``, which is where the opposite
+        expectation comes from). This test pins that default so a change
+        to it shows up here.
+        """
+        assert DecisionSettings.model_config.get("extra") == "forbid"
+        with pytest.raises(ValidationError) as excinfo:
+            DecisionSettings(fallback=value)  # type: ignore[call-arg]
+        assert "fallback" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "body",
+        ['  mode: "shadow"', '  primary: "llm"', '  fallback: "null"'],
+    )
+    def test_yaml_config_is_rejected_at_load(self, tmp_path, body: str) -> None:  # type: ignore[no-untyped-def]
+        """The operator surface: ``[decision]`` in the YAML config.
+
+        ``create_settings`` is what ``lexora.main`` calls, and it builds
+        ``DecisionSettings(**yaml["decision"])``, so this is the path a
+        real deployment takes.
+        """
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(f"decision:\n{body}\n", encoding="utf-8")
+        with pytest.raises(ValidationError):
+            create_settings(config_file)
+
+    @pytest.mark.parametrize("mode", ["off", "active"])
+    def test_implemented_modes_pass(self, mode: str) -> None:
+        assert DecisionSettings(mode=mode).mode == mode  # type: ignore[arg-type]

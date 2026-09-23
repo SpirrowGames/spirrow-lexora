@@ -155,7 +155,7 @@ class TestDecideStartupEnvCheck:
         """
         monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
         settings = Settings(
-            decision=DecisionSettings(primary="jev", fallback="llm", mode="active")
+            decision=DecisionSettings(primary="jev", mode="active")
         )
         with pytest.raises(RuntimeError) as excinfo:
             create_app(settings=settings)
@@ -167,7 +167,7 @@ class TestDecideStartupEnvCheck:
         """mode=off does not soften the refusal — see test_config."""
         monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
         settings = Settings(
-            decision=DecisionSettings(primary="jev", fallback="llm", mode="off")
+            decision=DecisionSettings(primary="jev", mode="off")
         )
         with pytest.raises(RuntimeError):
             create_app(settings=settings)
@@ -178,7 +178,7 @@ class TestDecideStartupEnvCheck:
         monkeypatch.setenv("TYPESAFE_API_KEY", "sk-not-a-real-key")
         settings = Settings(
             decision=DecisionSettings(
-                primary="jev", fallback="llm", mode="active", log_path=":memory:"
+                primary="jev", mode="active", log_path=":memory:"
             )
         )
         # No exception; a happy startup is the whole assertion.
@@ -271,7 +271,7 @@ def _jev_app(
     monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
     settings = Settings(
         decision=DecisionSettings(
-            primary="jev", fallback="null", mode="active", log_path=log_path
+            primary="jev", mode="active", log_path=log_path
         )
     )
     app = create_app(settings=settings)
@@ -310,9 +310,7 @@ class TestJevRouting:
         monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
         settings = Settings(
             decision=DecisionSettings(
-                primary="jev",
-                fallback="null",
-                mode="active",
+                primary="jev", mode="active",
                 log_path=":memory:",
                 jev_model="jev-1.13.0",
             )
@@ -434,7 +432,7 @@ class TestJevRouting:
         app = create_app(
             settings=Settings(
                 decision=DecisionSettings(
-                    primary="jev", fallback="null", mode="off", log_path=":memory:"
+                    primary="jev", mode="off", log_path=":memory:"
                 )
             )
         )
@@ -611,3 +609,29 @@ class TestRealJevProviderThroughRoute:
         assert row["provider"] == "jev"
         assert row["provider_model"] == "jev-1.13.0"
         assert (row["provider_input_tokens"], row["provider_output_tokens"]) == (30, 2)
+
+
+class TestSelectProvider:
+    """Two-way routing, no silent Null substitution (Bohr msg-387 v3 #3)."""
+
+    def test_off_answers_from_null(self) -> None:
+        from lexora.decide.providers import NullProvider
+        from lexora.decide.routes import _select_provider
+
+        null = NullProvider()
+        settings = DecisionSettings(primary="jev", mode="off")
+        assert _select_provider(settings, {"null": null}) is null
+
+    def test_active_unregistered_primary_is_loud(self) -> None:
+        """An active primary missing from the registry is a Lexora bug.
+
+        The startup key check guarantees ``jev`` is registered whenever
+        ``primary="jev"``; if that ever breaks, the request must fail
+        rather than quietly answer from NullProvider.
+        """
+        from lexora.decide.providers import NullProvider
+        from lexora.decide.routes import _select_provider
+
+        settings = DecisionSettings(primary="jev", mode="active")
+        with pytest.raises(KeyError):
+            _select_provider(settings, {"null": NullProvider()})

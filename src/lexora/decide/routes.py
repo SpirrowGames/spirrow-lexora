@@ -5,16 +5,11 @@ write one decision-log row, return. It exists so the utilisation-side
 threads (mindwire / prismind / verimend) have a stable URL to point at;
 the interesting behaviour is in the provider layer.
 
-PR 1 scope (msg-246): only ``NullProvider`` was wired. T-decide-jev-provider
-adds ``JevProvider``, the NullProvider fallback on ``ProviderError``, and
-logs the upstream ``model`` / usage (Bohr msg-342 #2). The ``mode`` /
-``primary`` / ``fallback`` settings *are* honoured — a config that
-selects Jev on PR 1 is refused at startup by
-:func:`lexora.decide.config.check_typesafe_api_key`, so the route never
-has to reach for a provider that has not been built yet — but the
-route resolves everything through :class:`~lexora.decide.config.
-DecisionSettings` so the switch to real providers in a later PR is a
-one-file change here.
+Routing is two-way (Bohr msg-387 v3): ``mode="off"`` answers from
+NullProvider, ``mode="active"`` answers from the provider named by
+``primary``. On a :class:`~lexora.decide.providers.ProviderError` the
+route falls back to NullProvider (Fermi msg-257 §3) and logs the
+upstream ``model`` / usage (Bohr msg-342 #2).
 """
 
 from __future__ import annotations
@@ -74,29 +69,17 @@ def _select_provider(
 ) -> DecisionProvider:
     """Return the provider whose answer this request should carry.
 
-    PR 1 behaviour (msg-246):
+    * ``mode == "off"`` → NullProvider.
+    * ``mode == "active"`` → the provider named by ``primary``.
 
-    * ``mode == "off"`` → NullProvider unconditionally.
-    * Otherwise → the provider named by ``primary`` if it is registered,
-      else NullProvider. In PR 1 only ``null`` is registered, so a
-      ``primary="jev"`` config that got past the startup env check but
-      has no provider still gets a NullProvider answer here — a
-      followup PR that registers ``jev`` / ``llm`` will change what
-      this returns without changing the shape of the response.
-
-    ``shadow`` mode's "return fallback, run primary in the background"
-    semantics is a follow-up PR: this PR only implements the caller-
-    visible provider, so ``shadow`` collapses to the same code path as
-    ``active`` today. The route logs ``provider`` verbatim so a replay
-    can filter by whichever provider actually served.
+    The schema only admits ``null`` / ``jev`` for ``primary``, and a
+    ``jev`` config cannot start without the key (so ``jev`` is always
+    registered). A ``KeyError`` here is therefore a Lexora bug and is
+    left to surface rather than being papered over with NullProvider.
     """
     if settings.mode == "off":
         return providers["null"]
-    caller_visible = settings.primary if settings.mode == "active" else settings.fallback
-    provider = providers.get(caller_visible)
-    if provider is None:
-        return providers["null"]
-    return provider
+    return providers[settings.primary]
 
 
 @router.post("/v1/decide", response_model=DecideResponse)
