@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from lexora.backends.base import Backend, BackendError, UsageSink
-from lexora.backends.codex_verification import CodexStateStore
+from lexora.backends.codex_verification import CodexStateStore, VerificationRecord
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -599,6 +599,55 @@ class ExecProgress:
     spawned: bool = False
 
 
+#: Hold after a quota failure whose reset time could not be parsed
+#: (``parse_reset_at`` returned ``None``; msg-329 / PR-2).
+QUOTA_HOLD_FALLBACK = timedelta(minutes=15)
+
+
+async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
+    """Kill ``process`` and wait for it, even if we are being cancelled.
+
+    Used on EVERY exit from a subprocess wait that did not end with the
+    process exiting -- ``TimeoutError`` and ``CancelledError`` included --
+    so a cancelled request (client disconnect) leaves no child running
+    (#52 PR-gate finding, msg-427; extended to every spawn by msg-429/430).
+    """
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.shield(process.wait())
+    except asyncio.CancelledError:
+        # Cancelled again while reaping: the kill is already sent; the
+        # caller's original exception still propagates.
+        pass
+
+
+@dataclass(frozen=True)
+class CodexAvailability:
+    """One evaluation of "may codex run now?" (S-1'', msg-429).
+
+    Produced only by ``CodexBackend.codex_availability``. The request path
+    and ``GET /v1/naysayer/status`` both read this, so they cannot disagree
+    (Principle 2). ``reason`` is ``None`` when codex may run; otherwise it is
+    the ``CodexNotVerifiedError.reason`` of the check that closed, or
+    ``quota_hold`` / ``launch_failed``. ``error`` is the exception the
+    request path raises for that reason. ``quota_hold_until`` is reported
+    whatever ``reason`` is, so a DB fault during a hold hides neither.
+    ``version`` is the CLI version when open (it goes on the latch row).
+    """
+
+    reason: str | None
+    error: CodexError | None = None
+    version: str | None = None
+    quota_hold_until: datetime | None = None
+
+    @property
+    def open(self) -> bool:
+        return self.reason is None
+
+
 class CodexBackend(Backend):
     """``codex exec`` backend. See the module docstring for the safety model."""
 
@@ -636,6 +685,11 @@ class CodexBackend(Backend):
         # only closes. Neither can open the gate.
         self._in_flight: set[int] = set()
         self._poisoned: str | None = None
+        # PR-2 quota hold (msg-329, S-1''). In memory only: read by
+        # ``codex_availability`` alone, written by ``_run_gated`` on a
+        # quota failure. A restart forgets it, which costs one codex attempt
+        # that fails with quota again and re-sets it.
+        self._quota_hold_until: datetime | None = None
 
     # ---- configuration identity -------------------------------------
 
@@ -719,9 +773,15 @@ class CodexBackend(Backend):
                 stderr=asyncio.subprocess.PIPE,
                 env=self._subprocess_env(),
             )
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15.0)
-        except (OSError, asyncio.TimeoutError) as exc:
+        except OSError as exc:
             raise CodexLaunchError(f"codex --version failed: {exc}") from exc
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15.0)
+        except BaseException as exc:
+            await _kill_and_reap(process)
+            if isinstance(exc, asyncio.TimeoutError):
+                raise CodexLaunchError(f"codex --version timed out: {exc!r}") from exc
+            raise
         if process.returncode != 0:
             raise CodexLaunchError(f"codex --version exited {process.returncode}")
         return stdout.decode("utf-8", errors="replace").strip()
@@ -749,6 +809,17 @@ class CodexBackend(Backend):
 
         A state DB that cannot be read closes the gate (``state_unreadable``);
         it is never treated as "no violations".
+        """
+        record = self._check_records()
+        return await self._check_version(record)
+
+    def _check_records(self) -> VerificationRecord:
+        """The record half of ``_ensure_verified`` (S-1'', msg-429).
+
+        Schema, in-process poison, conditions 0-2 and the config hash, in
+        that order, unchanged. Reads the state DB only: no subprocess, no
+        write, no change to in-memory state. Returns the passing record
+        for ``_check_version``.
         """
         if not self.state_store.schema_current:
             raise CodexNotVerifiedError(
@@ -805,6 +876,12 @@ class CodexBackend(Backend):
                 f"codex backend '{self.name}' config changed since verification",
                 reason="verification_stale",
             )
+        return record
+
+    async def _check_version(self, record: VerificationRecord) -> str:
+        """The subprocess half of ``_ensure_verified``: ``codex --version``
+        must equal the verified one (``verification_stale``). Raises
+        ``CodexLaunchError`` when the CLI cannot be run."""
         version = await self._codex_version()
         if record.codex_version != version:
             raise CodexNotVerifiedError(
@@ -813,6 +890,54 @@ class CodexBackend(Backend):
                 reason="verification_stale",
             )
         return version
+
+    async def codex_availability(self) -> CodexAvailability:
+        """The single "may codex run now?" decision (S-1'', msg-429).
+
+        Called once per request by the request path (the result is handed to
+        ``_run_gated``) and by ``GET /v1/naysayer/status``. Order:
+
+        1. ``_check_records()`` -- a closed record check wins, so a DB fault
+           or a latch is never masked by a quota hold.
+        2. An active quota hold -> ``quota_hold``; ``codex --version`` is not
+           started.
+        3. ``_check_version()`` -- ``verification_stale`` on a version
+           change, ``launch_failed`` when the CLI cannot be run.
+
+        Writes nothing: not the DB, not ``_in_flight``, not the hold (an
+        expired hold is ignored, never cleared here).
+        """
+        hold = self._quota_hold_until
+        if hold is not None and hold <= datetime.now(timezone.utc):
+            hold = None
+        try:
+            record = self._check_records()
+        except CodexNotVerifiedError as exc:
+            return CodexAvailability(exc.reason, exc, quota_hold_until=hold)
+        if hold is not None:
+            error = CodexQuotaError(
+                f"codex held after a usage-window failure until {hold.isoformat()}", hold
+            )
+            return CodexAvailability("quota_hold", error, quota_hold_until=hold)
+        try:
+            version = await self._check_version(record)
+        except CodexNotVerifiedError as exc:
+            return CodexAvailability(exc.reason, exc)
+        except CodexLaunchError as exc:
+            return CodexAvailability("launch_failed", exc)
+        return CodexAvailability(None, version=version)
+
+    def inflight_runs(self) -> int:
+        """Runs of this process between ``run_started`` and their outcome
+        row: the size of condition 0's "running here" set (msg-421 S-1)."""
+        return len(self._in_flight)
+
+    def _hold_for_quota(self, error: CodexQuotaError) -> None:
+        """Hold codex until the window resets, or 15 minutes if unknown."""
+        until = error.reset_at or datetime.now(timezone.utc) + QUOTA_HOLD_FALLBACK
+        if self._quota_hold_until is None or until > self._quota_hold_until:
+            self._quota_hold_until = until
+        logger.warning("codex_quota_hold", backend=self.name, until=self._quota_hold_until.isoformat())
 
     # ---- execution ---------------------------------------------------
 
@@ -862,16 +987,7 @@ class CodexBackend(Backend):
                         process.communicate(input=prompt.encode("utf-8")), timeout=limit
                     )
                 except BaseException as exc:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        await asyncio.shield(process.wait())
-                    except asyncio.CancelledError:
-                        # Cancelled again while reaping: the kill is already
-                        # sent; the original exception still propagates.
-                        pass
+                    await _kill_and_reap(process)
                     if isinstance(exc, asyncio.TimeoutError):
                         raise CodexTimeout(f"codex exec timed out after {limit}s") from exc
                     raise
@@ -908,7 +1024,9 @@ class CodexBackend(Backend):
         """
         return await self._execute(prompt, model, extra_overrides, timeout)
 
-    async def _run_gated(self, prompt: str, model: str) -> tuple[str, int, int]:
+    async def _run_gated(
+        self, prompt: str, model: str, availability: CodexAvailability | None = None
+    ) -> tuple[str, int, int]:
         """The production path: gate -> ``_execute`` -> D-1c/D-1d latch -> classify.
 
         The one place that writes a runtime violation (a test greps for it).
@@ -928,8 +1046,16 @@ class CodexBackend(Backend):
         spawn writes nothing -- in both cases the unpaired ``run_started``
         keeps the gate closed (condition 0). If the violation write fails,
         this process's gate is also poisoned (``state_unwritable``).
+
+        The gate is ``codex_availability()`` (S-1'', msg-429). A caller that
+        already evaluated it for this request (the PR-2 fallback decision)
+        passes the result in, so ``codex --version`` runs at most once per
+        request. A quota failure sets the hold ``codex_availability`` reads.
         """
-        version = await self._ensure_verified()
+        availability = availability if availability is not None else await self.codex_availability()
+        if availability.error is not None:
+            raise availability.error
+        version = availability.version
         try:
             run_seq = self.state_store.record_run_started(self.name, INSTANCE_ID)
         except sqlite3.Error as exc:
@@ -998,6 +1124,8 @@ class CodexBackend(Backend):
                 raise pending
             self._finish_run(run_seq)
             if pending is not None:
+                if isinstance(pending, CodexQuotaError):
+                    self._hold_for_quota(pending)
                 raise pending
             assert run is not None
             text = run.last_message if run.last_message is not None else last_agent_message(run.events)
@@ -1132,9 +1260,15 @@ class CodexBackend(Backend):
                 stderr=asyncio.subprocess.DEVNULL,
                 env=self._subprocess_env(),
             )
-            await asyncio.wait_for(process.wait(), timeout=15.0)
-        except (OSError, asyncio.TimeoutError):
+        except OSError:
             return False
+        try:
+            await asyncio.wait_for(process.wait(), timeout=15.0)
+        except BaseException as exc:
+            await _kill_and_reap(process)
+            if isinstance(exc, asyncio.TimeoutError):
+                return False
+            raise
         return process.returncode == 0
 
     async def close(self) -> None:
