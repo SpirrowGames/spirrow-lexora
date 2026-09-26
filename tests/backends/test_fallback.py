@@ -412,6 +412,33 @@ class TestLedger:
         rows = self._rows(db)
         assert rows[0]["answered_by"] is None
 
+    def test_pre_pr2b_code_still_writes_and_reads_a_migrated_db(self, tmp_path: Path) -> None:
+        """Rollback safety (#59): production's costs.db is shared by the a/b
+        surfaces, so a surface running the code from before PR-2b must keep
+        working on a DB this code has migrated. That code writes with the
+        explicit 14-column INSERT below (copied verbatim from it) and reads
+        with ``SELECT *``; ``answered_by`` is nullable with no default and
+        ``shadow_comparisons`` is a separate table, so neither notices them.
+        """
+        db = tmp_path / "costs.db"
+        CostTracker(db)  # migrated by this code
+        with sqlite3.connect(db) as conn:
+            conn.execute(
+                """INSERT INTO request_costs
+                   (timestamp, model, backend, endpoint, user_id,
+                    tokens_input, tokens_output, cost_usd,
+                    duration_seconds, success, tier, pricing_known,
+                    tokens_thinking, tokens_cached_input)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ("t", GEMINI_MODEL, "gemini", "/v1/messages", None, 1, 1, 0.1, 0.5, 1, "naysayer", 1, None, None),
+            )
+        rows = self._rows(db)
+        assert [r["answered_by"] for r in rows] == [None]
+        # and this code, rolled forward again, neither re-migrates nor counts
+        # the old surface's row as a fallback
+        again = CostTracker(db)
+        assert again.fallback_totals(datetime(2000, 1, 1, tzinfo=timezone.utc)) == (0, 0.0)
+
 
 # --------------------------------------------------------------------------
 # B-5: shadow mode
