@@ -17,9 +17,11 @@ this file (add a *named* column with a documented meaning, e.g.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +32,7 @@ from lexora.decide.contract import (
     compute_questions_hash,
     compute_state_hash,
 )
+from lexora.utils.logging import get_logger
 
 #: SQL for the ``decisions`` table. Column list is fixed and enumerated
 #: on purpose — the writer does not accept ``**kwargs``, so the schema
@@ -38,6 +41,8 @@ from lexora.decide.contract import (
 #: ``questions_hash`` is NOT NULL because Lexora computes it on every
 #: request (msg-244 disposition #1). ``questions_version`` is NULL-able
 #: because it is caller-supplied and optional.
+_logger = get_logger(__name__)
+
 _CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id       TEXT PRIMARY KEY,
@@ -269,6 +274,31 @@ class DecisionLog:
     would be a safety net that silently reintroduces the multi-worker
     ALTER race. Only ``:memory:`` DBs, which are per-connection and so
     cannot race across processes, get their schema applied here.
+
+    Async entry point (T-decide-endpoint, Bohr msg-464 v3, cleared by
+    Einstein): the route calls :meth:`awrite`, which runs :meth:`write`
+    on a *dedicated* single-thread executor owned by this object. Why
+    not the event loop, and why not the default executor:
+
+    * On the event loop, a blocked ``commit()`` (lock contention waits
+      up to sqlite3's default 5 s ``timeout``) freezes every endpoint of
+      the (single-worker) process.
+    * On the default executor (``asyncio.to_thread``), writes queued on
+      :attr:`_lock` can occupy every pool thread; that pool also serves
+      ``loop.getaddrinfo`` for httpx's upstream connections, so
+      ``/generate`` / ``/chat`` would stall at DNS. An ``asyncio.Lock``
+      in front does not fix it: a cancelled awaiter releases the asyncio
+      lock while its thread keeps running (msg-463).
+
+    With ``max_workers=1`` at most one thread is ever used for log
+    writes, cancelled or not, and the default pool is never touched.
+    A cancelled request's write stays queued and still commits — the
+    row is kept even though the response was never delivered (msg-460
+    behaviour 2). The queue is intentionally unbounded: dropping rows
+    would violate the "never silently drop a row" invariant of
+    :meth:`write`, and its growth is capped by the request arrival rate.
+    The worker thread is created lazily on first submit, so instances
+    that only use the sync :meth:`write` spawn no thread.
     """
 
     def __init__(self, path: Path | str = ":memory:") -> None:
@@ -278,7 +308,14 @@ class DecisionLog:
             parent = Path(self._path).parent
             if str(parent) and str(parent) != ".":
                 parent.mkdir(parents=True, exist_ok=True)
+        # Guards the connection. Kept even though executor writes are
+        # already serialised: the sync ``write`` / ``fetch_all`` are
+        # called directly (tests, offline replay scripts), bypassing the
+        # executor, and this lock is their only protection (msg-464 #1).
         self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="decision-log"
+        )
         self._conn = sqlite3.connect(self._path, check_same_thread=False)
         if self._path == ":memory:":
             # The ONLY place DecisionLog owns its schema: an external
@@ -302,8 +339,36 @@ class DecisionLog:
             self._conn.execute(_INSERT_SQL, _row_as_params(row))
             self._conn.commit()
 
+    async def awrite(self, row: DecisionRow) -> None:
+        """Async :meth:`write` on this log's dedicated writer thread.
+
+        Exceptions from :meth:`write` propagate to the awaiter, so a
+        failed write is still a failed request (500). If the awaiter is
+        cancelled the write is not: it completes in the background, and
+        an error it raises then has no caller — but that request never
+        received a response, so no failure is reported as success.
+        """
+        # Deviation from the literal v3 snippet (``loop.run_in_executor``):
+        # asyncio chains cancellation into the executor future, and a
+        # concurrent future that has not *started* yet does get cancelled
+        # — so under a cancel storm every queued write was silently
+        # dropped (acceptance test 5c: 1 row of 8). ``shield`` stops that
+        # propagation; the job stays queued and commits. Nothing else is
+        # added: no completion wait, still one thread.
+        fut = asyncio.wrap_future(self._executor.submit(self.write, row))
+        fut.add_done_callback(_log_write_failure)
+        await asyncio.shield(fut)
+
     def close(self) -> None:
-        """Close the underlying connection."""
+        """Drain queued writes, then close the underlying connection.
+
+        ``shutdown(wait=True)`` first, so rows queued by cancelled
+        requests still land before the connection closes (msg-464 #2).
+        Called from the app lifespan at shutdown; the event loop may
+        block here for (queued writes x write time), which only affects
+        process teardown, not live requests.
+        """
+        self._executor.shutdown(wait=True)
         with self._lock:
             self._conn.close()
 
@@ -323,6 +388,25 @@ class DecisionLog:
             )
             columns = [c[0] for c in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _log_write_failure(fut: asyncio.Future[None]) -> None:
+    """Retrieve and log a failed :meth:`DecisionLog.awrite` job.
+
+    When the awaiter was cancelled nobody else sees the exception; this
+    keeps the failure loud (and avoids asyncio's "exception never
+    retrieved" noise). A non-cancelled awaiter still receives the
+    exception too, via ``shield``, and fails its request with a 500.
+    """
+    if fut.cancelled():
+        return
+    err = fut.exception()
+    if err is not None:
+        _logger.error(
+            "decision_log_write_failed",
+            exc_type=type(err).__name__,
+            error=str(err),
+        )
 
 
 def _row_as_params(row: DecisionRow) -> dict[str, Any]:

@@ -770,6 +770,30 @@ class TestConfig:
         with pytest.raises(ValueError):
             CodexSettings(codex_home="/srv/codex/home", ro_binds=[ro_bind])
 
+    @pytest.mark.parametrize(
+        "codex_home",
+        ["../../sandbox", "sandbox/home", "./home", "/var/lib/codex/../sandbox", "/srv/./codex/home", "/srv//codex/home"],
+    )
+    def test_codex_home_must_be_absolute_and_normalised(self, codex_home: str) -> None:
+        """#53 PR-gate (msg-433): the parent of codex_home is taken syntactically,
+        so a relative or unnormalised codex_home would dodge the overlap check."""
+        with pytest.raises(ValueError, match="codex_home"):
+            CodexSettings(codex_home=codex_home)
+
+    def test_msg_433_bypass_is_refused(self) -> None:
+        """The exact pair from msg-433: /var/lib/codex/../sandbox resolves under
+        /var, so binding /var/sandbox was the parent it failed to protect."""
+        with pytest.raises(ValueError):
+            CodexSettings(codex_home="/var/lib/codex/../sandbox", ro_binds=["/var/sandbox"])
+        with pytest.raises(ValueError, match="overlaps"):
+            CodexSettings(codex_home="/var/sandbox/home", ro_binds=["/var/sandbox"])
+
+    def test_normalised_codex_home_with_trailing_slash_is_accepted(self) -> None:
+        settings = CodexSettings(codex_home="/srv/codex/home/", ro_binds=["/opt/codex"])
+        assert settings.codex_home == "/srv/codex/home/"
+        with pytest.raises(ValueError, match="overlaps"):
+            CodexSettings(codex_home="/srv/codex/home/", ro_binds=["/srv/codex"])
+
     def test_ro_bind_outside_sensitive_roots_is_accepted(self) -> None:
         assert CodexSettings(codex_home="/srv/codex/home", ro_binds=["/opt/codex"]).ro_binds == ["/opt/codex"]
 

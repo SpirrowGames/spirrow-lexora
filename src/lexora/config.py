@@ -207,6 +207,18 @@ def _posix(path: str | Path) -> PurePosixPath:
     return PurePosixPath(Path(path).as_posix() if isinstance(path, Path) else path)
 
 
+def _is_normalised(raw: str) -> bool:
+    """No ``.`` / ``..`` / empty component (``//``), either separator.
+
+    ``PurePosixPath`` computes parents syntactically, so a path carrying any
+    of these has a "parent" that is not the directory bwrap will actually
+    resolve (#53 PR-gate, msg-433). A trailing separator is tolerated.
+    """
+    parts = raw.replace("\\", "/").rstrip("/").split("/")
+    # parts[0] is "" for "/srv/..." (the root) or a drive such as "C:".
+    return all(part not in ("", ".", "..") for part in parts[1:])
+
+
 def _overlaps(a: PurePosixPath, b: PurePosixPath) -> bool:
     """True when ``a`` equals ``b``, lies under it, or contains it."""
     return a == b or b in a.parents or a in b.parents
@@ -271,13 +283,27 @@ class CodexSettings(BaseModel):
         it, so refusing only paths *under* the sensitive roots is not enough
         (the ancestor half is the implementer's reading, see PR #46).
 
+        ``codex_home``: absolute and normalised (#53 PR-gate, msg-433).
+        Its parent is one of the sensitive roots, and that parent is taken
+        syntactically; a relative ``codex_home`` made it a relative root the
+        overlap check skipped, and ``/a/b/../c`` made it ``/a/b/..`` instead
+        of ``/a``. Both are refused rather than normalised, so the path the
+        operator wrote is the path bwrap binds and the hash covers.
+        Symlinks are not resolved (the directory need not exist at load
+        time); the same holds for ``ro_binds``.
+
         ``cli_overrides``: ``key=value`` only; keys starting with any
         ``CODEX_FORBIDDEN_OVERRIDE_PREFIXES`` entry are refused.
         """
+        if not os.path.isabs(self.codex_home) or not _is_normalised(self.codex_home):
+            raise ValueError(
+                f"codex.codex_home {self.codex_home!r} must be an absolute, normalised path "
+                f"(no '.', '..' or empty components)"
+            )
         sensitive = [
             PurePosixPath("/home"),
             PurePosixPath("/root"),
-            PurePosixPath(self.codex_home).parent,
+            _posix(Path(self.codex_home)).parent,
             _posix(_LEXORA_REPO_ROOT),
             _posix(Path.cwd()),
         ]

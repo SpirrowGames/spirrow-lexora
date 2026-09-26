@@ -270,6 +270,23 @@ routing:
           capabilities: ["code", "reasoning", "analysis", "general", "frontier"]
           description: "Anthropic Claude Fable 5 (frontier ティア既定モデル、30 日保持・分類器あり)"
 
+# /v1/decide (判断専用エンドポイント) — Jev (TypeSafe) を本番で使う。
+# 2026-09-26 に null/off (出荷時既定) から jev/active へ切替。
+# - TYPESAFE_API_KEY は /etc/spirrow-lexora.env (EnvironmentFile) から読む。
+#   primary: jev でキーが無いと Lexora は起動を拒否する (fail-closed)。
+# - Jev の error / timeout / 429 は NullProvider にフォールバックし、
+#   decisions.db の provider_error に理由が残る (provider="null" で返る)。
+# - 実測 (smoke 2 件, 2026-09-26): noul 0.53s / score 0.57s。timeout_ms 2000 は既定のまま。
+# - jev_model は jev-latest のまま。実際に応答した版は provider_model に記録される。
+#   版を固定する場合はそのログを見てここに書く。
+# - 止める時は mode: "off" (primary は jev のままでよい)。
+decision:
+  primary: "jev"
+  mode: "active"
+  timeout_ms: 2000
+  jev_model: "jev-latest"
+  log_path: "data/decisions.db"
+
 queue:
   max_size: 1000
   default_timeout: 60.0
