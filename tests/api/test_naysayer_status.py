@@ -45,6 +45,12 @@ def test_open_codex(tmp_path: Path) -> None:
         "backend": "codex",
         "primary": "codex",
         "codex": {"codex_disabled_reason": None, "quota_hold_until": None, "inflight_runs": 2},
+        # PR-2b B-6: not a fallback wrapper -> no fallback figures.
+        "mode": "codex",
+        "fallback_since": None,
+        "fallback_calls": None,
+        "fallback_cost_usd": None,
+        "shadow_skipped": None,
     }
 
 
@@ -102,7 +108,17 @@ def test_body_carries_no_content(tmp_path: Path) -> None:
 def test_gemini_tier_has_no_codex_block() -> None:
     gemini = MagicMock(spec=GeminiBackend)
     body = _client(gemini, name="gemini").get("/v1/naysayer/status").json()
-    assert body == {"tier": "naysayer", "backend": "gemini", "primary": "gemini", "codex": None}
+    assert body == {
+        "tier": "naysayer",
+        "backend": "gemini",
+        "primary": "gemini",
+        "codex": None,
+        "mode": None,
+        "fallback_since": None,
+        "fallback_calls": None,
+        "fallback_cost_usd": None,
+        "shadow_skipped": None,
+    }
 
 
 def test_no_naysayer_tier_is_404(tmp_path: Path) -> None:

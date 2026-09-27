@@ -21,8 +21,10 @@ from lexora.decide.config import (
 )
 from lexora.decide.log import DecisionLog, apply_decision_log_migrations
 from lexora.decide.routes import build_default_providers, router as decide_router
+from lexora.backends.fallback import FallbackBackend
 from lexora.services.metrics import MetricsCollector
 from lexora.services.model_registry import ModelRegistry
+from lexora.services.process_lock import acquire_codex_locks
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.router import BackendRouter
@@ -50,6 +52,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Startup
     logger.info("lexora_starting", version=__version__)
 
+    # T-naysayer-codex-backend B-7: one process per codex state DB, enforced
+    # before any backend exists. ProcessLockError aborts startup.
+    app.state.codex_locks = acquire_codex_locks(settings.routing)
+
     # Initialize backend router (supports both single and multi-backend modes)
     app.state.backend_router = BackendRouter(
         routing_settings=settings.routing,
@@ -71,6 +77,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Initialize services
     app.state.stats_collector = StatsCollector()
     app.state.cost_tracker = CostTracker()
+    # B-3 / B-5: fallback backends count Gemini-fallback calls from, and
+    # write shadow comparisons to, the same ledger the routes write.
+    for backend in app.state.backend_router.backends.values():
+        if isinstance(backend, FallbackBackend):
+            backend.attach_ledger(app.state.cost_tracker)
     app.state.retry_handler = RetryHandler(
         max_retries=settings.retry.max_retries,
         base_delay=settings.retry.base_delay,
@@ -98,6 +109,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Shutdown
     logger.info("lexora_shutting_down")
     await app.state.backend_router.close()
+    for lock in getattr(app.state, "codex_locks", []):
+        lock.release()
     decision_log = getattr(app.state, "decision_log", None)
     if decision_log is not None:
         decision_log.close()
@@ -282,6 +295,9 @@ def main() -> None:
         host=settings.server.host,
         port=settings.server.port,
         reload=False,
+        # One worker, stated for the reader; the enforcement is the codex
+        # state lock taken in ``lifespan`` (T-naysayer-codex-backend B-7).
+        workers=1,
     )
 
 
