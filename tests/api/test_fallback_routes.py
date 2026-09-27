@@ -29,6 +29,7 @@ from lexora.api.routes import (
     is_rate_limit_enabled,
     router,
 )
+from lexora.backends.answer_route import current_answer_route
 from lexora.backends.fallback import FallbackBackend
 from lexora.services.cost_tracker import CostTracker
 from lexora.services.rate_limiter import RateLimiter
@@ -40,8 +41,8 @@ from tests.backends.test_fallback import GEMINI_MODEL, FakeGemini
 WRAPPER = "naysayer-fb"
 
 
-def _wrapper(tmp_path: Path, *, verified: bool, mode: str = "fallback") -> FallbackBackend:
-    codex = make_backend(tmp_path, "ok")
+def _wrapper(tmp_path: Path, *, verified: bool, mode: str = "fallback", scenario: str = "ok") -> FallbackBackend:
+    codex = make_backend(tmp_path, scenario)
     if verified:
         record_pass(codex)
     w = FallbackBackend(
@@ -107,6 +108,22 @@ class TestLedgerThroughTheRoutes:
         assert (backend, answered_by, model, known, tier) == ("gemini", "gemini-fallback", GEMINI_MODEL, 1, "naysayer")
         assert cost > 0
 
+    @pytest.mark.parametrize("stream", [False, True], ids=["plain", "stream"])
+    @pytest.mark.parametrize(("path", "body"), ROUTES)
+    def test_codex_answer_without_usage_still_gets_a_row(
+        self, tmp_path: Path, path: str, body: dict[str, Any], stream: bool
+    ) -> None:
+        """msg-501 (fixing B-2): codex answers are counted, and mindwire's
+        attestation reads the row, so a codex answer whose CLI reported no
+        usage still opens exactly one row -- at zero tokens, zero cost."""
+        ledger = CostTracker(tmp_path / "costs.db")
+        w = _wrapper(tmp_path, verified=True, scenario="no_usage")
+        response = _client(w, ledger).post(path, json={**body, "stream": stream})
+        assert response.status_code == 200, response.text
+        assert _rows(tmp_path / "costs.db") == [("codex", "codex", "gpt-5-codex", 0.0, 1, "naysayer")]
+        with sqlite3.connect(tmp_path / "costs.db") as conn:
+            assert conn.execute("SELECT tokens_input, tokens_output FROM request_costs").fetchall() == [(0, 0)]
+
     def test_shadow_gemini_answer_is_not_a_fallback(self, tmp_path: Path) -> None:
         ledger = CostTracker(tmp_path / "costs.db")
         w = _wrapper(tmp_path, verified=False, mode="shadow")  # closed codex: no shadow run
@@ -142,3 +159,28 @@ class TestStatusUnwrapsTheWrapper:
         body = _client(w, CostTracker(tmp_path / "costs.db")).get("/v1/naysayer/status").json()
         assert (body["primary"], body["mode"]) == ("gemini", "shadow")
         assert body["codex"]["codex_disabled_reason"] == "quota_hold"
+
+
+class TestShouldRecord:
+    """msg-501: the zero-token exception applies only when a fallback
+    wrapper stamped the answer route; every other path is unchanged."""
+
+    def test_without_a_route_zero_tokens_open_no_row(self) -> None:
+        from lexora.api.routes import _should_record
+
+        assert current_answer_route() is None
+        assert _should_record(0, 0) is False
+        assert _should_record(1, 0) is True and _should_record(0, 1) is True
+
+    def test_with_a_route_zero_tokens_open_a_row(self) -> None:
+        import contextvars
+
+        from lexora.api.routes import _should_record
+        from lexora.backends.answer_route import AnswerRoute, set_answer_route
+
+        def stamped() -> bool:
+            set_answer_route(AnswerRoute(backend="codex", answered_by="codex", model="gpt-5-codex"))
+            return _should_record(0, 0)
+
+        assert contextvars.copy_context().run(stamped) is True
+        assert current_answer_route() is None  # nothing leaked into this context
