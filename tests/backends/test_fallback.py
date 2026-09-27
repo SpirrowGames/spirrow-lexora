@@ -17,7 +17,13 @@ import pytest
 
 from lexora.backends.answer_route import current_answer_route
 from lexora.backends.base import Backend, UsageSink
-from lexora.backends.codex import CodexAuthError, CodexBackend, CodexQuotaError
+from lexora.backends.codex import (
+    CodexAuthError,
+    CodexBackend,
+    CodexFailed,
+    CodexQuotaError,
+    CodexUnsupportedInputError,
+)
 from lexora.backends.fallback import (
     FALLBACK_ERRORS,
     NOTICE_MAX_CHARS,
@@ -205,21 +211,53 @@ class TestFallbackDecision:
         assert _text(await w.chat_completions(REQUEST)) == GEMINI_TEXT
         assert w._last_reason == "launch_failed"
 
-    async def test_auth_failure_is_not_in_the_b1_list(self, tmp_path: Path, wrappers: list) -> None:
-        """B-1 lists quota / launch / not-verified / timeout / latch only."""
+    async def test_auth_failure_falls_back_with_a_started_notice(self, tmp_path: Path, wrappers: list) -> None:
+        """B-1' (msg-498): an expired / revoked login falls back to Gemini, the
+        ledger row is `gemini-fallback`, and the STARTED notice says auth."""
         w = _make(wrappers, tmp_path)
+        posted = _capture_posts(w)
 
         async def auth_fails(*_a: Any, **_k: Any) -> Any:
             # A classified auth failure (terminal event present). The fake
             # CLI's "auth" scenario has no terminal event, so it is a D-1d
-            # latch -- which does fall back.
+            # latch -- which falls back as well.
             raise CodexAuthError("not logged in")
 
         w.primary.chat_completions = auth_fails  # type: ignore[method-assign]
-        with pytest.raises(CodexAuthError):
+        assert _text(await w.chat_completions(REQUEST)) == GEMINI_TEXT
+        assert w.fallback.calls[0]["model"] == GEMINI_MODEL  # type: ignore[attr-defined]
+        assert w._last_reason == "auth"
+        w.ledger.record(model=GEMINI_MODEL, endpoint="/v1/chat/completions", tokens_input=10, tokens_output=1, backend="naysayer-fb")
+        with sqlite3.connect(tmp_path / "costs.db") as conn:
+            backend, answered_by = conn.execute(
+                "SELECT backend, answered_by FROM request_costs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        assert (backend, answered_by) == ("gemini", "gemini-fallback")
+        await _sends(w)
+        assert len(posted) == 1
+        assert posted[0].startswith("[Lexora naysayer] fallback STARTED: reason=auth ")
+
+    @pytest.mark.parametrize(
+        "exc",
+        [CodexFailed("unclassified"), CodexUnsupportedInputError("bad input")],
+        ids=["failed", "unsupported-input"],
+    )
+    async def test_unclassified_and_caller_errors_do_not_fall_back(
+        self, tmp_path: Path, wrappers: list, exc: Exception
+    ) -> None:
+        """B-1': an unknown failure is not hidden behind Gemini, and a caller
+        error stays the caller's."""
+        w = _make(wrappers, tmp_path)
+
+        async def fails(*_a: Any, **_k: Any) -> Any:
+            raise exc
+
+        w.primary.chat_completions = fails  # type: ignore[method-assign]
+        with pytest.raises(type(exc)):
             await w.chat_completions(REQUEST)
         assert w.fallback.calls == []  # type: ignore[attr-defined]
-        assert not issubclass(CodexAuthError, FALLBACK_ERRORS)
+        assert not issubclass(type(exc), FALLBACK_ERRORS)
+        assert issubclass(CodexAuthError, FALLBACK_ERRORS)
 
     async def test_quota_hold_skips_codex_on_the_next_request(self, tmp_path: Path, wrappers: list) -> None:
         w = _make(wrappers, tmp_path, "quota")
@@ -488,12 +526,31 @@ class TestShadow:
         [row] = w.ledger.shadow_comparisons()
         assert (row["codex_verdict"], row["codex_reason"]) == ("error", "timeout")
 
-    async def test_no_shadow_run_during_a_hold(self, tmp_path: Path, wrappers: list) -> None:
+    async def test_no_shadow_run_during_a_hold_but_a_not_run_row(self, tmp_path: Path, wrappers: list) -> None:
+        """B-5 no run during a hold; B-5' (msg-498) still one `not_run` row."""
         w = _make(wrappers, tmp_path, mode="shadow")
         w.primary._quota_hold_until = datetime.now(timezone.utc) + timedelta(hours=1)
         await w.chat_completions(REQUEST)
         await _shadow_idle(w)
-        assert w.ledger.shadow_comparisons() == []
+        assert w.primary.state_store.runs() == []
+        [row] = w.ledger.shadow_comparisons()
+        assert (row["gemini_verdict"], row["codex_verdict"], row["codex_reason"], row["codex_seconds"]) == (
+            "APPROVE", "not_run", "quota_hold", None,
+        )
+        assert row["gemini_seconds"] is not None
+
+    async def test_closed_gate_writes_not_run_with_its_reason(self, tmp_path: Path, wrappers: list) -> None:
+        """B-5': a gate closed mid-period (here: never verified) is visible
+        in the comparison rows, one per request, with the gate's reason."""
+        w = _make(wrappers, tmp_path, mode="shadow", verified=False)
+        for _ in range(2):
+            await w.chat_completions(REQUEST)
+            await _shadow_idle(w)
+        rows = w.ledger.shadow_comparisons()
+        assert [(r["codex_verdict"], r["codex_reason"]) for r in rows] == [
+            ("not_run", "verification_missing"),
+            ("not_run", "verification_missing"),
+        ]
         assert w.primary.state_store.runs() == []
 
     async def test_gemini_failure_is_recorded_as_error(self, tmp_path: Path, wrappers: list) -> None:
@@ -534,6 +591,9 @@ class TestShadowReport:
             ("blocking", "blocking", None),
             ("unparsed", "APPROVE", None),
             ("APPROVE", "error", "quota"),
+            ("APPROVE", "not_run", "tool_use_violation"),
+            ("APPROVE", "not_run", "tool_use_violation"),
+            ("blocking", "not_run", "quota_hold"),
         ]:
             ledger.record_shadow_comparison(tier="naysayer", gemini_verdict=g, codex_verdict=c, codex_reason=reason, gemini_seconds=2.0, codex_seconds=4.0)
         assert shadow_report.main(["--db", str(tmp_path / "costs.db")]) == 0
@@ -542,6 +602,7 @@ class TestShadowReport:
         assert out["agreement_rate"] == round(2 / 3, 4)
         assert out["unparsed"] == {"gemini": 1, "codex": 0}
         assert out["codex_failures"] == {"quota": 1}
+        assert out["codex_not_run"] == {"tool_use_violation": 2, "quota_hold": 1}
         assert out["median_seconds"] == {"gemini": 2.0, "codex": 4.0}
 
 

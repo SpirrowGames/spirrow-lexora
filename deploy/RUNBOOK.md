@@ -111,7 +111,8 @@
    - `fallback_since`、`fallback_calls`、`fallback_cost_usd`。
    - `codex.codex_disabled_reason`、`codex.quota_hold_until`。
 2. `codex_disabled_reason` が `quota_hold` 以外なら、上の 2 の表に従って対処します。`quota_hold` なら、待てば戻ります。
-3. 期間中の費用は、台帳でも確かめられます。
+3. 通知の `reason=auth` は、codex の device login が期限切れか失効していることを表します（msg-498 B-1'）。この理由は `codex_disabled_reason` には出ません。{{HOST_SERVICES}}（[[platform:infra-registry]]）で `codex login --device-auth` をやり直してください。やり直すまでは、リクエストのたびに codex が起動して auth で失敗し、Gemini が答えます。
+4. 期間中の費用は、台帳でも確かめられます。
 
    ```sh
    sqlite3 data/costs.db "SELECT COUNT(*), SUM(cost_usd) FROM request_costs WHERE answered_by='gemini-fallback' AND timestamp >= '<fallback_since>';"
@@ -135,6 +136,7 @@
   | `agreement_rate` / `disagreements` | `compared` のうち、一致した割合と、不一致の件数 |
   | `unparsed` | verdict を読めなかった件数（両側それぞれ） |
   | `codex_failures` | codex が失敗した件数を、理由ごとに数えたもの |
+  | `codex_not_run` | ゲートが閉じていたために codex を走らせなかった件数を、ゲートの理由ごとに数えたもの（msg-498 B-5'）。`tool_use_violation` や `run_unfinished` があれば、比較期間の途中で latch していたということなので、上の 3 に従って解除します |
   | `gemini_errors` | Gemini の側の失敗の件数 |
   | `median_seconds` | 所要時間の中央値 |
 

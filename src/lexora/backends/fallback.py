@@ -20,8 +20,12 @@ backends, and a ``mode``:
   skipped and counted in ``shadow_skipped``. A comparison row -- verdicts and
   timings, never text -- goes to ``shadow_comparisons`` in the cost DB.
 
-Errors that do NOT fall back and reach the caller: ``CodexAuthError``,
-``CodexFailed``, ``CodexUnsupportedInputError`` (not in B-1's list).
+``CodexAuthError`` falls back too (msg-498 B-1'): an expired or revoked
+device login is a known, recoverable state, and the "started" notice carries
+``reason=auth`` so the operator learns a re-login is needed. Errors that do
+NOT fall back and reach the caller: ``CodexFailed`` (unclassified -- an
+unknown failure is not hidden behind Gemini) and
+``CodexUnsupportedInputError`` (a caller error).
 
 **Notifications (B-3), producer declaration.** Intended reader: the human
 operator (Takahito). Surface: a Discord webhook named by the
@@ -62,6 +66,7 @@ from lexora.backends.answer_route import (
 )
 from lexora.backends.base import Backend, UsageSink
 from lexora.backends.codex import (
+    CodexAuthError,
     CodexAvailability,
     CodexBackend,
     CodexError,
@@ -84,12 +89,16 @@ WEBHOOK_ENV = "LEXORA_FALLBACK_WEBHOOK_URL"
 NOTICE_MAX_CHARS = 500
 CHECK_INTERVAL_S = 600.0
 REMIND_AFTER = timedelta(hours=6)
+#: ``shadow_comparisons.codex_verdict`` when the gate was closed and codex
+#: did not run (B-5'); ``codex_reason`` then holds the gate's reason.
+SHADOW_NOT_RUN = "not_run"
 
-#: The B-1 list: these fall back to Gemini. ``CodexUnverifiableRun`` is a
-#: ``CodexToolUseViolation`` (a latch).
+#: The B-1 list plus ``CodexAuthError`` (B-1'): these fall back to Gemini.
+#: ``CodexUnverifiableRun`` is a ``CodexToolUseViolation`` (a latch).
 FALLBACK_ERRORS: tuple[type[CodexError], ...] = (
     CodexNotVerifiedError,
     CodexQuotaError,
+    CodexAuthError,
     CodexLaunchError,
     CodexTimeout,
     CodexToolUseViolation,
@@ -102,6 +111,8 @@ def fallback_reason(exc: CodexError) -> str:
         return exc.reason
     if isinstance(exc, CodexQuotaError):
         return "quota"
+    if isinstance(exc, CodexAuthError):
+        return "auth"
     if isinstance(exc, CodexLaunchError):
         return "launch_failed"
     if isinstance(exc, CodexTimeout):
@@ -453,7 +464,19 @@ class FallbackBackend(Backend):
         availability = await self.primary.codex_availability()
         if not availability.open:
             # B-5: a closed gate (a quota hold included) means no shadow run.
+            # B-5' (msg-498): still write a row -- `not_run` with the gate's
+            # reason -- so a latch that stops codex mid-way through the
+            # comparison period shows up in `shadow_report` instead of the
+            # rows silently ceasing to grow. One row per request, no text.
             logger.info("naysayer_shadow_not_run", backend=self.name, reason=availability.reason)
+            gemini_text, gemini_seconds = await gemini_done
+            self._write_comparison(
+                gemini_text=gemini_text,
+                gemini_seconds=gemini_seconds,
+                codex_verdict=SHADOW_NOT_RUN,
+                codex_reason=availability.reason or "unknown",
+                codex_seconds=None,
+            )
             return
         started = time.monotonic()
         codex_text: str | None = None
@@ -475,13 +498,30 @@ class FallbackBackend(Backend):
                 )
         codex_seconds = time.monotonic() - started
         gemini_text, gemini_seconds = await gemini_done
+        self._write_comparison(
+            gemini_text=gemini_text,
+            gemini_seconds=gemini_seconds,
+            codex_verdict="error" if codex_reason is not None else extract_verdict(codex_text),
+            codex_reason=codex_reason,
+            codex_seconds=codex_seconds,
+        )
+
+    def _write_comparison(
+        self,
+        *,
+        gemini_text: str | None,
+        gemini_seconds: float | None,
+        codex_verdict: str,
+        codex_reason: str | None,
+        codex_seconds: float | None,
+    ) -> None:
         if self.ledger is None:
             return
         try:
             self.ledger.record_shadow_comparison(
                 tier=self.tier_label,
                 gemini_verdict="error" if gemini_text is None else extract_verdict(gemini_text),
-                codex_verdict="error" if codex_reason is not None else extract_verdict(codex_text),
+                codex_verdict=codex_verdict,
                 codex_reason=codex_reason,
                 gemini_seconds=gemini_seconds,
                 codex_seconds=codex_seconds,

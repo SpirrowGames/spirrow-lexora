@@ -8,6 +8,8 @@ timings only, never text) and prints:
 * agreement rate over those rows, and the number of disagreements;
 * ``unparsed`` counts per side;
 * codex failures by reason (``codex_verdict = error``), and Gemini errors;
+* codex not run, by the gate's reason (``codex_verdict = not_run``,
+  msg-498 B-5'): a latch or hold that stopped codex during the period;
 * median seconds per side.
 
 These are the figures Bohr takes to Takahito for the shadow -> codex-primary
@@ -48,6 +50,9 @@ def summarise(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "codex": sum(1 for r in rows if r["codex_verdict"] == "unparsed"),
         },
         "codex_failures": dict(Counter(r["codex_reason"] or "unknown" for r in rows if r["codex_verdict"] == "error")),
+        "codex_not_run": dict(
+            Counter(r["codex_reason"] or "unknown" for r in rows if r["codex_verdict"] == "not_run")
+        ),
         "gemini_errors": sum(1 for r in rows if r["gemini_verdict"] == "error"),
         "median_seconds": {"gemini": median("gemini_seconds"), "codex": median("codex_seconds")},
     }
