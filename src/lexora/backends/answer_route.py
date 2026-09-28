@@ -6,7 +6,7 @@ record the backend that *answered*, not the wrapper the tier names, and which
 route it took (``answered_by``: ``codex`` / ``gemini-fallback`` /
 ``codex-shadow``, msg-448 B-2).
 
-The ten ``cost_tracker.record`` sites in ``api/routes.py`` all pass
+Every ``cost_tracker.record`` site in ``api/routes.py`` passes
 ``backend=<the tier's backend name>``. Rather than thread a new argument
 through each of them, the wrapper stamps an ``AnswerRoute`` into this context
 variable and ``CostTracker.record`` reads it. Why that is safe:
