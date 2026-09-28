@@ -105,6 +105,7 @@ from lexora.backends.codex import (
     EventFindings,
     _error_text,
     is_terminal_event,
+    verify_provider_overrides,
 )
 from lexora.backends.codex_verification import (
     ClearViolationError,
@@ -555,14 +556,9 @@ class MockModelServer:
         self._server.server_close()
 
 
-def provider_overrides(base_url: str, wire_api: str) -> list[str]:
-    """``-c`` overrides pointing the CLI at the mock (excluded from the hash)."""
-    return [
-        'model_provider="lexora_verify"',
-        'model_providers.lexora_verify.name="lexora-verify"',
-        f'model_providers.lexora_verify.base_url="{base_url}"',
-        f'model_providers.lexora_verify.wire_api="{wire_api}"',
-    ]
+#: The overrides now live in the backend, which enforces a loopback target
+#: (msg-541); kept under the old name for readers of this module.
+provider_overrides = verify_provider_overrides
 
 
 # --------------------------------------------------------------------------
@@ -725,12 +721,13 @@ async def _drive(
 ) -> tuple[CodexRun | None, EventFindings, str | None]:
     """One ``codex exec`` against a fresh mock. Returns (run, findings, error)."""
     with MockModelServer(state) as server:
-        prompt = f"lexora verify_codex nonce {state.nonce}. Reply with the single word ok."
+        # The backend builds the prompt from the nonce and pins the provider
+        # to this loopback mock (msg-541).
         try:
             run, findings = await backend._run_unverified(
-                prompt,
-                backend.resolve_model(None),
-                extra_overrides=provider_overrides(server.base_url, wire_api),
+                state.nonce,
+                mock_base_url=server.base_url,
+                wire_api=wire_api,
                 timeout=V2_TIMEOUT_S,
             )
         except CodexError as exc:

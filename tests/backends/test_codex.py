@@ -27,6 +27,7 @@ from lexora.backends.base import UsageSink
 from lexora.backends.codex import (
     CodexAuthError,
     CodexBackend,
+    CodexError,
     CodexFailed,
     CodexLaunchError,
     CodexNotVerifiedError,
@@ -1211,3 +1212,96 @@ class TestStateTable:
         record_pass(backend)
         backend.state_store.record_run_started("codex", "dead-instance")
         assert await _reason(_restart(tmp_path, backend)) == "run_unfinished"
+
+
+# --------------------------------------------------------------------------
+# _run_unverified lockdown (msg-541)
+# --------------------------------------------------------------------------
+
+NONCE = "0123456789abcdef01234567"
+
+
+class TestRunUnverifiedLockdown:
+    """The ungated path skips the data-controls gate, so the backend itself
+    guarantees a fixed prompt and a loopback-only provider (msg-541)."""
+
+    @pytest.fixture
+    def executed(self, tmp_path: Path) -> tuple[CodexBackend, list[tuple[Any, ...]]]:
+        backend = make_backend(tmp_path)
+        calls: list[tuple[Any, ...]] = []
+
+        async def fake_execute(*args: Any, **kwargs: Any) -> Any:
+            calls.append((args, kwargs))
+            return CodexRun(returncode=0, stdout="", stderr="", events=[], last_message="ok"), codex_mod.EventFindings()
+
+        backend._execute = fake_execute  # type: ignore[method-assign]
+        return backend, calls
+
+    async def test_prompt_is_the_template_and_provider_is_pinned(self, executed: Any) -> None:
+        backend, calls = executed
+        await backend._run_unverified(NONCE, mock_base_url="http://127.0.0.1:4321/v1", wire_api="chat", timeout=5)
+        (args, _), = calls
+        prompt, model, overrides, timeout = args
+        assert prompt == codex_mod.VERIFY_PROMPT_TEMPLATE.format(nonce=NONCE)
+        assert model == backend.resolve_model(None)
+        assert overrides == codex_mod.verify_provider_overrides("http://127.0.0.1:4321/v1", "chat")
+        assert 'model_provider="lexora_verify"' in overrides
+        assert timeout == 5
+
+    @pytest.mark.parametrize("url", ["http://[::1]:9/v1", "http://localhost:9/v1", "https://LOCALHOST/v1"])
+    async def test_loopback_literals_are_accepted(self, executed: Any, url: str) -> None:
+        backend, calls = executed
+        await backend._run_unverified(NONCE, mock_base_url=url)
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize(
+        "nonce",
+        ["", "n", NONCE.upper(), NONCE + "0", NONCE[:-1], NONCE + "\n", "design doc: secret plan " + NONCE, 123],
+        ids=["empty", "short", "upper", "long", "23", "newline", "payload", "not-str"],
+    )
+    async def test_bad_nonce_is_refused_before_execute(self, executed: Any, nonce: Any) -> None:
+        backend, calls = executed
+        with pytest.raises(CodexError):
+            await backend._run_unverified(nonce, mock_base_url="http://127.0.0.1:1/v1")
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "",
+            "https://api.openai.com/v1",
+            "http://127.0.0.2:1/v1",
+            "http://127.0.0.1.evil.example/v1",
+            "http://127.0.0.1@evil.example/v1",
+            "http://localhost.evil.example/v1",
+            "http://0.0.0.0:1/v1",
+            "file:///127.0.0.1",
+            "ftp://127.0.0.1/v1",
+            'http://127.0.0.1:1/v1" model_provider="openai',
+            "http://127.0.0.1:1/v1\nx=1",
+            "http://127.0.0.1:notaport/v1",
+        ],
+    )
+    async def test_non_loopback_or_malformed_url_is_refused_before_execute(self, executed: Any, url: str) -> None:
+        backend, calls = executed
+        with pytest.raises(CodexError):
+            await backend._run_unverified(NONCE, mock_base_url=url)
+        assert calls == []
+
+    async def test_url_is_required(self, executed: Any) -> None:
+        backend, calls = executed
+        with pytest.raises(TypeError):
+            await backend._run_unverified(NONCE)  # type: ignore[call-arg]
+        assert calls == []
+
+    async def test_unknown_wire_api_is_refused(self, executed: Any) -> None:
+        backend, calls = executed
+        with pytest.raises(CodexError):
+            await backend._run_unverified(NONCE, mock_base_url="http://127.0.0.1:1/v1", wire_api='chat" x="y')
+        assert calls == []
+
+    def test_no_prompt_or_override_parameter(self) -> None:
+        import inspect
+
+        params = set(inspect.signature(CodexBackend._run_unverified).parameters)
+        assert params == {"self", "nonce", "mock_base_url", "wire_api", "timeout"}

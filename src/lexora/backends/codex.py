@@ -14,7 +14,9 @@ Safety structure, in the order a request meets it:
    taken against the same ``codex --version`` and the same config hash
    (``config_hash``) as now, and no runtime tool-use violation has been
    latched since. Otherwise ``CodexNotVerifiedError``. The gate has no
-   config switch. The only ungated entry is ``_run_unverified``, whose only
+   config switch. The only ungated entry is ``_run_unverified``; it builds
+   its own fixed prompt from a hex nonce and only talks to a loopback mock
+   provider, both enforced inside the backend (msg-541), and its only
    caller is ``lexora/tools/verify_codex.py`` (pinned by a test).
 2. **Input gate** -- non-text content blocks, ``tools`` / ``functions`` and
    tool-role messages are refused (``CodexUnsupportedInputError``).
@@ -67,6 +69,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from lexora.backends.base import Backend, BackendError, UsageSink
 from lexora.backends.codex_data_controls import (
@@ -102,6 +105,34 @@ SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin"
 TOOL_DISABLE_OVERRIDE_KEYS: frozenset[str] = frozenset()
 
 
+def verify_provider_overrides(base_url: str, wire_api: str) -> list[str]:
+    """``-c`` overrides pointing the CLI at the loopback verification mock.
+
+    Excluded from the config hash (they are never part of production
+    ``cli_overrides``). Refuses (``CodexError``) a ``base_url`` that is not
+    http(s) to a literal loopback host, carries characters that could break
+    out of the quoted value, or a ``wire_api`` outside ``VERIFY_WIRE_APIS``.
+    """
+    if wire_api not in VERIFY_WIRE_APIS:
+        raise CodexError(f"unverified run refused: wire_api must be one of {VERIFY_WIRE_APIS}")
+    if not isinstance(base_url, str) or not base_url or any(c in base_url for c in '"\\\n\r\t '):
+        raise CodexError("unverified run refused: mock base URL missing or malformed")
+    try:
+        parts = urlsplit(base_url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as exc:
+        raise CodexError("unverified run refused: mock base URL malformed") from exc
+    if parts.scheme not in ("http", "https") or host is None or host.lower() not in LOOPBACK_HOSTS:
+        raise CodexError("unverified run refused: mock base URL must be http(s) to a loopback host")
+    return [
+        'model_provider="lexora_verify"',
+        'model_providers.lexora_verify.name="lexora-verify"',
+        f'model_providers.lexora_verify.base_url="{base_url}"',
+        f'model_providers.lexora_verify.wire_api="{wire_api}"',
+    ]
+
+
 def override_key(override: str) -> str:
     """Key part of a ``key=value`` ``-c`` override, stripped and lowercased."""
     return override.split("=", 1)[0].strip().lower()
@@ -109,6 +140,22 @@ def override_key(override: str) -> str:
 
 #: Output file name inside the per-request working directory.
 LAST_MESSAGE_FILE = "last_message.txt"
+
+# ``_run_unverified`` lockdown (T-naysayer-codex-backend msg-541, endorsed by
+# Einstein): the ungated path skips the data-controls gate, so the backend --
+# not the caller -- guarantees that it carries no project data and never
+# reaches the real provider.
+
+#: The ONLY prompt ``_run_unverified`` ever sends. ``{nonce}`` is the one hole.
+VERIFY_PROMPT_TEMPLATE = "lexora verify_codex nonce {nonce}. Reply with the single word ok."
+#: ``secrets.token_hex(12)``: exactly 24 lowercase hex characters.
+VERIFY_NONCE_RE = re.compile(r"[0-9a-f]{24}")
+#: Hosts the verification provider may point at. Literal match on the parsed
+#: host, no name resolution (msg-541 / Einstein: no DNS rebinding).
+LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+#: ``wire_api`` values the CLI knows; anything else is refused before it is
+#: interpolated into a ``-c`` override.
+VERIFY_WIRE_APIS: tuple[str, ...] = ("responses", "chat")
 
 
 # --------------------------------------------------------------------------
@@ -1047,9 +1094,10 @@ class CodexBackend(Backend):
 
     async def _run_unverified(
         self,
-        prompt: str,
-        model: str,
-        extra_overrides: Sequence[str] = (),
+        nonce: str,
+        *,
+        mock_base_url: str,
+        wire_api: str = "responses",
         timeout: float | None = None,
     ) -> tuple[CodexRun, EventFindings]:
         """``_execute`` WITHOUT the gate and WITHOUT the latch.
@@ -1058,8 +1106,25 @@ class CodexBackend(Backend):
         pass a gate it is there to open, and whose control run executes tools
         on purpose (msg-318/319) -- so this path must never latch. A test
         greps for the caller.
+
+        Because it also skips the data-controls gate (A-15-2b), the caller is
+        not trusted with what is sent or where (msg-541):
+
+        1. No prompt argument: the prompt is ``VERIFY_PROMPT_TEMPLATE`` with
+           ``nonce``, which must be exactly 24 lowercase hex characters.
+        2. The provider is always overridden to ``mock_base_url``, whose
+           parsed host must be literally one of ``LOOPBACK_HOSTS``; there is
+           no way to run this path against the real provider.
+        3. No other ``-c`` override is accepted; ``wire_api`` is one of
+           ``VERIFY_WIRE_APIS``. The model is the backend's own default.
+
+        Any violation raises ``CodexError`` before anything is started.
         """
-        return await self._execute(prompt, model, extra_overrides, timeout)
+        overrides = verify_provider_overrides(mock_base_url, wire_api)
+        if not isinstance(nonce, str) or VERIFY_NONCE_RE.fullmatch(nonce) is None:
+            raise CodexError("unverified run refused: nonce must be 24 lowercase hex characters")
+        prompt = VERIFY_PROMPT_TEMPLATE.format(nonce=nonce)
+        return await self._execute(prompt, self.resolve_model(None), overrides, timeout)
 
     async def _run_gated(
         self, prompt: str, model: str, availability: CodexAvailability | None = None
