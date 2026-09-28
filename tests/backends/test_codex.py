@@ -45,6 +45,7 @@ from lexora.backends.codex import (
     usage_from_events,
 )
 from lexora.backends.codex import CodexRun
+from lexora.backends.codex_data_controls import DataControls
 from lexora.backends import codex_verification
 from lexora.backends.codex_verification import ClearViolationError, CodexStateStore
 from lexora.backends.factory import create_backend
@@ -66,6 +67,15 @@ def _host_env(backend: CodexBackend) -> dict[str, str]:
     return env
 
 
+def fresh_data_controls(tmp_path: Path) -> DataControls:
+    """A data-controls record verified just now (A-15-2b), so the gate's
+    other conditions are what a test exercises."""
+    path = tmp_path / "codex_data_controls.yaml"
+    stamp = datetime.now(timezone.utc).isoformat()
+    path.write_text(f'data_controls_verified_at: "{stamp}"\n', encoding="utf-8")
+    return DataControls(path)
+
+
 def make_backend(
     tmp_path: Path, scenario: str = "ok", timeout: float = 30.0, cli_overrides: list[str] | None = None
 ) -> CodexBackend:
@@ -78,6 +88,7 @@ def make_backend(
         timeout=timeout,
         cli_overrides=cli_overrides or [],
         name="codex",
+        data_controls=fresh_data_controls(tmp_path),
     )
     backend._wrap = lambda inner, workdir: [sys.executable, FAKE_CLI, backend._scenario, *inner[1:]]  # type: ignore[method-assign]
     backend._scenario = scenario  # type: ignore[attr-defined]

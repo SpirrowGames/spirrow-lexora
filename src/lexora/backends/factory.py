@@ -7,6 +7,7 @@ from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend
 from lexora.backends.claude_code import ClaudeCodeBackend
 from lexora.backends.codex import CodexBackend
+from lexora.backends.codex_data_controls import DataControls
 from lexora.backends.codex_verification import CodexStateStore
 from lexora.backends.fallback import WEBHOOK_ENV, FallbackBackend
 from lexora.backends.gemini import GeminiBackend
@@ -195,6 +196,7 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
             models=settings.get_model_names(),
             timeout=settings.timeout,
             max_concurrency=codex.max_concurrency,
+            data_controls=DataControls(codex.data_controls_file),
             name=name,
         )
     elif settings.type == "fallback":

@@ -28,7 +28,11 @@ Safety structure, in the order a request meets it:
    ``CodexToolUseViolation``. Only ``_run_gated`` writes the latch. Release:
    a human clears each violation with ``verify_codex --clear-violation``,
    THEN ``verify_codex`` must pass again (msg-317).
-5. **Unverifiable runs (D-1d, msg-394/396)** -- a run whose ``--json``
+5. **Data controls (A-15-2b, msg-535)** -- ``codex_availability`` also
+   closes (``data_controls_unverified``) unless a human recorded, less
+   than 30 days ago, that the ChatGPT account does not train on our
+   prompts (``codex_data_controls.py``). No record = closed.
+6. **Unverifiable runs (D-1d, msg-394/396)** -- a run whose ``--json``
    stream was cut short cannot show that no tool ran, so it latches too:
    timeout (``aborted:timeout``), cancellation after the spawn
    (``aborted:cancelled``), death by signal (``aborted:signal``) and a
@@ -65,6 +69,11 @@ from pathlib import Path
 from typing import Any
 
 from lexora.backends.base import Backend, BackendError, UsageSink
+from lexora.backends.codex_data_controls import (
+    REASON_DATA_CONTROLS_UNVERIFIED,
+    DataControls,
+    DataControlsState,
+)
 from lexora.backends.codex_verification import CodexStateStore, VerificationRecord
 from lexora.utils.logging import get_logger
 
@@ -631,8 +640,8 @@ class CodexAvailability:
     Produced only by ``CodexBackend.codex_availability``. The request path
     and ``GET /v1/naysayer/status`` both read this, so they cannot disagree
     (Principle 2). ``reason`` is ``None`` when codex may run; otherwise it is
-    the ``CodexNotVerifiedError.reason`` of the check that closed, or
-    ``quota_hold`` / ``launch_failed``. ``error`` is the exception the
+    the ``CodexNotVerifiedError.reason`` of the check that closed (including
+    ``data_controls_unverified``), or ``quota_hold`` / ``launch_failed``. ``error`` is the exception the
     request path raises for that reason. ``quota_hold_until`` is reported
     whatever ``reason`` is, so a DB fault during a hold hides neither.
     ``version`` is the CLI version when open (it goes on the latch row).
@@ -668,6 +677,7 @@ class CodexBackend(Backend):
         timeout: float = 600.0,
         max_concurrency: int = 2,
         name: str = "codex",
+        data_controls: DataControls | None = None,
     ) -> None:
         self.codex_home = codex_home
         self.state_store = state_store
@@ -679,6 +689,9 @@ class CodexBackend(Backend):
         self.models = list(models)
         self.timeout = timeout
         self.name = name
+        #: A-15-2b. ``None`` is not "no check": it reads as never verified,
+        #: so a backend built without one stays closed (fail-closed).
+        self.data_controls = data_controls
         self._semaphore = asyncio.Semaphore(max_concurrency)
         # D-1e' in-process state (msg-403/408). ``_in_flight`` only excuses
         # this process's own running runs from condition 0; ``_poisoned``
@@ -891,6 +904,23 @@ class CodexBackend(Backend):
             )
         return version
 
+    def data_controls_state(self) -> DataControlsState:
+        """The data-controls record now (hot-reloaded); ``missing`` if none
+        is configured."""
+        if self.data_controls is None:
+            return DataControlsState("missing")
+        return self.data_controls.state()
+
+    def _check_data_controls(self) -> None:
+        """Raise ``CodexNotVerifiedError(data_controls_unverified)`` unless
+        the record is valid (A-15-2b, msg-535: fail-closed)."""
+        state = self.data_controls_state()
+        if not state.valid:
+            raise CodexNotVerifiedError(
+                f"codex data controls not verified ({state.detail}); gate closed",
+                reason=REASON_DATA_CONTROLS_UNVERIFIED,
+            )
+
     async def codex_availability(self) -> CodexAvailability:
         """The single "may codex run now?" decision (S-1'', msg-429).
 
@@ -899,6 +929,9 @@ class CodexBackend(Backend):
 
         1. ``_check_records()`` -- a closed record check wins, so a DB fault
            or a latch is never masked by a quota hold.
+        1b. ``_check_data_controls()`` -- ``data_controls_unverified``
+           (A-15-2b). Before the hold: a privacy stop is not reported as
+           a quota stop.
         2. An active quota hold -> ``quota_hold``; ``codex --version`` is not
            started.
         3. ``_check_version()`` -- ``verification_stale`` on a version
@@ -912,6 +945,10 @@ class CodexBackend(Backend):
             hold = None
         try:
             record = self._check_records()
+        except CodexNotVerifiedError as exc:
+            return CodexAvailability(exc.reason, exc, quota_hold_until=hold)
+        try:
+            self._check_data_controls()
         except CodexNotVerifiedError as exc:
             return CodexAvailability(exc.reason, exc, quota_hold_until=hold)
         if hold is not None:
@@ -1256,6 +1293,7 @@ class CodexBackend(Backend):
         """
         try:
             await self._ensure_verified()
+            self._check_data_controls()
         except CodexError:
             return False
         try:

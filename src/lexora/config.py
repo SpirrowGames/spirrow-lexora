@@ -335,6 +335,17 @@ class CodexSettings(BaseModel):
             "runtime tool-use violation latch."
         ),
     )
+    data_controls_file: str = Field(
+        default="data/codex_data_controls.yaml",
+        description=(
+            "YAML file holding ``data_controls_verified_at``: when a human last "
+            "confirmed the ChatGPT account does not train on our prompts "
+            "(A-15-2b, deploy/RUNBOOK.md section 8). Re-read whenever it "
+            "changes (no restart). Missing, unreadable or older than 30 days: "
+            "codex is closed with ``data_controls_unverified``. Not part of the "
+            "config hash: it changes no command line."
+        ),
+    )
 
 
 class FallbackSettings(BaseModel):
