@@ -27,6 +27,7 @@ from lexora.backends.base import UsageSink
 from lexora.backends.codex import (
     CodexAuthError,
     CodexBackend,
+    CodexError,
     CodexFailed,
     CodexLaunchError,
     CodexNotVerifiedError,
@@ -45,6 +46,7 @@ from lexora.backends.codex import (
     usage_from_events,
 )
 from lexora.backends.codex import CodexRun
+from lexora.backends.codex_data_controls import DataControls
 from lexora.backends import codex_verification
 from lexora.backends.codex_verification import ClearViolationError, CodexStateStore
 from lexora.backends.factory import create_backend
@@ -66,6 +68,15 @@ def _host_env(backend: CodexBackend) -> dict[str, str]:
     return env
 
 
+def fresh_data_controls(tmp_path: Path) -> DataControls:
+    """A data-controls record verified just now (A-15-2b), so the gate's
+    other conditions are what a test exercises."""
+    path = tmp_path / "codex_data_controls.yaml"
+    stamp = datetime.now(timezone.utc).isoformat()
+    path.write_text(f'data_controls_verified_at: "{stamp}"\n', encoding="utf-8")
+    return DataControls(path)
+
+
 def make_backend(
     tmp_path: Path, scenario: str = "ok", timeout: float = 30.0, cli_overrides: list[str] | None = None
 ) -> CodexBackend:
@@ -78,6 +89,7 @@ def make_backend(
         timeout=timeout,
         cli_overrides=cli_overrides or [],
         name="codex",
+        data_controls=fresh_data_controls(tmp_path),
     )
     backend._wrap = lambda inner, workdir: [sys.executable, FAKE_CLI, backend._scenario, *inner[1:]]  # type: ignore[method-assign]
     backend._scenario = scenario  # type: ignore[attr-defined]
@@ -1200,3 +1212,189 @@ class TestStateTable:
         record_pass(backend)
         backend.state_store.record_run_started("codex", "dead-instance")
         assert await _reason(_restart(tmp_path, backend)) == "run_unfinished"
+
+
+# --------------------------------------------------------------------------
+# _run_unverified lockdown (msg-541)
+# --------------------------------------------------------------------------
+
+NONCE = "0123456789abcdef01234567"
+
+
+class TestRunUnverifiedLockdown:
+    """The ungated path skips the data-controls gate, so the backend itself
+    guarantees a fixed prompt and a loopback-only provider (msg-541)."""
+
+    @pytest.fixture
+    def executed(self, tmp_path: Path) -> tuple[CodexBackend, list[tuple[Any, ...]]]:
+        backend = make_backend(tmp_path)
+        calls: list[tuple[Any, ...]] = []
+
+        async def fake_execute(*args: Any, **kwargs: Any) -> Any:
+            calls.append((args, kwargs))
+            return CodexRun(returncode=0, stdout="", stderr="", events=[], last_message="ok"), codex_mod.EventFindings()
+
+        backend._execute = fake_execute  # type: ignore[method-assign]
+        return backend, calls
+
+    async def test_prompt_is_the_template_and_provider_is_pinned(self, executed: Any) -> None:
+        backend, calls = executed
+        await backend._run_unverified(NONCE, mock_base_url="http://127.0.0.1:4321/v1", wire_api="chat", timeout=5)
+        (args, _), = calls
+        prompt, model, overrides, timeout = args
+        assert prompt == codex_mod.VERIFY_PROMPT_TEMPLATE.format(nonce=NONCE)
+        assert model == backend.resolve_model(None)
+        assert overrides == codex_mod.verify_provider_overrides("http://127.0.0.1:4321/v1", "chat")
+        assert 'model_provider="lexora_verify"' in overrides
+        assert timeout == 5
+
+    @pytest.mark.parametrize("url", ["http://[::1]:9/v1", "http://localhost:9/v1", "https://LOCALHOST/v1"])
+    async def test_loopback_literals_are_accepted(self, executed: Any, url: str) -> None:
+        backend, calls = executed
+        await backend._run_unverified(NONCE, mock_base_url=url)
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize(
+        "nonce",
+        ["", "n", NONCE.upper(), NONCE + "0", NONCE[:-1], NONCE + "\n", "design doc: secret plan " + NONCE, 123],
+        ids=["empty", "short", "upper", "long", "23", "newline", "payload", "not-str"],
+    )
+    async def test_bad_nonce_is_refused_before_execute(self, executed: Any, nonce: Any) -> None:
+        backend, calls = executed
+        with pytest.raises(CodexError):
+            await backend._run_unverified(nonce, mock_base_url="http://127.0.0.1:1/v1")
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "",
+            "https://api.openai.com/v1",
+            "http://127.0.0.2:1/v1",
+            "http://127.0.0.1.evil.example/v1",
+            "http://127.0.0.1@evil.example/v1",
+            "http://localhost.evil.example/v1",
+            "http://0.0.0.0:1/v1",
+            "file:///127.0.0.1",
+            "ftp://127.0.0.1/v1",
+            'http://127.0.0.1:1/v1" model_provider="openai',
+            "http://127.0.0.1:1/v1\nx=1",
+            "http://127.0.0.1:notaport/v1",
+        ],
+    )
+    async def test_non_loopback_or_malformed_url_is_refused_before_execute(self, executed: Any, url: str) -> None:
+        backend, calls = executed
+        with pytest.raises(CodexError):
+            await backend._run_unverified(NONCE, mock_base_url=url)
+        assert calls == []
+
+    async def test_url_is_required(self, executed: Any) -> None:
+        backend, calls = executed
+        with pytest.raises(TypeError):
+            await backend._run_unverified(NONCE)  # type: ignore[call-arg]
+        assert calls == []
+
+    async def test_unknown_wire_api_is_refused(self, executed: Any) -> None:
+        backend, calls = executed
+        with pytest.raises(CodexError):
+            await backend._run_unverified(NONCE, mock_base_url="http://127.0.0.1:1/v1", wire_api='chat" x="y')
+        assert calls == []
+
+    def test_no_prompt_or_override_parameter(self) -> None:
+        import inspect
+
+        params = set(inspect.signature(CodexBackend._run_unverified).parameters)
+        assert params == {"self", "nonce", "mock_base_url", "wire_api", "timeout"}
+
+
+class TestVerifyOverridePrecedence:
+    """T-1/T-2 (msg-548, endorsed by Einstein): routing ``_run_unverified`` to
+    the loopback mock relies on the CLI's "last ``-c`` wins" rule, so the
+    verification overrides must come after every production ``cli_overrides``
+    entry in the argv actually handed to the subprocess. Checked through the
+    real ``_execute`` -> ``_build_exec_argv`` -> ``_wrap`` chain, so changing
+    the assembly order anywhere in it fails here."""
+
+    MOCK_URL = "http://127.0.0.1:4321/v1"
+    #: Production overrides that deliberately collide with every verification
+    #: key, plus one unrelated key, all with values the mock must beat.
+    COLLIDING = [
+        'model_provider="openai"',
+        'model_providers.lexora_verify.name="prod"',
+        'model_providers.lexora_verify.base_url="https://api.openai.com/v1"',
+        'model_providers.lexora_verify.wire_api="bogus"',
+        'model_reasoning_effort="high"',
+    ]
+
+    async def _captured_argv(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wire_api: str) -> list[str]:
+        home = tmp_path / "codex-home"
+        home.mkdir(exist_ok=True)
+        backend = CodexBackend(
+            codex_home=str(home),
+            state_store=CodexStateStore(tmp_path / "codex.db"),
+            models=["gpt-5-codex"],
+            cli_overrides=list(self.COLLIDING),
+            name="codex",
+            data_controls=fresh_data_controls(tmp_path),
+        )
+        captured: list[list[str]] = []
+
+        async def capture(*argv: Any, **kwargs: Any) -> Any:
+            captured.append([str(a) for a in argv])
+            raise OSError("captured, not started")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capture)
+        with pytest.raises(CodexLaunchError):
+            await backend._run_unverified(NONCE, mock_base_url=self.MOCK_URL, wire_api=wire_api)
+        assert len(captured) == 1
+        return captured[0]
+
+    @staticmethod
+    def _codex_overrides(argv: list[str]) -> list[str]:
+        """``-c`` values of the codex command (after bwrap's ``--``)."""
+        inner = argv[argv.index("--") + 1 :]
+        return [inner[i + 1] for i, a in enumerate(inner) if a == "-c"]
+
+    @pytest.mark.parametrize("wire_api", ["responses", "chat"])
+    async def test_verify_overrides_follow_every_production_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wire_api: str
+    ) -> None:
+        overrides = self._codex_overrides(await self._captured_argv(tmp_path, monkeypatch, wire_api))
+        verify = codex_mod.verify_provider_overrides(self.MOCK_URL, wire_api)
+        assert all(o in overrides for o in self.COLLIDING + verify)
+        last_production = max(overrides.index(o) for o in self.COLLIDING)
+        first_verify = min(overrides.index(o) for o in verify)
+        assert first_verify > last_production
+
+    @pytest.mark.parametrize("wire_api", ["responses", "chat"])
+    async def test_last_occurrence_of_each_colliding_key_is_the_verify_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wire_api: str
+    ) -> None:
+        overrides = self._codex_overrides(await self._captured_argv(tmp_path, monkeypatch, wire_api))
+        last: dict[str, str] = {}
+        for o in overrides:
+            last[codex_mod.override_key(o)] = o.split("=", 1)[1]
+        assert last["model_provider"] == '"lexora_verify"'
+        assert last["model_providers.lexora_verify.name"] == '"lexora-verify"'
+        assert last["model_providers.lexora_verify.base_url"] == f'"{self.MOCK_URL}"'
+        assert last["model_providers.lexora_verify.wire_api"] == f'"{wire_api}"'
+
+    def test_argv_is_assembled_in_one_place(self) -> None:
+        """T-2: ``_build_exec_argv`` is the only builder of the codex argv and
+        ``_execute`` its only production caller, so the test above sees the
+        real assembly order."""
+        src_root = Path(codex_mod.__file__).resolve().parents[1]
+        callers: list[tuple[str, str]] = []
+        for path in src_root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for func in ast.walk(tree):
+                if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for node in ast.walk(func):
+                    if (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "_build_exec_argv"
+                    ):
+                        callers.append((path.name, func.name))
+        assert callers == [("codex.py", "_execute")]

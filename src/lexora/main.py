@@ -82,6 +82,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     for backend in app.state.backend_router.backends.values():
         if isinstance(backend, FallbackBackend):
             backend.attach_ledger(app.state.cost_tracker)
+            # A-15-2b: the notice loop also carries the daily data-controls
+            # EXPIRING notice, so it runs from start-up, not only in fallback.
+            backend.start()
     app.state.retry_handler = RetryHandler(
         max_retries=settings.retry.max_retries,
         base_delay=settings.retry.base_delay,

@@ -45,6 +45,7 @@
 | `tool_use_violation` / `run_unfinished` | latch 中 | 下の 3 |
 | `schema_outdated` | state DB が古い schema | 下の 4 |
 | `state_unreadable` / `state_unwritable` | state DB が読めない・書けない | ディスクと権限を確かめ、Lexora を再起動 |
+| `data_controls_unverified` | ChatGPT アカウントのデータ設定（学習に使わない設定）を人が確かめた記録が無い・読めない・30 日を過ぎた | 下の 8 |
 
 ## 3. latch の解除（`tool_use_violation` / `run_unfinished`）
 
@@ -143,3 +144,37 @@
 - status の `shadow_skipped` は、裏の codex がまだ走っていたために飛ばした件数です。
 - shadow の run も `inflight_runs` に数えられます。デプロイの前の確認（上の 1）は、そのまま当てはまります。
 - codex が枠切れで hold 中の間は、shadow の run は走りません。そのリクエストは比較の行を残しません。
+
+## 8. データ設定の確認と記録（`data_controls_unverified`、msg-535 A-15-2b）
+
+codex はサブスクの login で動くため、「OpenAI が私たちのプロンプトを学習に使わない」ことは API 鍵の性質ではなく、ChatGPT アカウントの設定です。そこで、人が設定を確かめた日時を記録し、**記録から 30 日を過ぎると codex を止めます**（fail-closed）。記録が無い・読めない・形式が違う・未来の日時のときも止まります。止まっている間は Gemini にフォールバックし、通知は `reason=data_controls_unverified runbook=deploy/RUNBOOK.md#8` で届きます。
+
+### 記録の場所と形式
+
+- ファイル: 設定の `codex.data_controls_file`（既定は `data/codex_data_controls.yaml`）。
+- 中身は 1 行です。UTC オフセット付きの ISO 8601 で書きます（オフセットの無い時刻は受け付けません）。
+
+  ```yaml
+  data_controls_verified_at: "2026-09-29T01:00:00Z"
+  ```
+
+### 手順（30 日ごと、および再ログインのたび）
+
+1. ChatGPT に codex と同じアカウントでログインし、データの設定で「モデルの改善に使う」がオフであることを確かめます。
+2. 確かめた時刻を書きます。書きかけのファイルを読まれないよう、別名で書いてから置き換えます。
+
+   ```sh
+   printf 'data_controls_verified_at: "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > data/codex_data_controls.yaml.tmp
+   mv data/codex_data_controls.yaml.tmp data/codex_data_controls.yaml
+   ```
+
+3. **再起動は要りません。** Lexora はリクエストと status のたびにファイルの変化を見て読み直します。`GET /v1/naysayer/status` の `codex.codex_disabled_reason` が `data_controls_unverified` でなくなったことを確かめます。ログには `codex_data_controls_reloaded`（`expires_at` 付き）が出ます。
+4. フォールバック中だった場合は、次に codex が答えたときに `fallback ENDED` の通知が届きます。
+
+`codex login --device-auth` をやり直したとき（上の 6 の `reason=auth` の対処）も、同じアカウントかどうかを含めてこの手順を必ず踏んでください。
+
+### 期限前の予告
+
+- 期限の 7 日前から、フォールバック通知と同じ webhook に、UTC の 1 日 1 回、`data controls EXPIRING: codex stops in N day(s)` が届きます。
+- 送ったことはメモリに持っています。その日のうちに Lexora を再起動すると、同じ日にもう 1 回届くことがあります。送信に失敗したときは、10 分後の確認でもう一度送ります。
+- 期限が切れた後は予告は止まり、上のフォールバック通知（STARTED、6 時間ごとの CONTINUING、ENDED）に替わります。shadow モードでは Gemini が答えるのでフォールバック通知は出ません。止まっている間は、`shadow_report` の `codex_not_run` に `data_controls_unverified` として数えられます。

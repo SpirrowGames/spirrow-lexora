@@ -39,10 +39,26 @@ answers again. Body: fixed format, at most 500 characters, carrying only
 the event, the reason, ``fallback_since``, the Gemini calls and their cost
 in that period (counted from the ledger), and ``quota_hold_until``.
 
-State (``fallback_since``, the last notification time, ``shadow_skipped``)
-is in memory. That is system-wide because B-7 guarantees one process
-(``services/process_lock.py``). A restart during fallback re-sends "start";
-accepted in msg-448 B-3.
+**Data controls (A-15-2b, msg-535).** Codex closes with
+``reason=data_controls_unverified`` when the human check of the ChatGPT
+account's data controls is missing or older than 30 days
+(``codex_data_controls.py``); that is an ordinary fallback, so it gets the
+STARTED / CONTINUING / ENDED notices above, and those notices then also
+carry ``runbook=deploy/RUNBOOK.md#8``. Before that, from 7 days ahead of
+expiry, the notice loop posts one EXPIRING notice per UTC calendar day
+("codex stops in N days"), same webhook, same 500-character cap. Its
+state is the UTC date of the last EXPIRING notice sent; a failed post
+leaves the date unset, so the next 10-minute tick retries. The notice loop
+runs from start-up (``start``), not only during a fallback, so the warning
+goes out even while codex is answering everything. Re-verifying (updating
+the file) needs no restart: the next request re-reads it.
+
+State (``fallback_since``, the last notification time, ``shadow_skipped``,
+the date of the last EXPIRING notice) is in memory. That is system-wide
+because B-7 guarantees one process (``services/process_lock.py``). A
+restart during fallback re-sends "start"; accepted in msg-448 B-3. A
+restart inside the warning window may send a second EXPIRING notice that
+day; the same trade-off.
 """
 
 from __future__ import annotations
@@ -52,7 +68,7 @@ import json
 import re
 import time
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -76,6 +92,10 @@ from lexora.backends.codex import (
     CodexTimeout,
     CodexToolUseViolation,
     CodexUnverifiableRun,
+)
+from lexora.backends.codex_data_controls import (
+    REASON_DATA_CONTROLS_UNVERIFIED,
+    RUNBOOK_POINTER,
 )
 from lexora.utils.logging import get_logger
 
@@ -228,6 +248,9 @@ class FallbackBackend(Backend):
         self._pending_notice: str | None = None
         self._loop_task: asyncio.Task[None] | None = None
         self._send_tasks: set[asyncio.Task[None]] = set()
+        # A-15-2b pre-expiry warning: UTC date of the last EXPIRING notice
+        # delivered (or skipped for want of a webhook). In memory (B-7).
+        self._expiry_warned_on: date | None = None
         # Shadow state (B-5).
         self._shadow_task: asyncio.Task[None] | None = None
         self.shadow_skipped = 0
@@ -241,6 +264,11 @@ class FallbackBackend(Backend):
 
     def attach_ledger(self, ledger: CostTracker) -> None:
         self.ledger = ledger
+
+    def start(self) -> None:
+        """Start the notice loop (called from ``main.lifespan``, inside the
+        running event loop). Idempotent; requests also ensure it."""
+        self._ensure_loop()
 
     # ---- helpers --------------------------------------------------------
 
@@ -261,6 +289,7 @@ class FallbackBackend(Backend):
     # ---- fallback mode (B-1) ------------------------------------------------
 
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_loop()
         if self.mode == "shadow":
             return await self._shadow_chat(request)
         availability = await self.primary.codex_availability()
@@ -283,6 +312,7 @@ class FallbackBackend(Backend):
     async def chat_completions_stream(
         self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
+        self._ensure_loop()
         if self.mode == "shadow":
             async for chunk in self._shadow_stream(request, usage_sink):
                 yield chunk
@@ -358,6 +388,8 @@ class FallbackBackend(Backend):
             f"fallback_since={since} gemini_calls={calls} gemini_cost_usd={cost} "
             f"quota_hold_until={hold}"
         )
+        if self._last_reason == REASON_DATA_CONTROLS_UNVERIFIED:
+            text += f" runbook={RUNBOOK_POINTER}"
         return text[:NOTICE_MAX_CHARS]
 
     def _notify(self, text: str) -> None:
@@ -397,18 +429,55 @@ class FallbackBackend(Backend):
             await self.notice_tick()
 
     async def notice_tick(self) -> None:
-        """One 10-minute check: retry a parked notice, then remind if due."""
+        """One 10-minute check: retry a parked notice, remind if due, then
+        the daily data-controls EXPIRING notice if due."""
         if self._pending_notice is not None:
             text = self._pending_notice
             if await self._post(text):
                 if self._pending_notice == text:
                     self._pending_notice = None
-        if self._fallback_since is None or self._last_notice_at is None:
+        if self._fallback_since is not None and self._last_notice_at is not None:
+            now = self._clock()
+            if now - self._last_notice_at >= self.remind_after:
+                if not self.webhook_url or await self._post(self._notice_text("CONTINUING")):
+                    self._last_notice_at = now
+        await self._expiry_tick()
+
+    def _expiry_text(self, days_left: int, expires_at: datetime, verified_at: datetime) -> str:
+        text = (
+            f"[Lexora naysayer] data controls EXPIRING: codex stops in {days_left} day(s) "
+            f"at expires_at={expires_at.isoformat()} (verified_at={verified_at.isoformat()}); "
+            f"then reason={REASON_DATA_CONTROLS_UNVERIFIED} and Gemini answers. "
+            f"Re-verify per runbook={RUNBOOK_POINTER}; no restart needed."
+        )
+        return text[:NOTICE_MAX_CHARS]
+
+    async def _expiry_tick(self) -> None:
+        """A-15-2b: at most one EXPIRING notice per UTC calendar day while
+        the record is valid and within 7 days of expiry. Expired / missing
+        records are not warned here: codex is closed then, and the fallback
+        notices (``reason=data_controls_unverified``) take over."""
+        try:
+            state = self.primary.data_controls_state()
+        except Exception as exc:  # noqa: BLE001 - a notice must never raise
+            logger.warning("data_controls_state_failed", backend=self.name, error=type(exc).__name__)
             return
         now = self._clock()
-        if now - self._last_notice_at >= self.remind_after:
-            if not self.webhook_url or await self._post(self._notice_text("CONTINUING")):
-                self._last_notice_at = now
+        if not state.warn_due(now) or state.expires_at is None or state.verified_at is None:
+            return
+        today = now.astimezone(timezone.utc).date()
+        if self._expiry_warned_on == today:
+            return
+        days_left = state.days_left(now)
+        logger.warning(
+            "codex_data_controls_expiring",
+            backend=self.name,
+            days_left=days_left,
+            expires_at=state.expires_at.isoformat(),
+        )
+        text = self._expiry_text(days_left, state.expires_at, state.verified_at)
+        if not self.webhook_url or await self._post(text):
+            self._expiry_warned_on = today
 
     # ---- shadow mode (B-5) -------------------------------------------------
 
