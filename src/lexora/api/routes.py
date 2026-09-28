@@ -179,8 +179,8 @@ def _record_missing_stream_usage(
 
 
 def _should_record(tokens_input: int, tokens_output: int) -> bool:
-    """Whether a route handler opens a ``request_costs`` row. All nine
-    ``cost_tracker.record`` sites in this module ask this one predicate.
+    """Whether a route handler opens a ``request_costs`` row. Every
+    ``cost_tracker.record`` site in this module asks this one predicate.
 
     ``tokens > 0`` is the long-standing rule: bill what was observed and
     never estimate, so a backend that reported nothing gets no row.
