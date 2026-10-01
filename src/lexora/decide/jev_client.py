@@ -105,32 +105,38 @@ def build_body(
 async def call_systemone(
     body: dict[str, Any],
     *,
+    client: httpx.AsyncClient,
     api_key: str,
     timeout_ms: int,
-    base_url: str = DEFAULT_BASE_URL,
-    transport: httpx.AsyncBaseTransport | None = None,
 ) -> httpx.Response:
-    """POST ``body`` once and return the fully read response.
+    """POST ``body`` once on ``client`` and return the fully read response.
+
+    ``client`` is the long-lived client owned by
+    :class:`~lexora.decide.providers.JevProvider` (Bohr msg-580 v5): it is
+    reused across calls so the TCP/TLS connection to Jev is pooled instead
+    of re-established on every decision. Its ``base_url`` / ``timeout`` /
+    ``transport`` are set by the provider. The API key is NOT a default
+    header of that client: it is attached here, per request, so it never
+    becomes long-lived client state (msg-580 v5 #3).
 
     ``timeout_ms`` bounds the whole call (msg-339 #1): httpx's own timeout
     covers each phase separately, so an ``asyncio.timeout`` wraps the
     call on top of it. Raises ``httpx.TimeoutException`` /
     ``TimeoutError`` / ``httpx.RequestError`` unchanged; the provider
-    classifies them. There is no retry, 429/529 included (msg-339 #4).
+    classifies them. A pooled connection that went stale surfaces as an
+    ``httpx.RequestError`` (e.g. ``RemoteProtocolError``) and so falls
+    back like any network failure (msg-580 v5 #5). There is no retry,
+    429/529 included (msg-339 #4).
     """
-    timeout_s = timeout_ms / 1000.0
-    async with httpx.AsyncClient(
-        base_url=base_url, timeout=timeout_s, transport=transport
-    ) as client:
-        async with asyncio.timeout(timeout_s):
-            return await client.post(
-                SYSTEMONE_PATH,
-                json=body,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-            )
+    async with asyncio.timeout(timeout_ms / 1000.0):
+        return await client.post(
+            SYSTEMONE_PATH,
+            json=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
 
 
 def classify_status(status: int) -> StatusCode | None:

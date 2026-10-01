@@ -580,3 +580,45 @@ class TestApiKeyHygiene:
         provider = _provider(_respond(200, {}))
         assert API_KEY not in repr(provider)
         assert API_KEY not in repr(vars(provider))
+
+
+class TestPooledClient:
+    """Bohr msg-580 v5: one long-lived httpx client per JevProvider."""
+
+    async def test_client_reused_across_calls(self) -> None:
+        seen: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json=_ok({"q": {"noul": 0.1}}))
+
+        provider = _provider(handler)
+        client = provider._client  # noqa: SLF001
+        await provider.evaluate(state="s", questions={"q": _q("noul")})
+        await provider.evaluate(state="s", questions={"q": _q("noul")})
+        assert provider._client is client  # noqa: SLF001
+        assert not client.is_closed
+        assert len(seen) == 2
+        # The key still travels on every request (v5 #3).
+        assert all(r.headers["Authorization"] == f"Bearer {API_KEY}" for r in seen)
+        await provider.aclose()
+        assert client.is_closed
+
+    async def test_key_not_in_client_default_headers(self) -> None:
+        provider = _provider(_respond(200, _ok({"q": {"noul": 0.1}})))
+        headers = provider._client.headers  # noqa: SLF001
+        assert "authorization" not in {k.lower() for k in headers}
+        assert API_KEY not in repr(dict(headers))
+        await provider.aclose()
+
+    async def test_stale_pooled_connection_is_network_failure(self) -> None:
+        """v5 #5: a dropped keep-alive connection falls back as ``network``."""
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response.", request=request
+            )
+
+        err = await _raises(_provider(handler))
+        assert err.code == "network"
+        assert err.exc_type == "RemoteProtocolError"
