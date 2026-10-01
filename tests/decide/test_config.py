@@ -174,21 +174,12 @@ class TestCheckTypesafeApiKey:
 class TestSchemaMatchesImplementation:
     """Values the code does not implement fail validation (Bohr msg-387 v3).
 
-    ``shadow``, ``llm`` and a ``fallback`` selector used to be accepted and
-    then silently did nothing (msg-383 / msg-384 / msg-386). The PR that
+    ``llm`` and a ``fallback`` selector used to be accepted and then
+    silently did nothing (msg-383 / msg-384 / msg-386). The PR that
     implements one of them puts it back into the schema and rewrites the
-    matching test here on purpose.
+    matching test here on purpose — as the shadow PR (msg-583 v6) did for
+    ``shadow``, see :class:`TestShadowMode`.
     """
-
-    def test_mode_shadow_is_rejected(self) -> None:
-        with pytest.raises(ValidationError) as excinfo:
-            DecisionSettings(mode="shadow")  # type: ignore[arg-type]
-        assert "mode" in str(excinfo.value)
-
-    @pytest.mark.parametrize("primary", ["null", "jev"])
-    def test_mode_shadow_rejected_regardless_of_primary(self, primary: str) -> None:
-        with pytest.raises(ValidationError):
-            DecisionSettings(primary=primary, mode="shadow")  # type: ignore[arg-type]
 
     def test_primary_llm_is_rejected(self) -> None:
         with pytest.raises(ValidationError) as excinfo:
@@ -210,7 +201,12 @@ class TestSchemaMatchesImplementation:
 
     @pytest.mark.parametrize(
         "body",
-        ['  mode: "shadow"', '  primary: "llm"', '  fallback: "null"'],
+        [
+            '  mode: "shadow"',  # primary defaults to null → rejected (v6 §1)
+            '  mode: "shadow"\n  primary: "null"',
+            '  primary: "llm"',
+            '  fallback: "null"',
+        ],
     )
     def test_yaml_config_is_rejected_at_load(self, tmp_path, body: str) -> None:  # type: ignore[no-untyped-def]
         """The operator surface: ``[decision]`` in the YAML config.
@@ -227,6 +223,38 @@ class TestSchemaMatchesImplementation:
     @pytest.mark.parametrize("mode", ["off", "active"])
     def test_implemented_modes_pass(self, mode: str) -> None:
         assert DecisionSettings(mode=mode).mode == mode  # type: ignore[arg-type]
+
+
+class TestShadowMode:
+    """``mode="shadow"`` is back in the schema (Bohr msg-583 v6 §1)."""
+
+    def test_shadow_with_jev_is_accepted(self) -> None:
+        s = DecisionSettings(mode="shadow", primary="jev")
+        assert (s.mode, s.primary) == ("shadow", "jev")
+
+    def test_shadow_with_null_primary_is_rejected(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            DecisionSettings(mode="shadow", primary="null")
+        assert "shadow" in str(excinfo.value)
+
+    def test_shadow_with_default_primary_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            DecisionSettings(mode="shadow")
+
+    def test_shadow_yaml_loads_through_create_settings(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            'decision:\n  mode: "shadow"\n  primary: "jev"\n', encoding="utf-8"
+        )
+        decision = create_settings(config_file).decision
+        assert (decision.mode, decision.primary) == ("shadow", "jev")
+
+    def test_shadow_with_jev_still_requires_the_key(self) -> None:
+        """The key check keys on ``primary``; shadow uses it, so it applies."""
+        with pytest.raises(RuntimeError):
+            check_typesafe_api_key(
+                DecisionSettings(mode="shadow", primary="jev"), environ={}
+            )
 
 
 class TestYamlOnlySource:

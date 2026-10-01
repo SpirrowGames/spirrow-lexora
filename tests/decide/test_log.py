@@ -54,6 +54,7 @@ class TestDecisionRowShape:
             "provider_model",
             "provider_input_tokens",
             "provider_output_tokens",
+            "shadow_of",
         }
         fields = {f for f in DecisionRow.__dataclass_fields__ if not f.startswith("_")}
         assert fields == allowed
@@ -201,6 +202,7 @@ class TestDecisionLogSqlite:
             "provider_model",
             "provider_input_tokens",
             "provider_output_tokens",
+            "shadow_of",
         }
         # And to satisfy the type checker that sqlite3 is used.
         assert isinstance(log._conn, sqlite3.Connection)  # noqa: SLF001
@@ -229,6 +231,7 @@ _ADDED = (
     "provider_model",
     "provider_input_tokens",
     "provider_output_tokens",
+    "shadow_of",
 )
 
 
@@ -394,6 +397,56 @@ class TestDecisionLogMigrations:
         with pytest.raises(sqlite3.OperationalError, match="no such table"):
             log.write(_sample_row())
         log.close()
+
+
+class TestShadowOfColumn:
+    """``shadow_of`` (Bohr msg-583 v6 §3)."""
+
+    def test_up_migration_from_pre_shadow_schema(self, tmp_path: Path) -> None:
+        """A DB that has every column up to provider_output_tokens but no
+        ``shadow_of`` gains it in place; its old rows read back as NULL."""
+        import sqlite3
+
+        db_path = tmp_path / "decisions.db"
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(_PR43_CREATE_SQL)
+            for name, decl in (
+                ("provider_error", "TEXT NULL"),
+                ("provider_model", "TEXT NULL"),
+                ("provider_input_tokens", "INTEGER NULL"),
+                ("provider_output_tokens", "INTEGER NULL"),
+            ):
+                conn.execute(f"ALTER TABLE decisions ADD COLUMN {name} {decl}")
+            conn.execute(
+                "INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("old-1", "p", "a" * 16, "b" * 16, None, "null", "{}", 3, "t0",
+                 None, None, None, None),
+            )
+        assert "shadow_of" not in _columns(db_path)
+
+        apply_decision_log_migrations(db_path)
+        log = DecisionLog(db_path)
+        log.write(_sample_row(decision_id="sh-1", provider="jev", shadow_of="old-1"))
+        rows = {r["decision_id"]: r for r in log.fetch_all()}
+        log.close()
+
+        assert rows["old-1"]["shadow_of"] is None
+        assert rows["sh-1"]["shadow_of"] == "old-1"
+        assert _columns(db_path).count("shadow_of") == 1
+
+    def test_build_decision_row_carries_shadow_of(self) -> None:
+        row = build_decision_row(
+            decision_id="sh-2",
+            policy="p",
+            state="s",
+            questions={},
+            provider="jev",
+            answers={},
+            latency_ms=1,
+            questions_version=None,
+            shadow_of="ans-1",
+        )
+        assert row.shadow_of == "ans-1"
 
 
 def _sample_row(**overrides: Any) -> DecisionRow:

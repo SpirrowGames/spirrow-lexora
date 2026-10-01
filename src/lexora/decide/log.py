@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     provider_error    TEXT NULL,
     provider_model    TEXT NULL,
     provider_input_tokens  INTEGER NULL,
-    provider_output_tokens INTEGER NULL
+    provider_output_tokens INTEGER NULL,
+    shadow_of         TEXT NULL
 )
 """
 
@@ -65,11 +66,11 @@ _INSERT_SQL = """
 INSERT INTO decisions (
     decision_id, policy, state_hash, questions_hash, questions_version,
     provider, answers_json, latency_ms, timestamp, provider_error,
-    provider_model, provider_input_tokens, provider_output_tokens
+    provider_model, provider_input_tokens, provider_output_tokens, shadow_of
 ) VALUES (
     :decision_id, :policy, :state_hash, :questions_hash, :questions_version,
     :provider, :answers_json, :latency_ms, :timestamp, :provider_error,
-    :provider_model, :provider_input_tokens, :provider_output_tokens
+    :provider_model, :provider_input_tokens, :provider_output_tokens, :shadow_of
 )
 """
 
@@ -82,6 +83,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("provider_model", "TEXT NULL"),
     ("provider_input_tokens", "INTEGER NULL"),
     ("provider_output_tokens", "INTEGER NULL"),
+    # Shadow rows (Bohr msg-583 v6 §3).
+    ("shadow_of", "TEXT NULL"),
 )
 
 
@@ -146,14 +149,32 @@ def apply_decision_log_migrations(path: Path | str) -> None:
 class DecisionRow:
     """One row of the decision log.
 
+    Two kinds of row (Bohr msg-583 v6 §3):
+
+    * **Answering row** — ``shadow_of IS NULL``. One per ``/v1/decide``
+      request; it describes the answer the caller received.
+    * **Shadow row** — ``shadow_of`` is the ``decision_id`` of the
+      answering row of the same request. Written only under
+      ``mode="shadow"``, after the response, for the provider named by
+      ``primary``. The caller never saw these answers; they exist for
+      offline evaluation (mindwire §6.3). A failed shadow call still
+      leaves a row (``answers_json='{}'``, ``provider_error`` set), so the
+      provider's failure rate is part of the data.
+
+    The meaning of ``provider`` depends on the kind of row: on an
+    answering row it is the provider that ACTUALLY ANSWERED the caller;
+    on a shadow row it is the provider that was CALLED (it answered
+    nobody). Cut calibration populations on ``shadow_of IS NULL`` first.
+
     Field notes:
 
     * ``state_hash`` / ``questions_hash`` — 16-hex-char sha256 prefixes
       (see :mod:`lexora.decide.contract`). Fixed width so the schema
       does not have to grow when a hash algorithm changes; the width is
       part of the writer's contract, not the dataclass's.
-    * ``provider`` — WHO ANSWERED the caller. Calibration populations
-      are cut on this column (msg-260).
+    * ``provider`` — on an answering row, WHO ANSWERED the caller;
+      calibration populations are cut on this column (msg-260). On a
+      shadow row, the provider that was called (see above).
     * ``provider_*`` (``provider_error`` / ``provider_model`` /
       ``provider_input_tokens`` / ``provider_output_tokens``) — WHAT
       HAPPENED ON THE UPSTREAM CALL (Bohr msg-342 #2). They are not
@@ -169,6 +190,10 @@ class DecisionRow:
       actually served the call and its ``usage``, when a 2xx arrived.
       Each field is read leniently, so a malformed one is ``None``.
       Always ``None`` for NullProvider and for non-2xx failures.
+    * ``shadow_of`` — ``None`` on an answering row; the answering row's
+      ``decision_id`` on a shadow row. Under ``mode="shadow"`` the
+      answering row is ``provider="null"`` with ``provider_error=None``:
+      Null answering is the design there, not a failure.
     * ``answers_json`` — JSON-serialised ``answers`` object. Kept as a
       string rather than a nested dict because SQLite has no JSON
       column type and turning every read into a JSON parse in Python
@@ -194,6 +219,7 @@ class DecisionRow:
     provider_model: str | None = None
     provider_input_tokens: int | None = None
     provider_output_tokens: int | None = None
+    shadow_of: str | None = None
 
     def __post_init__(self) -> None:
         # Fixed-width hash discipline lives here so a caller who passes
@@ -225,6 +251,7 @@ def build_decision_row(
     provider_model: str | None = None,
     provider_input_tokens: int | None = None,
     provider_output_tokens: int | None = None,
+    shadow_of: str | None = None,
 ) -> DecisionRow:
     """Construct a :class:`DecisionRow` from the request/response shape.
 
@@ -251,6 +278,7 @@ def build_decision_row(
         provider_model=provider_model,
         provider_input_tokens=provider_input_tokens,
         provider_output_tokens=provider_output_tokens,
+        shadow_of=shadow_of,
     )
 
 
@@ -384,7 +412,7 @@ class DecisionLog:
                 "SELECT decision_id, policy, state_hash, questions_hash, "
                 "questions_version, provider, answers_json, latency_ms, "
                 "timestamp, provider_error, provider_model, provider_input_tokens, "
-                "provider_output_tokens FROM decisions ORDER BY timestamp, decision_id"
+                "provider_output_tokens, shadow_of FROM decisions ORDER BY timestamp, decision_id"
             )
             columns = [c[0] for c in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -433,4 +461,5 @@ def _row_as_params(row: DecisionRow) -> dict[str, Any]:
         "provider_model": row.provider_model,
         "provider_input_tokens": row.provider_input_tokens,
         "provider_output_tokens": row.provider_output_tokens,
+        "shadow_of": row.shadow_of,
     }
