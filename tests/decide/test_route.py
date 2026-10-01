@@ -635,3 +635,23 @@ class TestSelectProvider:
         settings = DecisionSettings(primary="jev", mode="active")
         with pytest.raises(KeyError):
             _select_provider(settings, {"null": NullProvider()})
+
+
+class TestJevClientLifecycle:
+    """Bohr msg-580 v5 #4: the lifespan shutdown closes the pooled client."""
+
+    def test_lifespan_shutdown_closes_jev_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+        app = create_app(
+            settings=Settings(
+                decision=DecisionSettings(
+                    primary="jev", mode="active", log_path=":memory:"
+                )
+            )
+        )
+        client = app.state.decision_providers["jev"]._client  # noqa: SLF001
+        with TestClient(app):
+            assert not client.is_closed
+        assert client.is_closed

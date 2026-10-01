@@ -117,6 +117,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     decision_log = getattr(app.state, "decision_log", None)
     if decision_log is not None:
         decision_log.close()
+    # Providers that hold a pooled HTTP client (JevProvider, msg-580 v5 #4).
+    for provider in getattr(app.state, "decision_providers", {}).values():
+        aclose = getattr(provider, "aclose", None)
+        if aclose is not None:
+            await aclose()
     logger.info("lexora_shutdown_complete")
 
 
