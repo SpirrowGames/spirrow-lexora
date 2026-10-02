@@ -44,7 +44,12 @@ class QuestionSpec(BaseModel):
     instructions: str = Field(description="What the judgment is about.")
     criteria: Any | None = Field(
         default=None,
-        description="Criteria object; shape depends on the primitive.",
+        description=(
+            "Criteria; shape depends on the primitive and is forwarded to "
+            "Jev as sent. TypeSafe expects noul: {true, false} descriptions; "
+            "choice: an {option: description} map (an array is a 422); "
+            "score: an ordered array of levels, low to high."
+        ),
     )
 
     model_config = {"extra": "allow"}
