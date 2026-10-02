@@ -1,26 +1,37 @@
 """Decision endpoint settings and startup env checks.
 
-Contract (msg-237 / msg-244 / msg-246, narrowed by Bohr msg-387 v3):
+Contract (msg-237 / msg-244 / msg-246, narrowed by Bohr msg-387 v3,
+``shadow`` restored by Bohr msg-583 v6):
 
-* ``primary``: which provider answers under ``active`` (``null`` | ``jev``
-  — Fermi msg-257 scope 2).
-* ``mode``: ``off`` answers from :class:`NullProvider` unconditionally;
-  ``active`` answers from ``primary`` and falls back to NullProvider on
-  error / timeout / 429 (Fermi msg-257 §3). There is no other mode.
+* ``primary``: which provider answers under ``active``, and which one is
+  run in the background under ``shadow`` (``null`` | ``jev`` — Fermi
+  msg-257 scope 2).
+* ``mode``:
+
+  - ``off`` answers from :class:`NullProvider` unconditionally and never
+    calls ``primary`` (no metered call).
+  - ``active`` answers from ``primary`` and falls back to NullProvider on
+    error / timeout / 429 (Fermi msg-257 §3).
+  - ``shadow`` answers from NullProvider, then — after the response —
+    calls ``primary`` and logs its answers as a separate ``shadow_of``
+    row (msg-422 decision: Jev-only shadow before LlmEmulationProvider).
+    ``shadow`` with ``primary="null"`` is rejected at load: it would
+    compare Null with Null. There is no separate "shadow provider" field
+    (msg-583 v6 §1): the one provider under evaluation is ``primary``.
 * ``timeout_ms``: per-call upstream deadline in milliseconds.
 * ``jev_model``: the ``model`` value sent to Jev (default ``jev-latest``).
   The version that actually served each request is logged in
   ``provider_model``.
 
-The schema accepts only what the code implements (msg-387 v3). ``shadow``
-(answer from one provider, run another in the background for logging),
-``llm`` (``LlmEmulationProvider``) and a ``fallback`` provider selector are
-not implemented, so they are not in the schema: a config naming any of
-them fails validation at load instead of being accepted and silently
-doing nothing. ``DecisionSettings`` forbids unknown keys
+The schema accepts only what the code implements (msg-387 v3). ``llm``
+(``LlmEmulationProvider``) and a ``fallback`` provider selector are not
+implemented, so they are not in the schema: a config naming either
+fails validation at load instead of being accepted and silently doing
+nothing. ``DecisionSettings`` forbids unknown keys
 (``extra="forbid"``, set explicitly and pinned by a test), so a leftover
-``fallback`` key in ``[decision]`` stops start-up too. The PR that implements shadow /
-LlmEmulation adds the value back together with the behaviour. This
+``fallback`` key in ``[decision]`` stops start-up too. The PR that implements
+LlmEmulation adds the value back together with the behaviour (as the
+shadow PR did for ``shadow``). This
 withdraws the earlier "validate the mode up front so a later PR does not
 have to revisit the schema" policy.
 
@@ -58,7 +69,7 @@ from __future__ import annotations
 import os
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 #: The single env variable Lexora reads for the TypeSafe API key. Fixed by
 #: msg-239: chosen to match TypeSafe's official SDK default so a Lexora
@@ -78,7 +89,7 @@ _MISSING_KEY_MESSAGE = (
 
 
 DecisionProviderName = Literal["null", "jev"]
-DecisionMode = Literal["off", "active"]
+DecisionMode = Literal["off", "active", "shadow"]
 
 
 class DecisionSettings(BaseModel):
@@ -96,8 +107,9 @@ class DecisionSettings(BaseModel):
     primary: DecisionProviderName = Field(
         default="null",
         description=(
-            "Provider that answers under mode=active (null | jev). "
-            "Ignored under mode=off."
+            "Provider that answers under mode=active, and the one run in "
+            "the background under mode=shadow (null | jev). Ignored under "
+            "mode=off."
         ),
     )
     mode: DecisionMode = Field(
@@ -105,7 +117,9 @@ class DecisionSettings(BaseModel):
         description=(
             "off = always answer from NullProvider (safest); active = "
             "answer from primary, fall back to NullProvider on "
-            "error/timeout/429."
+            "error/timeout/429; shadow = answer from NullProvider and, "
+            "after the response, call primary and log its answers as a "
+            "shadow_of row (primary must not be null)."
         ),
     )
     timeout_ms: int = Field(
@@ -139,6 +153,20 @@ class DecisionSettings(BaseModel):
             "operator does not have to learn two directory layouts."
         ),
     )
+
+    @model_validator(mode="after")
+    def _shadow_needs_a_real_primary(self) -> DecisionSettings:
+        """Reject ``mode="shadow"`` with ``primary="null"`` (msg-583 v6 §1).
+
+        Checked here, inside the schema, and nowhere else: there is no
+        separate startup check for it.
+        """
+        if self.mode == "shadow" and self.primary == "null":
+            raise ValueError(
+                'mode "shadow" requires a non-null primary '
+                "(shadowing NullProvider with NullProvider logs nothing useful)"
+            )
+        return self
 
 
 def references_jev(settings: DecisionSettings) -> bool:

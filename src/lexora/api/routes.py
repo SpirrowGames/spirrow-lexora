@@ -34,8 +34,10 @@ from lexora.api.models import (
     ModelCapabilityInfo,
     StatsResponse,
 )
+from lexora.backends.answer_route import current_answer_route
 from lexora.backends.base import BackendError, BackendUpstreamError, UsageSink
 from lexora.backends.codex import CodexBackend
+from lexora.backends.fallback import FallbackBackend
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
@@ -143,12 +145,13 @@ def _record_missing_stream_usage(
        a hang-up is out. This is the conjunct that keeps the observable from
        becoming the "fail loudly" alarm that was rejected: turning a client
        hang-up into an alarm is the failure mode, not the defect.
-    3. an empty sink -- the exact complement of the row-opening guard
-       (``prompt_tokens > 0 or completion_tokens > 0``), written as its
-       negation so the two cannot both fire and cannot both stay silent.
-       The guard is still inline at three sites; that duplication predates
-       this change and unifying it is a separate decision, deliberately not
-       taken in a diff about something else.
+    3. an empty sink -- the negation of the token half of the row-opening
+       guard (``prompt_tokens > 0 or completion_tokens > 0``). Outside a
+       ``type: fallback`` backend that is the whole guard, so the two cannot
+       both fire and cannot both stay silent. Through a fallback wrapper
+       ``_should_record`` opens a row even on an empty sink (msg-501), so
+       both fire: the row counts the answer, and this counter still says
+       the sink was empty, which is the signal it exists for.
 
     One function called from all three sites, not a fourth inline copy: a
     drift between copies of *this* predicate would change behaviour rather
@@ -173,6 +176,27 @@ def _record_missing_stream_usage(
         backend=backend_name,
         endpoint=endpoint,
     )
+
+
+def _should_record(tokens_input: int, tokens_output: int) -> bool:
+    """Whether a route handler opens a ``request_costs`` row. Every
+    ``cost_tracker.record`` site in this module asks this one predicate.
+
+    ``tokens > 0`` is the long-standing rule: bill what was observed and
+    never estimate, so a backend that reported nothing gets no row.
+
+    The exception (T-naysayer-codex-backend msg-501, fixing B-2): an answer
+    served through a ``type: fallback`` backend -- ``current_answer_route()``
+    is set -- always gets a row, even at zero tokens. B-2 says codex answers
+    are *counted*, and mindwire's attestation reads that row
+    (``probe=cost-row#...``). Nothing else sets the route, so every other
+    path behaves exactly as before. ``_record_missing_stream_usage`` keeps the
+    plain ``tokens > 0`` test: it measures whether a backend filled the sink,
+    which is a different question from whether a row is opened.
+    """
+    if tokens_input > 0 or tokens_output > 0:
+        return True
+    return current_answer_route() is not None
 
 
 def _fail_preflight(
@@ -756,7 +780,7 @@ async def chat_completions(
             # and not after the `return StreamingResponse(...)` below, because
             # that `return` happens before a single byte is sent.
             #
-            # Guard: the same predicate the six non-streaming sites use. A
+            # Guard: `_should_record`, the predicate every record site uses. A
             # backend that filled nothing leaves the sink at zero and no row is
             # opened -- which is why the two verbatim-relay backends need no
             # special case, and why an early disconnect usually bills nothing
@@ -765,8 +789,8 @@ async def chat_completions(
             # of a disconnect is a different collector --
             # `tests/api/test_stream_disconnect_accounting.py`.
             finally:
-                if cost_tracker and (
-                    usage_sink.prompt_tokens > 0 or usage_sink.completion_tokens > 0
+                if cost_tracker and _should_record(
+                    usage_sink.prompt_tokens, usage_sink.completion_tokens
                 ):
                     cost_tracker.record(
                         model=resolved_model,
@@ -884,7 +908,7 @@ async def chat_completions(
         # `DEFAULT_PRICING` in `services/cost_tracker.py`; the behaviour is
         # fenced by `TestSubscriptionBackendIsNotPriced` in
         # `tests/services/test_cost_tracker.py`.
-        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+        if cost_tracker and _should_record(tokens_input, tokens_output):
             cost_tracker.record(
                 model=resolved_model,
                 endpoint=endpoint,
@@ -1216,8 +1240,8 @@ async def completions(
             # above for why it is a `finally`, why it is inside the generator
             # rather than after the `return`, and what the guard's zero means.
             finally:
-                if cost_tracker and (
-                    usage_sink.prompt_tokens > 0 or usage_sink.completion_tokens > 0
+                if cost_tracker and _should_record(
+                    usage_sink.prompt_tokens, usage_sink.completion_tokens
                 ):
                     cost_tracker.record(
                         model=resolved_model,
@@ -1319,7 +1343,7 @@ async def completions(
         # the alias the caller used. The `claude-code-*` exception recorded
         # at that call site applies here unchanged -- a resolved ID is an
         # upstream model ID only for the metered HTTP backends.
-        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+        if cost_tracker and _should_record(tokens_input, tokens_output):
             cost_tracker.record(
                 model=resolved_model,
                 endpoint=endpoint,
@@ -1476,7 +1500,7 @@ async def embeddings(
         # guard is `or` and not `and`. No embedding model is in
         # `DEFAULT_PRICING`, so these rows land on `pricing_known=0` and cost
         # 0.0 -- "no price for this" is a statement; no row was not one.
-        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+        if cost_tracker and _should_record(tokens_input, tokens_output):
             cost_tracker.record(
                 model=resolved_model,
                 endpoint=endpoint,
@@ -1640,31 +1664,57 @@ async def naysayer_status(
     ``inflight_runs`` is the operator's pre-deploy check: restart only at 0
     (msg-421 S-2).
 
-    Fields that describe the Gemini fallback (``mode``, ``fallback_since``,
-    the fallback's call count and cost) belong to the fallback itself and
-    arrive with it (PR-2b); they are absent here, not null-filled.
+    PR-2b (msg-448 B-1 / B-6): when the tier's backend is a ``type:
+    fallback`` wrapper, the ``codex`` block describes its ``primary`` and
+    ``primary`` is ``codex`` (``gemini`` in shadow mode, where Gemini
+    answers); ``mode`` / ``fallback_since`` / ``fallback_calls`` /
+    ``fallback_cost_usd`` / ``shadow_skipped`` come from the wrapper
+    (``FallbackBackend.status_fields``), the counts from the ledger. For a
+    backend that is not a wrapper they are null, except ``mode``, which is
+    ``codex`` for a plain codex backend.
     """
     if not backend_router.is_tier(NAYSAYER_TIER):
         raise HTTPException(status_code=404, detail=f"tier '{NAYSAYER_TIER}' is not configured")
     backend_name = backend_router.get_backend_name_for_model(NAYSAYER_TIER)
     backend = backend_router.get_backend_by_name(backend_name)
+    wrapper = backend if isinstance(backend, FallbackBackend) else None
+    codex_backend = wrapper.primary if wrapper is not None else backend
     primary: str | None
-    if isinstance(backend, CodexBackend):
+    if wrapper is not None:
+        primary = "gemini" if wrapper.mode == "shadow" else "codex"
+    elif isinstance(backend, CodexBackend):
         primary = "codex"
     elif isinstance(backend, GeminiBackend):
         primary = "gemini"
     else:
         primary = None
     codex: dict[str, Any] | None = None
-    if isinstance(backend, CodexBackend):
-        availability = await backend.codex_availability()
+    extra: dict[str, Any] = {
+        "mode": None,
+        "fallback_since": None,
+        "fallback_calls": None,
+        "fallback_cost_usd": None,
+        "shadow_skipped": None,
+    }
+    if isinstance(codex_backend, CodexBackend):
+        availability = await codex_backend.codex_availability()
         hold = availability.quota_hold_until
         codex = {
             "codex_disabled_reason": availability.reason,
             "quota_hold_until": hold.isoformat() if hold is not None else None,
-            "inflight_runs": backend.inflight_runs(),
+            "inflight_runs": codex_backend.inflight_runs(),
         }
-    return {"tier": NAYSAYER_TIER, "backend": backend_name, "primary": primary, "codex": codex}
+        if wrapper is not None:
+            extra = wrapper.status_fields(availability)
+        else:
+            extra["mode"] = "codex"
+    return {
+        "tier": NAYSAYER_TIER,
+        "backend": backend_name,
+        "primary": primary,
+        "codex": codex,
+        **extra,
+    }
 
 
 @router.get("/stats", response_model=StatsResponse)
@@ -1949,7 +1999,7 @@ async def generate(
         # Record cost. `CostTracker.record` takes the concrete model in
         # `model` and the alias in `tier`; `resolved_model` is the same value
         # the outgoing request carries, so the ledger and the wire agree.
-        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+        if cost_tracker and _should_record(tokens_input, tokens_output):
             cost_tracker.record(
                 model=resolved_model,
                 endpoint=endpoint,
@@ -2134,7 +2184,7 @@ async def chat(
 
         # Record cost. Same shape as `/generate`: `resolved_model` in the
         # `model` column, the alias in `tier`.
-        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+        if cost_tracker and _should_record(tokens_input, tokens_output):
             cost_tracker.record(
                 model=resolved_model,
                 endpoint=endpoint,
@@ -2448,8 +2498,8 @@ async def messages(
             # (`anthropic_compat.py`), which is a separate, already-recorded
             # gap and not a source of truth for billing.
             finally:
-                if cost_tracker and (
-                    usage_sink.prompt_tokens > 0 or usage_sink.completion_tokens > 0
+                if cost_tracker and _should_record(
+                    usage_sink.prompt_tokens, usage_sink.completion_tokens
                 ):
                     cost_tracker.record(
                         model=resolved_model,
@@ -2538,7 +2588,7 @@ async def messages(
                 retries=retries,
             )
 
-        if cost_tracker and (tokens_input > 0 or tokens_output > 0):
+        if cost_tracker and _should_record(tokens_input, tokens_output):
             cost_tracker.record(
                 model=resolved_model,
                 endpoint=endpoint,

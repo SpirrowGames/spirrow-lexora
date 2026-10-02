@@ -346,7 +346,20 @@ class JevProvider:
         self._timeout_ms = timeout_ms
         self._model = model
         self._base_url = base_url
-        self._transport = transport
+        # One pooled client per provider (Bohr msg-580 v5 #1): JevProvider
+        # is built once per app (``build_default_providers``) and closed in
+        # ``main.lifespan`` via :meth:`aclose`. The key is deliberately NOT
+        # a default header here (msg-580 v5 #3); ``call_systemone`` adds it
+        # per request.
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            timeout=timeout_ms / 1000.0,
+            transport=transport,
+        )
+
+    async def aclose(self) -> None:
+        """Close the pooled HTTP client (called from ``main.lifespan``)."""
+        await self._client.aclose()
 
     def __repr__(self) -> str:
         return f"JevProvider(base_url={self._base_url!r}, model={self._model!r})"
@@ -379,10 +392,9 @@ class JevProvider:
             stage = "http"
             resp = await jev_client.call_systemone(
                 body,
+                client=self._client,
                 api_key=self._key(),
                 timeout_ms=self._timeout_ms,
-                base_url=self._base_url,
-                transport=self._transport,
             )
             status_code = jev_client.classify_status(resp.status_code)
             if status_code is not None:

@@ -9,6 +9,8 @@ shape the backend reads.
 Scenarios for the backend:
 
 * ``ok``            -- final message + ``turn.completed`` with usage.
+* ``no_usage``      -- like ``ok`` but ``turn.completed`` carries no usage
+                       (the ledger must still count it, msg-501).
 * ``tool_use``      -- reports a ``command_execution`` item (D-1c).
 * ``unknown_event`` -- an item type nobody recognises, then a normal answer
                        (D-1c must treat it as an execution, msg-315 #4).
@@ -215,6 +217,13 @@ def main() -> int:
         text = "REVIEW: " + prompt[:40]
         emit({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": text}})
         emit({"type": "turn.completed", "usage": {"input_tokens": 120, "cached_input_tokens": 20, "output_tokens": 7}})
+        if last_message:
+            Path(last_message).write_text(text)
+        return 0
+    if scenario == "no_usage":
+        text = "REVIEW: " + prompt[:40]
+        emit({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": text}})
+        emit({"type": "turn.completed", "usage": {}})
         if last_message:
             Path(last_message).write_text(text)
         return 0

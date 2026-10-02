@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from lexora.backends.answer_route import SUBSCRIPTION_ANSWERS, current_answer_route
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -248,6 +249,26 @@ class CostTracker:
                 conn.execute(
                     "ALTER TABLE request_costs ADD COLUMN tokens_cached_input INTEGER"
                 )
+            # T-naysayer-codex-backend msg-448 B-2: the route a `type:
+            # fallback` backend took -- `codex` / `gemini-fallback` /
+            # `codex-shadow`; NULL for every other row, old rows included.
+            # `backend` alone cannot tell the primary Gemini from the
+            # fallback Gemini, hence a column of its own.
+            if "answered_by" not in cols:
+                conn.execute("ALTER TABLE request_costs ADD COLUMN answered_by TEXT")
+            # B-5: one row per shadow comparison. No prompt, no answer text.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS shadow_comparisons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    tier TEXT,
+                    gemini_verdict TEXT NOT NULL,
+                    codex_verdict TEXT NOT NULL,
+                    codex_reason TEXT,
+                    gemini_seconds REAL,
+                    codex_seconds REAL
+                )
+            """)
             conn.execute(
                 """CREATE INDEX IF NOT EXISTS idx_costs_tier
                    ON request_costs(tier)"""
@@ -352,6 +373,16 @@ class CostTracker:
     ) -> float:
         """Record a request's cost.
 
+        **Answer route (T-naysayer-codex-backend B-2).** When a ``type:
+        fallback`` backend served the request it has stamped an
+        ``AnswerRoute`` into ``backends.answer_route``; it then overrides
+        ``backend`` (the backend that actually answered, not the wrapper),
+        ``model`` (codex serves its own model) and fills ``answered_by``. A
+        codex answer (``codex`` / ``codex-shadow``) is written at
+        ``cost_usd=0`` with ``pricing_known=1``: it is billed by the
+        subscription, so 0 is a known price, not a missing one. See that
+        module's docstring for why the context variable is safe here.
+
         The caller is expected to pass the *resolved* model ID in ``model``
         (i.e. ``BackendRouter.resolve_model(requested)``) and the caller's
         tier name in ``tier`` when the request was routed by tier. Callers
@@ -378,13 +409,22 @@ class CostTracker:
         Returns:
             Calculated cost in USD.
         """
-        cost, pricing_known = self.calculate_cost(
-            model,
-            tokens_input,
-            tokens_output,
-            tokens_thinking=tokens_thinking,
-            tokens_cached_input=tokens_cached_input,
-        )
+        route = current_answer_route()
+        answered_by: str | None = None
+        if route is not None:
+            backend = route.backend
+            model = route.model or model
+            answered_by = route.answered_by
+        if answered_by in SUBSCRIPTION_ANSWERS:
+            cost, pricing_known = 0.0, True
+        else:
+            cost, pricing_known = self.calculate_cost(
+                model,
+                tokens_input,
+                tokens_output,
+                tokens_thinking=tokens_thinking,
+                tokens_cached_input=tokens_cached_input,
+            )
         if not pricing_known:
             # Best-effort warn. The `record` path is deliberately
             # exception-swallowing (see the except below) so accounting
@@ -406,8 +446,8 @@ class CostTracker:
                        (timestamp, model, backend, endpoint, user_id,
                         tokens_input, tokens_output, cost_usd,
                         duration_seconds, success, tier, pricing_known,
-                        tokens_thinking, tokens_cached_input)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tokens_thinking, tokens_cached_input, answered_by)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         timestamp,
                         model,
@@ -423,12 +463,64 @@ class CostTracker:
                         1 if pricing_known else 0,
                         tokens_thinking,
                         tokens_cached_input,
+                        answered_by,
                     ),
                 )
         except Exception:
             logger.exception("cost_record_failed", model=model)
 
         return cost
+
+    # ---- T-naysayer-codex-backend B-3 / B-5 --------------------------------
+
+    def fallback_totals(self, since: datetime) -> tuple[int, float]:
+        """Gemini-fallback calls and their cost since ``since`` (B-3).
+
+        Counted from the ledger rather than kept as a counter, so the
+        notification, the status endpoint and ``/stats/costs`` cannot
+        disagree (Principle 2). Raises ``sqlite3.Error`` to the caller.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            count, cost = conn.execute(
+                """SELECT COUNT(*), COALESCE(SUM(cost_usd), 0.0) FROM request_costs
+                   WHERE answered_by = 'gemini-fallback' AND timestamp >= ?""",
+                (since.astimezone(timezone.utc).isoformat(),),
+            ).fetchone()
+        return int(count), float(cost)
+
+    def record_shadow_comparison(
+        self,
+        *,
+        tier: str | None,
+        gemini_verdict: str,
+        codex_verdict: str,
+        codex_reason: str | None,
+        gemini_seconds: float | None,
+        codex_seconds: float | None,
+    ) -> None:
+        """One B-5 comparison row. Verdicts and timings only, never text."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT INTO shadow_comparisons
+                   (timestamp, tier, gemini_verdict, codex_verdict, codex_reason,
+                    gemini_seconds, codex_seconds)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    tier,
+                    gemini_verdict,
+                    codex_verdict,
+                    codex_reason,
+                    gemini_seconds,
+                    codex_seconds,
+                ),
+            )
+
+    def shadow_comparisons(self) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM shadow_comparisons ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
 
     def get_costs(
         self,

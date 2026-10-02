@@ -168,6 +168,25 @@ routing:
           capabilities: ["code", "reasoning", "analysis", "general"]
           description: "Google Gemini 3.1 Pro Preview (naysayer, native generateContent)"
 
+    # Codex CLI (`codex exec` under bwrap, ChatGPT Pro サブスク認証)。
+    # T-D8-codex-backend-adr14-15-amendment msg-5940 / msg-5942。
+    # tier には未接続 (2026-10-02) — naysayer への紐付けはループ側の設計確定後。
+    # 検証ゲート (verify_codex) が閉じている間は全リクエストを拒否する。
+    # max_concurrency: 1 は必須 — 1 つの auth.json のトークン更新を競合させない。
+    # health_check: false — ゲートが閉じている間は unhealthy を返し、
+    # どの tier からも使われていないのに /health 全体を degraded にするため。
+    # model は codex-cli 0.160.0 同梱カタログの既定 (priority 1)。
+    codex:
+      type: "codex"
+      health_check: false
+      models:
+        - name: "gpt-6.1-sol"
+          capabilities: ["reasoning", "analysis", "general"]
+          description: "OpenAI gpt-6.1-sol via Codex CLI (ChatGPT Pro, 未検証・tier 未接続)"
+      codex:
+        codex_home: "/srv/lexora/codex-home"
+        max_concurrency: 1
+
     # Claude Code CLI (non-interactive mode)
     claude_code:
       type: "claude_code"

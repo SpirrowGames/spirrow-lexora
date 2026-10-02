@@ -5,11 +5,27 @@ write one decision-log row, return. It exists so the utilisation-side
 threads (mindwire / prismind / verimend) have a stable URL to point at;
 the interesting behaviour is in the provider layer.
 
-Routing is two-way (Bohr msg-387 v3): ``mode="off"`` answers from
-NullProvider, ``mode="active"`` answers from the provider named by
-``primary``. On a :class:`~lexora.decide.providers.ProviderError` the
-route falls back to NullProvider (Fermi msg-257 §3) and logs the
-upstream ``model`` / usage (Bohr msg-342 #2).
+Routing (Bohr msg-387 v3, ``shadow`` added by msg-583 v6 / msg-585 v7):
+
+* ``mode="off"`` answers from NullProvider.
+* ``mode="active"`` answers from the provider named by ``primary``. On a
+  :class:`~lexora.decide.providers.ProviderError` the route falls back to
+  NullProvider (Fermi msg-257 §3) and logs the upstream ``model`` / usage
+  (Bohr msg-342 #2).
+* ``mode="shadow"`` answers from NullProvider (so every Tier-C escalation
+  still reaches a human), then runs ``primary`` as a FastAPI background
+  task and writes its result as a separate row whose ``shadow_of`` is the
+  answering row's ``decision_id`` (:func:`_run_shadow`).
+
+Shadow lifecycle (msg-585 v7 §4): a background task runs inside the
+request's ASGI task, after the response has been sent. uvicorn waits for
+in-flight requests — background tasks included — before it runs the
+lifespan shutdown, so a pending shadow call delays shutdown rather than
+being dropped. The delay is bounded by ``timeout_ms`` (the whole Jev call
+is under ``asyncio.timeout``) plus one log write — the same bound an
+in-flight ``active`` request already imposes. ``JevProvider.aclose()``
+and ``DecisionLog.close()`` run only after every shadow task finished.
+There is no separate wait mechanism.
 """
 
 from __future__ import annotations
@@ -18,7 +34,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 
 from lexora.decide.config import DecisionSettings
 from lexora.decide.contract import DecideRequest, DecideResponse
@@ -70,6 +86,8 @@ def _select_provider(
     """Return the provider whose answer this request should carry.
 
     * ``mode == "off"`` → NullProvider.
+    * ``mode == "shadow"`` → NullProvider (``primary`` runs afterwards in
+      the background, see :func:`_run_shadow`).
     * ``mode == "active"`` → the provider named by ``primary``.
 
     The schema only admits ``null`` / ``jev`` for ``primary``, and a
@@ -77,14 +95,81 @@ def _select_provider(
     registered). A ``KeyError`` here is therefore a Lexora bug and is
     left to surface rather than being papered over with NullProvider.
     """
-    if settings.mode == "off":
+    if settings.mode in ("off", "shadow"):
         return providers["null"]
     return providers[settings.primary]
+
+
+async def _run_shadow(
+    *,
+    provider: DecisionProvider,
+    decision_log: DecisionLog,
+    shadow_of: str,
+    body: DecideRequest,
+) -> None:
+    """Call ``provider`` after the response and log it as a shadow row.
+
+    Runs as a FastAPI background task under ``mode="shadow"`` (Bohr
+    msg-583 v6 §2/§3, msg-585 v7 §2). Nothing here can change the
+    response: it was already sent.
+
+    * Success → a row with ``provider=<provider.name>``, the answers, the
+      upstream meta, ``shadow_of`` = the answering row's ``decision_id``.
+    * :class:`ProviderError` → a row too, with ``answers_json='{}'`` and
+      ``provider_error="<name>:<code>"`` (the failure rate is evaluation
+      data as well).
+    * Any other ``Exception`` (a Lexora bug, a failed log write) → one
+      ``decide_shadow_failed`` error line carrying only the type name; no
+      row. It is caught here and NOT re-raised: an exception escaping a
+      background task is logged by Starlette/uvicorn as "Exception in
+      ASGI application" WITH a traceback, and this frame holds ``body``
+      (the caller's ``state``). For the same reason nothing here logs
+      with ``exc_info`` (see the note in :func:`decide`).
+    * ``asyncio.CancelledError`` is a ``BaseException`` and propagates.
+    """
+    try:
+        start = time.monotonic()
+        answers: dict[str, Any] = {}
+        provider_error: str | None = None
+        upstream: UpstreamMeta | None = None
+        try:
+            result = await provider.evaluate(state=body.state, questions=body.questions)
+        except ProviderError as err:
+            # Plain values only; ``err`` is not kept (msg-344 v7 #2).
+            provider_error = f"{provider.name}:{err.code}"
+            upstream = err.upstream
+        else:
+            answers = _answers_for_log(result.answers)
+            upstream = result.upstream
+        latency_ms = int((time.monotonic() - start) * 1000)
+        row = build_decision_row(
+            decision_id=uuid.uuid4().hex,
+            policy=body.policy,
+            state=body.state,
+            questions={name: q for name, q in body.questions.items()},
+            provider=provider.name,
+            answers=answers,
+            latency_ms=latency_ms,
+            questions_version=body.questions_version,
+            provider_error=provider_error,
+            provider_model=upstream.model if upstream else None,
+            provider_input_tokens=upstream.input_tokens if upstream else None,
+            provider_output_tokens=upstream.output_tokens if upstream else None,
+            shadow_of=shadow_of,
+        )
+        await decision_log.awrite(row)
+    except Exception as exc:  # noqa: BLE001 — v7 §2: nothing may escape to the ASGI layer
+        logger.error(
+            "decide_shadow_failed",
+            exc_type=type(exc).__name__,
+            decision_id=shadow_of,
+        )
 
 
 @router.post("/v1/decide", response_model=DecideResponse)
 async def decide(
     body: DecideRequest,
+    background_tasks: BackgroundTasks,
     settings: DecisionSettings = Depends(_get_decision_settings),
     providers: dict[str, DecisionProvider] = Depends(_get_decision_providers),
     decision_log: DecisionLog = Depends(_get_decision_log),
@@ -161,6 +246,17 @@ async def decide(
     # serves DNS for upstream connections. A write failure still raises
     # here and fails the request.
     await decision_log.awrite(row)
+
+    if settings.mode == "shadow":
+        # After the answering row is committed, so ``shadow_of`` always
+        # points at an existing row. Runs after the response is sent.
+        background_tasks.add_task(
+            _run_shadow,
+            provider=providers[settings.primary],
+            decision_log=decision_log,
+            shadow_of=decision_id,
+            body=body,
+        )
 
     # Provider names are constrained to the Literal in DecideResponse,
     # so we assert the type on the way out. Any provider whose name
