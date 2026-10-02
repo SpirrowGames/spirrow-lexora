@@ -140,8 +140,23 @@ _StrictSafeLoader.add_constructor(
 ERROR_PASSTHROUGH_TYPES: frozenset[str] = frozenset({"anthropic"})
 
 
-class ModelInfo(BaseSettings):
+# YAML section models (T-config-unprefixed-env). Every class below that
+# ``create_settings`` builds from a YAML section is a ``BaseModel``, not a
+# ``BaseSettings``: a ``BaseSettings`` without ``env_prefix`` fills every
+# field the YAML omits from an *unprefixed* env var of the same name
+# (``API_KEY`` onto every backend, ``PORT`` onto the server, ``ENABLED``
+# onto rate limiting ...). ``extra="forbid"`` is written out on each one
+# because ``BaseModel`` defaults to ``"ignore"`` and YAML typos must keep
+# failing. Only the root ``Settings`` is a ``BaseSettings`` (``LEXORA_``
+# prefix); env reads go through explicitly named variables
+# (``LEXORA_FRONTIER_MODEL``, ``BackendSettings.api_key_env``).
+# ``tests/test_config_unprefixed_env.py`` guards this structurally.
+
+
+class ModelInfo(BaseModel):
     """Individual model information with capabilities."""
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str = Field(description="Model name/identifier")
     capabilities: list[str] = Field(
@@ -365,8 +380,10 @@ class FallbackSettings(BaseModel):
     mode: Literal["fallback", "shadow"] = Field(default="fallback")
 
 
-class BackendSettings(BaseSettings):
+class BackendSettings(BaseModel):
     """Single backend settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     type: Literal[
         "vllm", "openai_compatible", "anthropic", "claude_code", "gemini", "codex", "fallback"
@@ -550,16 +567,20 @@ class BackendSettings(BaseSettings):
         return [m.name for m in self.models]
 
 
-class VLLMSettings(BaseSettings):
+class VLLMSettings(BaseModel):
     """vLLM backend settings (legacy, for single backend)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     url: str = Field(default="http://localhost:8000", description="vLLM server URL")
     timeout: float = Field(default=120.0, description="Request timeout in seconds")
     connect_timeout: float = Field(default=5.0, description="Connection timeout in seconds")
 
 
-class TierSettings(BaseSettings):
+class TierSettings(BaseModel):
     """Tier configuration — maps a tier name to a backend and model."""
+
+    model_config = ConfigDict(extra="forbid")
 
     backend: str = Field(description="Backend name this tier routes to")
     model: str | None = Field(
@@ -571,8 +592,10 @@ class TierSettings(BaseSettings):
     )
 
 
-class ClassifierSettings(BaseSettings):
+class ClassifierSettings(BaseModel):
     """Task classifier settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(default=False, description="Enable task classification")
     model: str | None = Field(
@@ -583,8 +606,10 @@ class ClassifierSettings(BaseSettings):
     )
 
 
-class RoutingSettings(BaseSettings):
+class RoutingSettings(BaseModel):
     """Model routing settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(default=False, description="Enable multi-backend routing")
     default_backend: str = Field(default="default", description="Default backend name")
@@ -667,30 +692,38 @@ class RoutingSettings(BaseSettings):
         return self
 
 
-class ServerSettings(BaseSettings):
+class ServerSettings(BaseModel):
     """Server settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     host: str = Field(default="0.0.0.0", description="Server host")
     port: int = Field(default=8001, description="Server port")
 
 
-class QueueSettings(BaseSettings):
+class QueueSettings(BaseModel):
     """Queue settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     max_size: int = Field(default=1000, description="Maximum queue size")
     default_timeout: float = Field(default=60.0, description="Default request timeout in seconds")
 
 
-class RateLimitSettings(BaseSettings):
+class RateLimitSettings(BaseModel):
     """Rate limit settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(default=True, description="Enable rate limiting")
     default_rate: float = Field(default=10.0, description="Default requests per second")
     default_burst: int = Field(default=20, description="Default burst size")
 
 
-class RetrySettings(BaseSettings):
+class RetrySettings(BaseModel):
     """Retry settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     max_retries: int = Field(default=3, description="Maximum number of retries")
     base_delay: float = Field(default=1.0, description="Base delay between retries in seconds")
@@ -704,8 +737,10 @@ class RetrySettings(BaseSettings):
     )
 
 
-class LoggingSettings(BaseSettings):
+class LoggingSettings(BaseModel):
     """Logging settings."""
+
+    model_config = ConfigDict(extra="forbid")
 
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Logging level"
