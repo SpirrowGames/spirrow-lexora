@@ -47,8 +47,31 @@ class TestNullProviderChoice:
         assert answer["confidence"] == 0.0
 
     @pytest.mark.asyncio
+    async def test_choice_with_map_options(self) -> None:
+        """TypeSafe's ``{option: description}`` map: the keys, in order."""
+        result = (await NullProvider().evaluate(
+            state="s",
+            questions={
+                "q": QuestionSpec(
+                    type="choice",
+                    instructions="i",
+                    criteria={"rule_1": "...", "none": "..."},
+                )
+            },
+        )).answers
+        answer = result["q"]
+        assert answer["choice"] == "rule_1"
+        assert list(answer["probabilities"]) == ["rule_1", "none"]
+        assert answer["probabilities"]["none"] == pytest.approx(0.5)
+        assert answer["confidence"] == 0.0
+
+    @pytest.mark.asyncio
     async def test_choice_with_object_options(self) -> None:
-        """TypeSafe's ``[{name, description}, ...]`` shape also works."""
+        """A ``[{name, description}, ...]`` array is read best-effort.
+
+        Jev rejects this shape with a 422 (mindwire#433), so this only
+        keeps NullProvider shape-correct for a caller that sends it.
+        """
         result = (await NullProvider().evaluate(
             state="s",
             questions={

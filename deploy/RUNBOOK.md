@@ -84,7 +84,10 @@
 
 ### 設定
 
-- Discord の webhook の URL を `/etc/lexora/environment` の `LEXORA_FALLBACK_WEBHOOK_URL` に書きます（`deploy/environment.example` を参照）。
+- Discord の webhook の URL を、unit の `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` として書きます（`deploy/environment.example` を参照）。
+  - `deploy/lexora.service` では `/etc/lexora/environment` ですが、実際に動いている unit はこれと違うことがあります。パスは `systemctl cat <unit>` で確かめてください。
+  - 読み込まれるのは起動時です。書いた後は再起動が要ります（上の 1 の手順で）。
+  - webhook を読むのは `type: fallback` の backend だけです。`codex` の backend しか無い構成では、設定しても通知は届きません（下の 8 の期限前の予告も同じ）。
   - URL は資格情報として扱ってください。Lexora はログに URL を出しません。
 - 未設定のときは、起動時に `fallback_webhook_unset` の WARNING が 1 回出るだけで、通知は送られません。
 
