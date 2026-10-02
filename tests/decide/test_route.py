@@ -655,3 +655,212 @@ class TestJevClientLifecycle:
         with TestClient(app):
             assert not client.is_closed
         assert client.is_closed
+
+
+def _shadow_app(
+    monkeypatch: pytest.MonkeyPatch, provider, mode: str = "shadow"
+):  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
+    app = create_app(
+        settings=Settings(
+            decision=DecisionSettings(
+                primary="jev", mode=mode, log_path=":memory:"  # type: ignore[arg-type]
+            )
+        )
+    )
+    app.state.decision_providers["jev"] = provider
+    return app
+
+
+def _rows_by_kind(app):  # type: ignore[no-untyped-def]
+    rows = app.state.decision_log.fetch_all()
+    answering = [r for r in rows if r["shadow_of"] is None]
+    shadow = [r for r in rows if r["shadow_of"] is not None]
+    return answering, shadow
+
+
+class TestShadowMode:
+    """``mode="shadow"`` (Bohr msg-583 v6, msg-585 v7).
+
+    Determinism: ``TestClient`` returns only after the ASGI call has
+    finished, and Starlette runs background tasks inside that call, after
+    the response is sent. So by the time ``post`` returns, the shadow task
+    has completed and its row (if any) is in the log — no waiting needed.
+    """
+
+    def test_jev_success_writes_linked_shadow_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        import httpx
+
+        calls: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "model": "jev-1.13.0",
+                    "answers": {"esc": {"type": "noul", "noul": 0.95}},
+                    "usage": {"input_tokens": 30, "output_tokens": 2},
+                },
+            )
+
+        app = _shadow_app(monkeypatch, _real_jev(handler))
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # The caller gets the NullProvider answer.
+        assert body["provider"] == "null"
+        assert body["answers"] == {"esc": {"noul": 0.5}}
+        assert len(calls) == 1
+
+        (answering,), (shadow,) = _rows_by_kind(app)
+        assert answering["decision_id"] == body["decision_id"]
+        assert answering["provider"] == "null"
+        assert answering["provider_error"] is None
+        for col in _UPSTREAM_COLS:
+            assert answering[col] is None, col
+
+        assert shadow["shadow_of"] == body["decision_id"]
+        assert shadow["decision_id"] != body["decision_id"]
+        assert shadow["provider"] == "jev"
+        assert shadow["provider_error"] is None
+        assert json.loads(shadow["answers_json"]) == {
+            "esc": {"type": "noul", "noul": 0.95}
+        }
+        assert shadow["provider_model"] == "jev-1.13.0"
+        assert shadow["provider_input_tokens"] == 30
+        assert shadow["provider_output_tokens"] == 2
+        assert shadow["state_hash"] == answering["state_hash"]
+        assert shadow["questions_hash"] == answering["questions_hash"]
+        assert shadow["policy"] == answering["policy"]
+
+    @pytest.mark.parametrize(
+        ("kind", "code"),
+        [("timeout", "timeout"), ("429", "rate_limited"), ("disconnect", "network")],
+    )
+    def test_jev_failure_leaves_failure_row(
+        self, monkeypatch: pytest.MonkeyPatch, kind: str, code: str
+    ) -> None:
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if kind == "timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
+            if kind == "disconnect":
+                raise httpx.RemoteProtocolError(
+                    "Server disconnected without sending a response.", request=request
+                )
+            return httpx.Response(429, json={})
+
+        app = _shadow_app(monkeypatch, _real_jev(handler))
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["provider"] == "null"
+        assert resp.json()["answers"] == {"esc": {"noul": 0.5}}
+
+        (answering,), (shadow,) = _rows_by_kind(app)
+        assert answering["provider_error"] is None
+        assert shadow["shadow_of"] == answering["decision_id"]
+        assert shadow["provider"] == "jev"
+        assert shadow["provider_error"] == f"jev:{code}"
+        assert shadow["answers_json"] == "{}"
+
+    def test_unexpected_exception_is_contained(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """v7 §2: no row, one type-name-only error line, no traceback."""
+
+        class _Boom:
+            name = "jev"
+
+            async def evaluate(self, *, state, questions):  # type: ignore[no-untyped-def]
+                raise RuntimeError(f"bug holding {state}")
+
+        app = _shadow_app(monkeypatch, _Boom())
+        capsys.readouterr()
+        with caplog.at_level("DEBUG"):
+            resp = TestClient(app).post(
+                "/v1/decide", json=dict(_BODY, state=_STATE_SENTINEL)
+            )
+        captured = capsys.readouterr()
+        logs = captured.out + captured.err
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["provider"] == "null"
+        answering, shadow = _rows_by_kind(app)
+        assert len(answering) == 1
+        assert shadow == []
+        (line,) = [ln for ln in logs.splitlines() if "decide_shadow_failed" in ln]
+        assert "RuntimeError" in line
+        assert "Traceback" not in logs
+        assert _STATE_SENTINEL not in logs
+        assert all(r.exc_info is None for r in caplog.records)
+
+    def test_shadow_log_write_failure_is_contained(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """v7 §2/§5: a failing ``awrite`` of the shadow row is caught too."""
+        import sqlite3
+
+        app = _shadow_app(monkeypatch, _FakeJev())
+        log = app.state.decision_log
+        real_awrite = log.awrite
+
+        async def awrite(row):  # type: ignore[no-untyped-def]
+            if row.shadow_of is not None:
+                raise sqlite3.OperationalError("database is locked")
+            await real_awrite(row)
+
+        monkeypatch.setattr(log, "awrite", awrite)
+        capsys.readouterr()
+        with caplog.at_level("DEBUG"):
+            resp = TestClient(app).post(
+                "/v1/decide", json=dict(_BODY, state=_STATE_SENTINEL)
+            )
+        captured = capsys.readouterr()
+        logs = captured.out + captured.err
+        assert resp.status_code == 200, resp.text
+        answering, shadow = _rows_by_kind(app)
+        assert len(answering) == 1
+        assert shadow == []
+        (line,) = [ln for ln in logs.splitlines() if "decide_shadow_failed" in ln]
+        assert "OperationalError" in line
+        assert "Traceback" not in logs
+        assert _STATE_SENTINEL not in logs
+        assert all(r.exc_info is None for r in caplog.records)
+
+    def test_off_never_calls_jev(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import httpx
+
+        calls: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        app = _shadow_app(monkeypatch, _real_jev(handler), mode="off")
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.status_code == 200, resp.text
+        assert calls == []
+        answering, shadow = _rows_by_kind(app)
+        assert len(answering) == 1
+        assert shadow == []
+
+    def test_active_writes_no_shadow_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeJev()
+        app = _shadow_app(monkeypatch, fake, mode="active")
+        resp = TestClient(app).post("/v1/decide", json=_BODY)
+        assert resp.json()["provider"] == "jev"
+        assert fake.calls == 1
+        answering, shadow = _rows_by_kind(app)
+        assert len(answering) == 1
+        assert shadow == []
