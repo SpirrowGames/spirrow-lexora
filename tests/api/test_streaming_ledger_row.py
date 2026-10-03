@@ -125,6 +125,19 @@ pattern found 3, expected 3, replaced 3, each time.
 - `duration=4.75`, i.e. `ADVANCE_A` -- a constant equal to one of the two
   scripted advances, which is the shape a single-advance version could not
   see: 3 red / 13 green, the same three (-75 bytes).
+- `time.monotonic()` -> `time.time()` in that same `duration=` argument, i.e.
+  the handler reading the adjustable wall clock instead of `monotonic` at the
+  three sites that bill: 3 red / 13 green, the same three (-15 bytes), each an
+  `AssertionError` on the identity (`[1791057648.4..., ...] == [4.75, 8.25]`),
+  not a crash -- `_SteppingClock.__getattr__` delegates `time()` to the real
+  module, so the mutant reads a real clock and the equality is what kills it.
+  SUITE-WIDE, at `fbbfdea` on win32 / CPython 3.12.13: 3 failed / 1418 passed
+  / 1 skipped / 2 deselected, and the three are these cases and nothing else.
+  That is what this row establishes: the identity also holds the
+  clock-provenance half for THESE THREE SITES -- both endpoints must resolve
+  through `routes.time.monotonic` -- and no other case in the suite does,
+  including every case in `test_interval_clock.py`, none of which is
+  parametrised over a streaming route's success path.
 
 THE THIRD ROW IS THE ONE THAT EARNS THE SECOND ADVANCE, and it was measured as
 a counterfactual rather than argued: with the case cut down to
@@ -247,8 +260,14 @@ COMPLETION_TOKENS = 42
 # plausible band -- no single constant satisfies both.
 #
 # WHAT THAT FENCE DOES NOT BUY, written here rather than left to be discovered
-# from a green run: it cannot show the handler reads a REAL clock. Under a
-# scripted double every reading is scripted, by construction. That half is
+# from a green run: it cannot show the handler's READING is real. Under a
+# scripted double every reading is scripted, by construction. What it DOES
+# force is provenance: both endpoints must resolve through
+# `routes.time.monotonic` and nothing else, because any other clock yields a
+# value that is not the script (the `time.time()` row in the module docstring
+# measures that, and measures that no other case in the suite sees it). So do
+# not add a separate provenance fence for these three sites; the reality of
+# the reading is the half that lives elsewhere. That half is
 # already held, by identity and not by margin, in `test_ledger_coverage.py` --
 # `test_route_records_exactly_one_row`'s `backend_delta <= duration <= wall`,
 # whose ends are read through `read_outer_clock` off the handler's own clock,
@@ -559,8 +578,12 @@ class TestStreamingRoutesOpenARow:
         loosened: no resolution, platform, scheduling or load property has to
         hold for an identity over a scripted double.
 
-        WHAT THIS DOES NOT BUY. It cannot show the handler reads a real clock;
-        under a scripted double every reading is scripted. `SLOW`'s comment
+        WHAT THIS DOES NOT BUY. It cannot show the handler's reading is real;
+        under a scripted double every reading is scripted. It DOES force both
+        endpoints to resolve through `routes.time.monotonic` and nothing else,
+        because any other clock yields a value that is not the script -- the
+        `time.time()` row in the module docstring is that receipt, and it is
+        the only case in the suite that reds under it. `SLOW`'s comment
         above carries the full statement and names the two cases in
         `test_ledger_coverage.py` that hold that half by identity. The two
         together are what `assert slow > fast` was trying to buy in one move.
