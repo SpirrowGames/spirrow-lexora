@@ -47,6 +47,11 @@ from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.router import BackendRouter
 from lexora.services.cost_tracker import CostTracker
+from lexora.services.trace import (
+    TRACE_HEADER,
+    parse_trace_id,
+    set_current_trace_id,
+)
 from lexora.services.stats import StatsCollector
 from lexora.services.task_classifier import (
     TaskClassifier,
@@ -444,6 +449,25 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
     return getattr(request.app.state, "cost_tracker", None)
 
 
+def get_trace_id(request: Request) -> str | None:
+    """Validated ``X-Mindwire-Trace`` of this request (T-cost-row-trace-id).
+
+    None when the header is absent, invalid (see ``services.trace``), or sent
+    more than once -- a repeated header has no single value to record, so it
+    is rejected rather than one copy being picked. Never fails the request.
+
+    This only returns the value. The handler both passes it to
+    ``cost_tracker.record`` and calls ``set_current_trace_id`` itself: a sync
+    dependency runs in a threadpool, so a context variable set here would not
+    reach the handler or the shadow task it spawns.
+    """
+    values = request.headers.getlist(TRACE_HEADER)
+    if len(values) > 1:
+        logger.warning("trace_id_rejected", reason="multiple", count=len(values))
+        return None
+    return parse_trace_id(values[0] if values else None)
+
+
 def check_rate_limit(
     user_id: str | None,
     rate_limiter: RateLimiter,
@@ -493,6 +517,7 @@ async def chat_completions(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+    trace_id: str | None = Depends(get_trace_id),
 ) -> dict[str, Any] | StreamingResponse:
     """Proxy chat completion request to vLLM.
 
@@ -509,6 +534,7 @@ async def chat_completions(
         OpenAI-compatible chat completion response or streaming response.
     """
     endpoint = "/v1/chat/completions"
+    set_current_trace_id(trace_id)
 
     # Check rate limit
     check_rate_limit(request.user, rate_limiter, rate_limit_enabled, metrics_collector)
@@ -807,6 +833,7 @@ async def chat_completions(
                             if backend_router.is_tier(request.model)
                             else None
                         ),
+                        trace_id=trace_id,
                         **_ledger_token_extras(usage_sink),
                     )
                 # ★ The other half of the same `finally`, and mutually
@@ -918,6 +945,7 @@ async def chat_completions(
                 user_id=request.user,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                trace_id=trace_id,
                 **_ledger_token_extras(usage),
             )
 
@@ -1003,6 +1031,7 @@ async def completions(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+    trace_id: str | None = Depends(get_trace_id),
 ) -> dict[str, Any] | StreamingResponse:
     """Proxy completion request to vLLM.
 
@@ -1020,6 +1049,7 @@ async def completions(
         OpenAI-compatible completion response or streaming response.
     """
     endpoint = "/v1/completions"
+    set_current_trace_id(trace_id)
 
     # Check rate limit
     check_rate_limit(request.user, rate_limiter, rate_limit_enabled, metrics_collector)
@@ -1258,6 +1288,7 @@ async def completions(
                             if backend_router.is_tier(request.model)
                             else None
                         ),
+                        trace_id=trace_id,
                         **_ledger_token_extras(usage_sink),
                     )
                 # ★ The observable half of the same `finally`. See the
@@ -1353,6 +1384,7 @@ async def completions(
                 user_id=request.user,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                trace_id=trace_id,
                 **_ledger_token_extras(usage),
             )
 
@@ -1434,6 +1466,7 @@ async def embeddings(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+    trace_id: str | None = Depends(get_trace_id),
 ) -> dict[str, Any]:
     """Proxy embeddings request to vLLM.
 
@@ -1450,6 +1483,7 @@ async def embeddings(
         OpenAI-compatible embeddings response.
     """
     endpoint = "/v1/embeddings"
+    set_current_trace_id(trace_id)
 
     # Check rate limit
     check_rate_limit(request.user, rate_limiter, rate_limit_enabled, metrics_collector)
@@ -1510,6 +1544,7 @@ async def embeddings(
                 user_id=request.user,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                trace_id=trace_id,
                 **_ledger_token_extras(usage),
             )
 
@@ -1878,6 +1913,7 @@ async def generate(
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     model_registry: ModelRegistry | None = Depends(get_model_registry),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+    trace_id: str | None = Depends(get_trace_id),
 ) -> GenerateResponse:
     """Simple text generation endpoint.
 
@@ -1899,6 +1935,7 @@ async def generate(
         GenerateResponse with generated text.
     """
     endpoint = "/generate"
+    set_current_trace_id(trace_id)
 
     # Check rate limit
     check_rate_limit(request.user, rate_limiter, rate_limit_enabled, metrics_collector)
@@ -2009,6 +2046,7 @@ async def generate(
                 user_id=request.user,
                 duration=duration,
                 tier=model if backend_router.is_tier(model) else None,
+                trace_id=trace_id,
                 **_ledger_token_extras(usage),
             )
 
@@ -2073,6 +2111,7 @@ async def chat(
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     model_registry: ModelRegistry | None = Depends(get_model_registry),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+    trace_id: str | None = Depends(get_trace_id),
 ) -> ChatResponse:
     """Simple chat endpoint.
 
@@ -2094,6 +2133,7 @@ async def chat(
         ChatResponse with assistant response.
     """
     endpoint = "/chat"
+    set_current_trace_id(trace_id)
 
     # Check rate limit
     check_rate_limit(request.user, rate_limiter, rate_limit_enabled, metrics_collector)
@@ -2194,6 +2234,7 @@ async def chat(
                 user_id=request.user,
                 duration=duration,
                 tier=model if backend_router.is_tier(model) else None,
+                trace_id=trace_id,
                 **_ledger_token_extras(usage),
             )
 
@@ -2253,6 +2294,7 @@ async def messages(
     rate_limit_enabled: bool = Depends(is_rate_limit_enabled),
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
+    trace_id: str | None = Depends(get_trace_id),
 ) -> dict[str, Any] | JSONResponse | StreamingResponse:
     """Anthropic Messages API-compatible endpoint.
 
@@ -2278,6 +2320,7 @@ async def messages(
         (JSONResponse), or a streaming SSE response.
     """
     endpoint = "/v1/messages"
+    set_current_trace_id(trace_id)
 
     req_dict = request.model_dump(exclude_none=True)
     user_id = extract_user_id(req_dict)
@@ -2516,6 +2559,7 @@ async def messages(
                             if backend_router.is_tier(request.model)
                             else None
                         ),
+                        trace_id=trace_id,
                         **_ledger_token_extras(usage_sink),
                     )
                 # ★ The observable half of the same `finally`. See the
@@ -2598,6 +2642,7 @@ async def messages(
                 user_id=user_id,
                 duration=duration,
                 tier=request.model if backend_router.is_tier(request.model) else None,
+                trace_id=trace_id,
                 **_ledger_token_extras(usage),
             )
 
@@ -2719,16 +2764,26 @@ async def get_costs(
 @router.get("/stats/costs/recent")
 async def get_recent_costs(
     limit: int = 50,
+    trace_id: str | None = None,
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
 ) -> list[dict[str, Any]]:
     """Get recent request cost records.
 
     Args:
         limit: Maximum number of records to return.
+        trace_id: Only rows recorded under this ``X-Mindwire-Trace`` value
+            (exact match). A value that is not a canonical ULID is answered
+            with 422 rather than ignored: returning unfiltered rows would be
+            the "the gateway did not apply the filter" failure mindwire's
+            attestation exists to catch (T-cost-row-trace-id msg-627 §2c).
 
     Returns:
         List of recent request cost records.
     """
+    if trace_id is not None and parse_trace_id(trace_id) is None:
+        raise HTTPException(
+            status_code=422, detail="trace_id must be a canonical ULID"
+        )
     if cost_tracker is None:
         raise HTTPException(status_code=503, detail="Cost tracking not available")
-    return cost_tracker.get_recent(limit=limit)
+    return cost_tracker.get_recent(limit=limit, trace_id=trace_id)

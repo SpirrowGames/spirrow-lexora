@@ -256,6 +256,15 @@ class CostTracker:
             # fallback Gemini, hence a column of its own.
             if "answered_by" not in cols:
                 conn.execute("ALTER TABLE request_costs ADD COLUMN answered_by TEXT")
+            # T-cost-row-trace-id: the `X-Mindwire-Trace` ULID of the request
+            # (see `services/trace.py`). NULL when the caller sent none or an
+            # invalid one, and for every row written before this migration.
+            if "trace_id" not in cols:
+                conn.execute("ALTER TABLE request_costs ADD COLUMN trace_id TEXT")
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_costs_trace_id
+                   ON request_costs(trace_id)"""
+            )
             # B-5: one row per shadow comparison. No prompt, no answer text.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS shadow_comparisons (
@@ -370,6 +379,7 @@ class CostTracker:
         tier: str | None = None,
         tokens_thinking: int | None = None,
         tokens_cached_input: int | None = None,
+        trace_id: str | None = None,
     ) -> float:
         """Record a request's cost.
 
@@ -405,6 +415,8 @@ class CostTracker:
                 them; stored as NULL.
             tokens_cached_input: Cached input tokens, a subset of
                 ``tokens_input``. None when not measured; stored as NULL.
+            trace_id: The validated ``X-Mindwire-Trace`` value of the
+                request (``services.trace.parse_trace_id``), or None.
 
         Returns:
             Calculated cost in USD.
@@ -446,8 +458,9 @@ class CostTracker:
                        (timestamp, model, backend, endpoint, user_id,
                         tokens_input, tokens_output, cost_usd,
                         duration_seconds, success, tier, pricing_known,
-                        tokens_thinking, tokens_cached_input, answered_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tokens_thinking, tokens_cached_input, answered_by,
+                        trace_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         timestamp,
                         model,
@@ -464,6 +477,7 @@ class CostTracker:
                         tokens_thinking,
                         tokens_cached_input,
                         answered_by,
+                        trace_id,
                     ),
                 )
         except Exception:
@@ -666,20 +680,31 @@ class CostTracker:
             "pricing": self.pricing,
         }
 
-    def get_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+    def get_recent(
+        self, limit: int = 50, trace_id: str | None = None
+    ) -> list[dict[str, Any]]:
         """Get recent request records.
 
         Args:
             limit: Maximum number of records.
+            trace_id: When given, only rows whose ``trace_id`` equals it
+                exactly. None returns every row, as before.
 
         Returns:
             List of recent request records.
         """
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                """SELECT * FROM request_costs
-                   ORDER BY id DESC LIMIT ?""",
-                (limit,),
-            ).fetchall()
+            if trace_id is None:
+                rows = conn.execute(
+                    """SELECT * FROM request_costs
+                       ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM request_costs WHERE trace_id = ?
+                       ORDER BY id DESC LIMIT ?""",
+                    (trace_id, limit),
+                ).fetchall()
         return [dict(r) for r in rows]
