@@ -97,6 +97,7 @@ from lexora.backends.codex_data_controls import (
     REASON_DATA_CONTROLS_UNVERIFIED,
     RUNBOOK_POINTER,
 )
+from lexora.services.trace import current_trace_id
 from lexora.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -564,6 +565,9 @@ class FallbackBackend(Backend):
                     tokens_input=int(usage.get("prompt_tokens", 0)),
                     tokens_output=int(usage.get("completion_tokens", 0)),
                     tier=self.tier_label,
+                    # Set by the handler before it called this wrapper; the
+                    # task copied that context when `_start_shadow` made it.
+                    trace_id=current_trace_id(),
                 )
         codex_seconds = time.monotonic() - started
         gemini_text, gemini_seconds = await gemini_done
