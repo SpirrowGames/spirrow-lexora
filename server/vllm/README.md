@@ -7,7 +7,7 @@ Lexora の `vllm` バックエンドが向いている推論サーバ（`http://
 
 ズレは `drift-check.sh` が検出し、`--apply` で解消する（`server/docs-host/` と同じ方式）。
 
-| このリポジトリ | sg-ai-server-01 の実体 | 読む主体 |
+| このリポジトリ | {{HOST_SERVICES}}（[[platform:infra-registry]]）の実体 | 読む主体 |
 |---|---|---|
 | `start-qwen38-27b.sh` | `~/services/vllm/start-qwen38-27b.sh` | `vllm-32b.service` の `ExecStart`（**稼働中**） |
 | `start-32b.sh` | `~/services/vllm/start-32b.sh` | 同上（`qwen38.conf` を消したときの切り戻し先） |

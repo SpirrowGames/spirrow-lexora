@@ -248,13 +248,18 @@ def _null_answer_for(question: QuestionSpec) -> Answer:
 def _extract_choice_options(criteria: object) -> list[str]:
     """Best-effort extraction of the option names for a ``choice`` question.
 
-    TypeSafe's ``choice`` criteria may be a list of strings or a list of
-    ``{name, description}`` objects (docs at
-    https://docs.typesafe.ai/primitives/choice.md — accessible from the
-    vendored SKILL.md, not from this codebase at runtime). Lexora
-    accepts either form so NullProvider stays useful against real
-    question payloads from the utilisation-side threads.
+    TypeSafe's ``choice`` criteria is a ``{option: description}`` map;
+    the keys are the options, in order
+    (https://docs.typesafe.ai/primitives/choice.md). Jev rejects an
+    array with a 422 (``dict_type``). An earlier version of this
+    docstring said otherwise, and mindwire's tierc-v2/v3 questions
+    followed it into NullProvider on every call from 2026-09-30 until
+    mindwire#433. A list of strings or of ``{name, ...}`` objects is
+    still read, best-effort, so NullProvider stays shape-correct for a
+    caller that sends one, but Jev will not accept it.
     """
+    if isinstance(criteria, dict):
+        return [name for name in criteria if isinstance(name, str)]
     if not isinstance(criteria, list):
         return []
     options: list[str] = []

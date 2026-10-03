@@ -325,3 +325,72 @@ class TestSubscriptionBackendIsNotPriced:
             cost, pricing_known = tracker.calculate_cost(model, 1_000_000, 1_000_000)
             assert pricing_known is True, f"{model!r} lost its price"
             assert cost == pytest.approx(total), f"{model!r} repriced"
+
+
+class TestTraceIdColumn:
+    """T-cost-row-trace-id msg-627 §2b: a nullable ``trace_id`` column, the
+    value stored verbatim, and ``get_recent(trace_id=)`` filtering on it."""
+
+    X = "01J9Z3K4M5N6P7Q8R9S0T1V2W3"
+    Y = "01J9Z3K4M5N6P7Q8R9S0T1V2W4"
+
+    def _pre_trace_schema(self, db_path: Path) -> None:
+        """The schema as of the previous migration: every column but ``trace_id``."""
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """CREATE TABLE request_costs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    backend TEXT,
+                    endpoint TEXT NOT NULL,
+                    user_id TEXT,
+                    tokens_input INTEGER NOT NULL DEFAULT 0,
+                    tokens_output INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0.0,
+                    duration_seconds REAL,
+                    success INTEGER NOT NULL DEFAULT 1,
+                    tier TEXT,
+                    pricing_known INTEGER,
+                    tokens_thinking INTEGER,
+                    tokens_cached_input INTEGER,
+                    answered_by TEXT
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO request_costs
+                   (timestamp, model, endpoint, tokens_input, tokens_output, cost_usd, success)
+                   VALUES ('2026-01-01T00:00:00Z', 'legacy-model', '/e', 10, 20, 0.001, 1)"""
+            )
+
+    def test_migration_adds_column_and_keeps_rows_null(self, db_path: Path) -> None:
+        self._pre_trace_schema(db_path)
+        CostTracker(db_path=db_path)
+        tracker = CostTracker(db_path=db_path)  # second open: guarded, no raise
+        with sqlite3.connect(db_path) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(request_costs)")}
+            indexes = {row[1] for row in conn.execute("PRAGMA index_list(request_costs)")}
+        assert "trace_id" in cols
+        assert "idx_costs_trace_id" in indexes
+        [row] = tracker.get_recent()
+        assert row["model"] == "legacy-model"
+        assert row["trace_id"] is None
+
+    def test_record_stores_trace_id_verbatim(self, db_path: Path) -> None:
+        tracker = CostTracker(db_path=db_path)
+        tracker.record(model="m", endpoint="/e", tokens_input=1, tokens_output=1, trace_id=self.X)
+        tracker.record(model="m", endpoint="/e", tokens_input=1, tokens_output=1)
+        rows = tracker.get_recent()
+        assert [r["trace_id"] for r in rows] == [None, self.X]
+
+    def test_get_recent_filters_by_trace_id(self, db_path: Path) -> None:
+        tracker = CostTracker(db_path=db_path)
+        for trace in (self.X, self.Y, None, self.X):
+            tracker.record(model="m", endpoint="/e", tokens_input=1, tokens_output=1, trace_id=trace)
+        only_x = tracker.get_recent(trace_id=self.X)
+        assert [r["trace_id"] for r in only_x] == [self.X, self.X]
+        assert [r["id"] for r in only_x] == [4, 1]  # newest first, as unfiltered
+        assert len(tracker.get_recent(trace_id=self.X, limit=1)) == 1
+        assert len(tracker.get_recent()) == 4
+        assert tracker.get_recent(trace_id="01J9Z3K4M5N6P7Q8R9S0T1V2W5") == []
