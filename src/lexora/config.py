@@ -383,7 +383,12 @@ class FallbackSettings(BaseModel):
 class BackendSettings(BaseModel):
     """Single backend settings."""
 
-    model_config = ConfigDict(extra="forbid")
+    # protected_namespaces=(): ``model_mapping`` starts with ``model_``, which
+    # pydantic < 2.10 (allowed by ``pydantic>=2.5.0``) reserves and warns on.
+    # Scoped to this class only; tests/test_config_unprefixed_env.py guards
+    # both the scope and real BaseModel-attribute collisions
+    # (T-config-unprefixed-env msg-617 / msg-622 / msg-624).
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     type: Literal[
         "vllm", "openai_compatible", "anthropic", "claude_code", "gemini", "codex", "fallback"

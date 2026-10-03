@@ -14,7 +14,9 @@ Two layers of test:
 
 * ``TestStructuralGuard`` walks every class reachable from ``Settings`` and
   asserts none is a ``BaseSettings`` -- so a child class added later cannot
-  reintroduce the leak without turning CI red, whatever its name.
+  reintroduce the leak without turning CI red, whatever its name. It also
+  keeps ``protected_namespaces=()`` scoped to ``BackendSettings`` and fails
+  any field name that shadows a ``BaseModel`` attribute.
 * ``TestBehaviour`` sets one unprefixed env var per field name of every
   reachable class and checks ``create_settings()`` is unchanged, on both
   paths that fall back to the environment: (a) section present, field
@@ -37,19 +39,11 @@ from lexora.backends.factory import resolve_api_key
 from lexora.config import (
     BackendSettings,
     ClassifierSettings,
-    LoggingSettings,
     ModelInfo,
-    QueueSettings,
-    RateLimitSettings,
-    RetrySettings,
-    RoutingSettings,
-    ServerSettings,
     Settings,
     TierSettings,
-    VLLMSettings,
     create_settings,
 )
-from lexora.decide.config import DecisionSettings
 
 
 def _reachable_models(root: type[BaseModel]) -> list[type[BaseModel]]:
@@ -75,31 +69,23 @@ def _reachable_models(root: type[BaseModel]) -> list[type[BaseModel]]:
     return list(seen)
 
 
-#: Classes ``create_settings`` constructs directly. Most are also reachable
-#: from ``Settings``; listing them keeps a class built by the loader but not
-#: typed on ``Settings`` guarded too.
-_CONSTRUCTED_BY_CREATE_SETTINGS: tuple[type[BaseModel], ...] = (
-    VLLMSettings,
-    ServerSettings,
-    QueueSettings,
-    RateLimitSettings,
-    RetrySettings,
-    LoggingSettings,
-    RoutingSettings,
-    BackendSettings,
-    TierSettings,
-    ClassifierSettings,
-    ModelInfo,
-    DecisionSettings,
-)
-
-
 def _child_classes() -> list[type[BaseModel]]:
-    classes = _reachable_models(Settings)
-    for cls in _CONSTRUCTED_BY_CREATE_SETTINGS:
-        if cls not in classes:
-            classes.append(cls)
-    return [cls for cls in classes if cls is not Settings]
+    """Every class reachable from ``Settings``, minus the root itself.
+
+    The recursive walk is the single source: no hand-kept list of the classes
+    ``create_settings`` constructs (msg-617 advisory, accepted in msg-622).
+    """
+    return [cls for cls in _reachable_models(Settings) if cls is not Settings]
+
+
+#: Child classes allowed to disable pydantic's protected-namespace check.
+#: ``BackendSettings.model_mapping`` starts with ``model_``; pydantic < 2.10
+#: (permitted by ``pydantic>=2.5.0``) warns on it. Suppression is an
+#: exception: adding a class here must be a reviewed decision
+#: (T-config-unprefixed-env msg-617 / msg-620 / msg-624).
+_PROTECTED_NAMESPACES_SUPPRESSED: frozenset[type[BaseModel]] = frozenset(
+    {BackendSettings}
+)
 
 
 #: One unprefixed env value per field name of every child class. Values
@@ -242,6 +228,36 @@ class TestStructuralGuard:
         """``BaseModel`` defaults to ``extra='ignore'``: a YAML typo would
         pass silently unless ``forbid`` is explicit (msg-602 step 3)."""
         assert cls.model_config.get("extra") == "forbid"
+
+    def test_backend_settings_suppresses_protected_namespaces(self) -> None:
+        """``model_mapping`` would warn on pydantic < 2.10 otherwise."""
+        assert BackendSettings.model_config.get("protected_namespaces") == ()
+
+    def test_protected_namespace_suppression_is_scoped(self) -> None:
+        """Only the allow-listed classes may set ``protected_namespaces=()``:
+        elsewhere pydantic's own check must stay in force."""
+        suppressed = {
+            cls
+            for cls in _child_classes()
+            if cls.model_config.get("protected_namespaces") == ()
+        }
+        assert suppressed == set(_PROTECTED_NAMESPACES_SUPPRESSED)
+
+    @pytest.mark.parametrize("cls", _child_classes(), ids=lambda c: c.__name__)
+    def test_no_field_shadows_base_model_attribute(self, cls: type[BaseModel]) -> None:
+        """No field name may equal a ``BaseModel`` attribute.
+
+        pydantic >= 2.10 hard-errors only for the ``model_validate`` /
+        ``model_dump`` prefixes; every other shadow (``model_copy``,
+        ``model_fields``, legacy ``copy`` / ``json`` / ``dict`` ...) is just a
+        ``UserWarning``, and with ``protected_namespaces=()`` even
+        ``model_dump`` is. This raises all of them to a CI failure, on every
+        child class (msg-624 / msg-626).
+        """
+        shadowing = sorted(name for name in cls.model_fields if hasattr(BaseModel, name))
+        assert not shadowing, (
+            f"{cls.__name__} fields shadow BaseModel attributes: {shadowing}"
+        )
 
     def test_root_keeps_prefixed_base_settings(self) -> None:
         assert issubclass(Settings, BaseSettings)
