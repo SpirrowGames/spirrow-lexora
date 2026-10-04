@@ -51,10 +51,20 @@ routing:
       description: "複雑なタスク (Qwen3.8-27B, reasoning_effort=xhigh)"
     # role ルート: naysayer は別訓練分布 (Gemini) で最大独立性を取る
     # (ADR-2026-05-31-15 D-2「2 協調 1 独立」)。呼び出し側は model: "naysayer"
+    # 2026-10-04 (T-naysayer-codex-backend msg-687 E): fallback wrapper
+    # `naysayer-codex` の mode: shadow に接続。答えるのは今まで通り Gemini で、
+    # 台帳の行 (backend=gemini, answered_by=NULL) も今と同じ — mindwire の
+    # attestation (expected=gemini) はそのまま通る。codex は裏で比較用に走るだけ。
+    # mode: fallback (codex が答える) への切替は費用面の Tier-C (Takahito 判断)。
     naysayer:
+      backend: "naysayer-codex"
+      model: "gemini-3.1-pro-preview"
+      description: "naysayer (Gemini が回答、codex は shadow で比較のみ)"
+    # Gemini だけに直結する naysayer (msg-687 E)。codex を一切通さない入口。
+    naysayer-gemini:
       backend: "gemini"
       model: "gemini-3.1-pro-preview"
-      description: "naysayer (別訓練分布・最大独立性、native generateContent gate)"
+      description: "naysayer (Gemini 直結、codex を通さない)"
     # frontier: heavy とは別に「一番賢い有料モデル」の入口を独立させる
     # (T-frontier-tier, 2026-08-31)。heavy はローカル vLLM (限界費用ゼロ)、
     # frontier は Anthropic の課金モデル ∴ 呼び出し側は「コストを払う意思表示」
@@ -170,12 +180,18 @@ routing:
 
     # Codex CLI (`codex exec` under bwrap, ChatGPT Pro サブスク認証)。
     # T-D8-codex-backend-adr14-15-amendment msg-5940 / msg-5942。
-    # tier には未接続 (2026-10-02) — naysayer への紐付けはループ側の設計確定後。
-    # 検証ゲート (verify_codex) が閉じている間は全リクエストを拒否する。
+    # tier に直接は付けない。naysayer ティアは下の fallback wrapper
+    # `naysayer-codex` (mode: shadow) を経由してこの backend を使う
+    # (2026-10-04, T-naysayer-codex-backend msg-687 E)。
+    # 検証ゲート (verify_codex) が閉じている間は全リクエストを拒否する
+    # (shadow では比較行が not_run になるだけで、回答は Gemini)。
     # max_concurrency: 1 は必須 — 1 つの auth.json のトークン更新を競合させない。
+    # 1 以外は起動時に拒否される (msg-687 A)。
     # health_check: false — ゲートが閉じている間は unhealthy を返し、
-    # どの tier からも使われていないのに /health 全体を degraded にするため。
+    # /health 全体を degraded にするため。
     # model は codex-cli 0.160.0 同梱カタログの既定 (priority 1)。
+    # backends/codex.py の CODEX_MODEL_PIN と一致しないと起動を拒否する
+    # (msg-687 G)。model を変える時は pin も読み直して同じ変更で動かす。
     codex:
       type: "codex"
       health_check: false
@@ -186,6 +202,24 @@ routing:
       codex:
         codex_home: "/srv/lexora/codex-home"
         max_concurrency: 1
+
+    # naysayer ティアの実体 (T-naysayer-codex-backend msg-687 E)。
+    # mode: shadow — Gemini が答え、codex は同じリクエストを裏で 1 本だけ走らせて
+    # verdict を比較する (shadow_comparisons)。fallback への切替は Tier-C。
+    # 時間の予算 (msg-687 C): slot_wait_s + codex_timeout_s + fallback_floor_s
+    # <= caller_budget_s を起動時に検査し、成り立たなければ起動しない。
+    # caller_budget_s=930 は mindwire の client が待つ時間 (gemini backend の
+    # timeout コメント参照)。
+    naysayer-codex:
+      type: "fallback"
+      fallback:
+        primary: "codex"
+        fallback: "gemini"
+        mode: "shadow"
+        caller_budget_s: 930
+        slot_wait_s: 30
+        codex_timeout_s: 300
+        fallback_floor_s: 600
 
     # Claude Code CLI (non-interactive mode)
     claude_code:

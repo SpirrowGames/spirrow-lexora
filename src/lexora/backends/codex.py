@@ -138,6 +138,39 @@ def override_key(override: str) -> str:
     return override.split("=", 1)[0].strip().lower()
 
 
+@dataclass(frozen=True)
+class CodexModelPin:
+    """Limits of the one model the codex backend may serve (msg-687 G).
+
+    ``max_output_tokens`` is ``None`` because the catalog carries no output
+    limit for any model: ``models.json`` at the pinned tag has no
+    ``max_output_tokens`` (or any other output-limit) key. It is left
+    unknown rather than guessed (msg-687 G).
+    """
+
+    model: str
+    context_window: int
+    max_context_window: int
+    max_output_tokens: int | None
+
+
+#: Read, not inferred, from the public openai/codex repository:
+#:   tag   rust-v0.160.0 (tag object 79b1b666f2e8551f8abbbca34957227f67f3f553,
+#:         commit a956835d020762cb2b570053af06f643a11c0ecc)
+#:   file  codex-rs/models-manager/models.json
+#:   blob  77e0389c56000ca19df5029278c30c3e9528af51
+#: Entry ``"slug": "gpt-6.1-sol"`` (``"priority": 1``):
+#: ``"context_window": 272000``, ``"max_context_window": 872000``.
+#: Change the config's model only together with a new read of this entry:
+#: ``factory.create_backend`` refuses a codex backend whose model differs.
+CODEX_MODEL_PIN = CodexModelPin(
+    model="gpt-6.1-sol",
+    context_window=272000,
+    max_context_window=872000,
+    max_output_tokens=None,
+)
+
+
 #: Output file name inside the per-request working directory.
 LAST_MESSAGE_FILE = "last_message.txt"
 
@@ -192,6 +225,16 @@ class CodexLaunchError(CodexError):
 
 class CodexTimeout(CodexError):
     """``codex exec`` did not finish within the backend timeout."""
+
+
+class CodexSlotTimeout(CodexError):
+    """No execution slot became free within ``slot_wait_s`` (msg-687 B).
+
+    Codex never ran: the run is finished, not latched. When it is raised
+    while another run still holds the slot, ``slot_hold`` is set
+    (``CodexBackend.codex_availability``) until that run gives the slot
+    back.
+    """
 
 
 class CodexFailed(CodexError):
@@ -395,21 +438,64 @@ def is_terminal_event(event: Mapping[str, Any]) -> bool:
     return etype in TERMINAL_EVENT_TYPES
 
 
-def usage_from_events(events: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
-    """(prompt_tokens, completion_tokens) from the last ``turn.completed``.
+@dataclass(frozen=True)
+class CodexUsage:
+    """Token counts of one ``codex exec`` run, in the ledger's convention.
 
-    ASSUMED shape: ``{"type": "turn.completed", "usage": {"input_tokens",
-    "cached_input_tokens", "output_tokens"}}``, with ``input_tokens``
-    already including the cached part (OpenAI convention). Assigned from the
-    last such event, never summed.
+    ``prompt_tokens`` = ``input_tokens`` (cached part INCLUDED, as for
+    Gemini's ``promptTokenCount``). ``completion_tokens`` = ``output_tokens``
+    minus ``reasoning_output_tokens``, so it EXCLUDES thinking the way
+    Gemini's ``candidatesTokenCount`` does and the ledger never counts
+    thinking twice (``tokens_thinking`` is "NOT included in
+    ``tokens_output``", ``CostTracker.record``). ``cached_input_tokens`` /
+    ``thinking_tokens`` are ``None`` when the event carries no such field:
+    NULL in the ledger means "not measured" (msg-687 H-2).
     """
-    prompt = completion = 0
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_input_tokens: int | None = None
+    thinking_tokens: int | None = None
+
+
+def _optional_int(usage: Mapping[str, Any], key: str) -> int | None:
+    if key not in usage or usage[key] is None:
+        return None
+    return int(usage[key])
+
+
+def usage_from_events(events: Sequence[Mapping[str, Any]]) -> CodexUsage:
+    """``CodexUsage`` from the last ``turn.completed`` (msg-687 H-2).
+
+    Shape read from codex-cli 0.160.0 (tag ``rust-v0.160.0``,
+    ``codex-rs/exec/src/exec_events.rs`` ``struct Usage``): ``input_tokens``,
+    ``cached_input_tokens``, ``cache_write_input_tokens``, ``output_tokens``,
+    ``reasoning_output_tokens``. ``input_tokens`` includes the cached part
+    (``TokenUsage::non_cached_input`` subtracts it). ``output_tokens``
+    includes the reasoning part: ``TokenUsage::blended_total`` is
+    ``non_cached_input + output_tokens`` with no reasoning term, and the CLI
+    copies the Responses API's ``output_tokens_details.reasoning_tokens``,
+    which OpenAI defines as a part of ``output_tokens``. That inclusion is
+    read from those two places, not measured on a live run (ASSUMED until
+    the first shadow rows confirm it); a reasoning count above the output
+    count is clamped so ``completion_tokens`` never goes negative.
+
+    Assigned from the last such event, never summed. A missing
+    ``cached_input_tokens`` / ``reasoning_output_tokens`` stays ``None``.
+    """
+    result = CodexUsage()
     for event in events:
         if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
             usage = event["usage"]
-            prompt = int(usage.get("input_tokens", 0) or 0)
-            completion = int(usage.get("output_tokens", 0) or 0)
-    return prompt, completion
+            output = int(usage.get("output_tokens", 0) or 0)
+            thinking = _optional_int(usage, "reasoning_output_tokens")
+            result = CodexUsage(
+                prompt_tokens=int(usage.get("input_tokens", 0) or 0),
+                completion_tokens=max(output - (thinking or 0), 0),
+                cached_input_tokens=_optional_int(usage, "cached_input_tokens"),
+                thinking_tokens=thinking,
+            )
+    return result
 
 
 def last_agent_message(events: Sequence[Mapping[str, Any]]) -> str | None:
@@ -688,7 +774,8 @@ class CodexAvailability:
     and ``GET /v1/naysayer/status`` both read this, so they cannot disagree
     (Principle 2). ``reason`` is ``None`` when codex may run; otherwise it is
     the ``CodexNotVerifiedError.reason`` of the check that closed (including
-    ``data_controls_unverified``), or ``quota_hold`` / ``launch_failed``. ``error`` is the exception the
+    ``data_controls_unverified``), or ``quota_hold`` / ``slot_hold`` /
+    ``launch_failed``. ``error`` is the exception the
     request path raises for that reason. ``quota_hold_until`` is reported
     whatever ``reason`` is, so a DB fault during a hold hides neither.
     ``version`` is the CLI version when open (it goes on the latch row).
@@ -722,7 +809,7 @@ class CodexBackend(Backend):
         model_mapping: Mapping[str, str] | None = None,
         models: Sequence[str] = (),
         timeout: float = 600.0,
-        max_concurrency: int = 2,
+        max_concurrency: int = 1,
         name: str = "codex",
         data_controls: DataControls | None = None,
     ) -> None:
@@ -734,6 +821,10 @@ class CodexBackend(Backend):
         self.cli_overrides = list(cli_overrides)
         self.model_mapping = dict(model_mapping or {})
         self.models = list(models)
+        if max_concurrency != 1:
+            # msg-687 A (msg-675 (a)): one CLI login, one token refresh at a
+            # time, and ``slot_hold`` assumes a single slot.
+            raise ValueError(f"codex backend '{name}': max_concurrency must be 1, not {max_concurrency}")
         self.timeout = timeout
         self.name = name
         #: A-15-2b. ``None`` is not "no check": it reads as never verified,
@@ -750,6 +841,12 @@ class CodexBackend(Backend):
         # quota failure. A restart forgets it, which costs one codex attempt
         # that fails with quota again and re-sets it.
         self._quota_hold_until: datetime | None = None
+        # msg-687 B: set when a request gave up waiting for the slot while
+        # another run held it; cleared by that run when it gives the slot
+        # back (``_execute``'s ``finally``). (monotonic time it was set, the
+        # bound after which ``codex_availability`` ignores it.) Read by
+        # ``codex_availability`` alone, so both wrapper modes see it alike.
+        self._slot_hold: tuple[float, float] | None = None
 
     # ---- configuration identity -------------------------------------
 
@@ -981,6 +1078,13 @@ class CodexBackend(Backend):
            a quota stop.
         2. An active quota hold -> ``quota_hold``; ``codex --version`` is not
            started.
+        2b. An active slot hold -> ``slot_hold`` (msg-687 B): a request gave
+           up waiting while another run holds the only slot, and that run
+           has not given it back yet. Kept apart from ``quota_hold`` so the
+           shadow report and the notices tell a busy slot from an exhausted
+           window. A slot hold older than ``codex_timeout_s + slot_wait_s``
+           cannot be legitimate (the holder is cut off by then and its
+           ``finally`` clears it): it is ignored with a WARNING each time.
         3. ``_check_version()`` -- ``verification_stale`` on a version
            change, ``launch_failed`` when the CLI cannot be run.
 
@@ -1003,6 +1107,15 @@ class CodexBackend(Backend):
                 f"codex held after a usage-window failure until {hold.isoformat()}", hold
             )
             return CodexAvailability("quota_hold", error, quota_hold_until=hold)
+        slot = self._slot_hold
+        if slot is not None:
+            set_at, bound = slot
+            age = time.monotonic() - set_at
+            if age <= bound:
+                return CodexAvailability(
+                    "slot_hold", CodexSlotTimeout("codex is busy: another run holds the only slot")
+                )
+            logger.warning("codex_slot_hold_stale_ignored", backend=self.name, age_s=round(age, 1), bound_s=bound)
         try:
             version = await self._check_version(record)
         except CodexNotVerifiedError as exc:
@@ -1032,8 +1145,16 @@ class CodexBackend(Backend):
         extra_overrides: Sequence[str] = (),
         timeout: float | None = None,
         progress: ExecProgress | None = None,
+        slot_wait_s: float | None = None,
     ) -> tuple[CodexRun, EventFindings]:
         """Start ``codex exec`` and collect its output. NO side effects.
+
+        (Other than the in-memory slot hold, msg-687 B: with ``slot_wait_s``
+        set, a request that waits longer than that for the slot raises
+        ``CodexSlotTimeout`` before anything is spawned, and sets
+        ``_slot_hold`` if the slot is still taken; the run holding the slot
+        clears it when it gives the slot back. ``None`` waits as long as it
+        takes, as before.)
 
         Launch, timeout and collection only; writes neither the state DB nor
         the latch (msg-319). Called by ``_run_gated`` and ``_run_unverified``.
@@ -1051,7 +1172,8 @@ class CodexBackend(Backend):
         argv = self._wrap(self._build_exec_argv(model, last_message_path, extra_overrides), workdir)
         limit = timeout if timeout is not None else self.timeout
         try:
-            async with self._semaphore:
+            await self._acquire_slot(slot_wait_s, limit)
+            try:
                 if progress is not None:
                     progress.spawned = True
                 try:
@@ -1075,6 +1197,11 @@ class CodexBackend(Backend):
                     if isinstance(exc, asyncio.TimeoutError):
                         raise CodexTimeout(f"codex exec timed out after {limit}s") from exc
                     raise
+            finally:
+                self._semaphore.release()
+                # This run held the only slot: whoever gave up waiting for it
+                # may run again now (msg-683: no idle codex while Gemini pays).
+                self._slot_hold = None
             stdout = stdout_b.decode("utf-8", errors="replace")
             last_message: str | None = None
             path = Path(last_message_path)
@@ -1091,6 +1218,22 @@ class CodexBackend(Backend):
             return run, classify_events(events)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _acquire_slot(self, slot_wait_s: float | None, run_limit: float) -> None:
+        """Take the slot, waiting at most ``slot_wait_s`` (msg-687 B)."""
+        if slot_wait_s is None:
+            await self._semaphore.acquire()
+            return
+        try:
+            async with asyncio.timeout(slot_wait_s):
+                await self._semaphore.acquire()
+        except TimeoutError as exc:
+            # Only while the slot is really taken: a hold set after its
+            # holder has already let go would have nobody to clear it.
+            if self._semaphore.locked():
+                self._slot_hold = (time.monotonic(), run_limit + slot_wait_s)
+                logger.warning("codex_slot_hold", backend=self.name, slot_wait_s=slot_wait_s)
+            raise CodexSlotTimeout(f"no codex slot free within {slot_wait_s}s") from exc
 
     async def _run_unverified(
         self,
@@ -1127,8 +1270,14 @@ class CodexBackend(Backend):
         return await self._execute(prompt, self.resolve_model(None), overrides, timeout)
 
     async def _run_gated(
-        self, prompt: str, model: str, availability: CodexAvailability | None = None
-    ) -> tuple[str, int, int]:
+        self,
+        prompt: str,
+        model: str,
+        availability: CodexAvailability | None = None,
+        *,
+        timeout: float | None = None,
+        slot_wait_s: float | None = None,
+    ) -> tuple[str, CodexUsage]:
         """The production path: gate -> ``_execute`` -> D-1c/D-1d latch -> classify.
 
         The one place that writes a runtime violation (a test greps for it).
@@ -1153,6 +1302,11 @@ class CodexBackend(Backend):
         already evaluated it for this request (the PR-2 fallback decision)
         passes the result in, so ``codex --version`` runs at most once per
         request. A quota failure sets the hold ``codex_availability`` reads.
+
+        ``timeout`` / ``slot_wait_s`` (msg-687 B/C): the fallback wrapper's
+        ``codex_timeout_s`` / ``slot_wait_s``; ``None`` keeps the backend's
+        own timeout and an unbounded wait for the slot. A slot timeout is a
+        failure before the spawn: the run is finished, never latched.
         """
         availability = availability if availability is not None else await self.codex_availability()
         if availability.error is not None:
@@ -1172,7 +1326,9 @@ class CodexBackend(Backend):
             latch: list[str] | None
             pending: BaseException | None
             try:
-                run, findings = await self._execute(prompt, model, progress=progress)
+                run, findings = await self._execute(
+                    prompt, model, timeout=timeout, progress=progress, slot_wait_s=slot_wait_s
+                )
             except CodexTimeout as exc:
                 latch, pending = ["aborted:timeout"], exc
             except asyncio.CancelledError as exc:
@@ -1233,8 +1389,7 @@ class CodexBackend(Backend):
             text = run.last_message if run.last_message is not None else last_agent_message(run.events)
             if text is None:
                 raise CodexFailed("codex exec exited 0 without a final message")
-            prompt_tokens, completion_tokens = usage_from_events(run.events)
-            return text, prompt_tokens, completion_tokens
+            return text, usage_from_events(run.events)
         finally:
             self._in_flight.discard(run_seq)
 
@@ -1268,7 +1423,19 @@ class CodexBackend(Backend):
 
     # ---- Backend interface -------------------------------------------
 
-    def _response(self, content: str, model: str, prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
+    def _response(self, content: str, model: str, usage: CodexUsage) -> dict[str, Any]:
+        """OpenAI-shaped completion. ``usage`` carries the Lexora-own
+        ``lexora_thinking_tokens`` and ``prompt_tokens_details.cached_tokens``
+        exactly as the gemini backend does, so the ledger reads both
+        (msg-687 H-2); either is ``None`` (NULL) when the CLI did not report
+        it. ``total_tokens`` is input + output with thinking included."""
+        usage_block: dict[str, Any] = {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.prompt_tokens + usage.completion_tokens + (usage.thinking_tokens or 0),
+            "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens},
+            "lexora_thinking_tokens": usage.thinking_tokens,
+        }
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
@@ -1277,28 +1444,35 @@ class CodexBackend(Backend):
             "choices": [
                 {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
             ],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
+            "usage": usage_block,
         }
 
     async def chat_completions(
-        self, request: dict[str, Any], availability: CodexAvailability | None = None
+        self,
+        request: dict[str, Any],
+        availability: CodexAvailability | None = None,
+        *,
+        timeout: float | None = None,
+        slot_wait_s: float | None = None,
     ) -> dict[str, Any]:
         """``availability``: this request's ``codex_availability()`` result,
-        when the caller (the fallback wrapper) already evaluated it."""
+        when the caller (the fallback wrapper) already evaluated it.
+        ``timeout`` / ``slot_wait_s``: see ``_run_gated``."""
         prompt = request_to_prompt(request)
         requested = request.get("model")
-        text, p, c = await self._run_gated(prompt, self.resolve_model(requested), availability)
-        return self._response(text, requested or self.resolve_model(None), p, c)
+        text, usage = await self._run_gated(
+            prompt, self.resolve_model(requested), availability, timeout=timeout, slot_wait_s=slot_wait_s
+        )
+        return self._response(text, requested or self.resolve_model(None), usage)
 
     async def chat_completions_stream(
         self,
         request: dict[str, Any],
         usage_sink: UsageSink | None = None,
         availability: CodexAvailability | None = None,
+        *,
+        timeout: float | None = None,
+        slot_wait_s: float | None = None,
     ) -> AsyncIterator[bytes]:
         """Run to completion, then emit the answer as one SSE burst.
 
@@ -1308,9 +1482,13 @@ class CodexBackend(Backend):
         """
         prompt = request_to_prompt(request)
         requested = request.get("model")
-        text, p, c = await self._run_gated(prompt, self.resolve_model(requested), availability)
+        text, usage = await self._run_gated(
+            prompt, self.resolve_model(requested), availability, timeout=timeout, slot_wait_s=slot_wait_s
+        )
         if usage_sink is not None:
-            usage_sink.prompt_tokens, usage_sink.completion_tokens = p, c
+            usage_sink.prompt_tokens, usage_sink.completion_tokens = usage.prompt_tokens, usage.completion_tokens
+            usage_sink.thinking_tokens = usage.thinking_tokens
+            usage_sink.cached_input_tokens = usage.cached_input_tokens
         model = requested or self.resolve_model(None)
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())

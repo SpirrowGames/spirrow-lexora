@@ -284,7 +284,14 @@ class CodexSettings(BaseModel):
         ),
     )
     max_concurrency: int = Field(
-        default=2, ge=1, description="Concurrent ``codex exec`` processes."
+        default=1,
+        ge=1,
+        le=1,
+        description=(
+            "Concurrent ``codex exec`` processes. Fixed at 1 (T-naysayer-codex-"
+            "backend msg-687 A): one CLI login must not be refreshed by two "
+            "runs at once, and ``slot_hold`` assumes a single slot."
+        ),
     )
 
     @model_validator(mode="after")
@@ -378,6 +385,48 @@ class FallbackSettings(BaseModel):
     primary: str = Field(description="Name of the codex backend tried first.")
     fallback: str = Field(description="Name of the gemini backend used when codex cannot answer.")
     mode: Literal["fallback", "shadow"] = Field(default="fallback")
+    # Time budget of one request (msg-687 C, from msg-677 objection 2).
+    caller_budget_s: float = Field(
+        default=930.0,
+        gt=0,
+        description=(
+            "How long the caller waits for one answer (mindwire's client waits "
+            "930s). Each request's deadline is its arrival at the wrapper plus this."
+        ),
+    )
+    slot_wait_s: float = Field(
+        default=30.0, gt=0, description="Longest wait for the codex slot before falling back."
+    )
+    codex_timeout_s: float = Field(
+        default=300.0, gt=0, description="Longest a codex run may take when called through this wrapper."
+    )
+    fallback_floor_s: float = Field(
+        default=600.0,
+        gt=0,
+        description="Time Gemini is guaranteed to get after codex has used its whole share.",
+    )
+
+    @model_validator(mode="after")
+    def _budget_holds(self) -> "FallbackSettings":
+        """``slot_wait_s + codex_timeout_s + fallback_floor_s <= caller_budget_s``
+        (msg-687 C): otherwise a request that waits for the slot and then
+        times out in codex leaves Gemini less than its floor. Refused at
+        load time, so Lexora does not start with such a budget."""
+        check_fallback_budget(self.caller_budget_s, self.slot_wait_s, self.codex_timeout_s, self.fallback_floor_s)
+        return self
+
+
+def check_fallback_budget(
+    caller_budget_s: float, slot_wait_s: float, codex_timeout_s: float, fallback_floor_s: float
+) -> None:
+    """Raise ``ValueError`` unless the msg-687 C inequality holds."""
+    used = slot_wait_s + codex_timeout_s + fallback_floor_s
+    if used > caller_budget_s:
+        raise ValueError(
+            f"fallback budget does not hold: slot_wait_s ({slot_wait_s}) + codex_timeout_s "
+            f"({codex_timeout_s}) + fallback_floor_s ({fallback_floor_s}) = {used} > "
+            f"caller_budget_s ({caller_budget_s})"
+        )
 
 
 class BackendSettings(BaseModel):

@@ -44,8 +44,15 @@ class TestNaysayerRouteInvariance:
     """The naysayer tier resolution must survive the frontier tier addition."""
 
     def test_shipped_config_naysayer_backend_is_gemini(self) -> None:
+        """Since T-naysayer-codex-backend msg-687 E the naysayer tier goes
+        through the fallback wrapper in shadow mode, whose answering side is
+        still the `gemini` backend; `naysayer-gemini` is the direct route."""
         settings = create_settings(REPO_CONFIG)
-        assert settings.routing.tiers["naysayer"].backend == "gemini"
+        assert settings.routing.tiers["naysayer"].backend == "naysayer-codex"
+        wrapper = settings.routing.backends["naysayer-codex"].fallback
+        assert wrapper is not None
+        assert (wrapper.mode, wrapper.fallback) == ("shadow", "gemini")
+        assert settings.routing.tiers["naysayer-gemini"].backend == "gemini"
 
     def test_shipped_config_naysayer_model_is_gemini_31_pro(self) -> None:
         settings = create_settings(REPO_CONFIG)
@@ -60,8 +67,10 @@ class TestNaysayerRouteInvariance:
             vllm_settings=settings.vllm,
         )
         try:
-            assert router.get_backend_name_for_model("naysayer") == "gemini"
+            assert router.get_backend_name_for_model("naysayer") == "naysayer-codex"
             assert router.resolve_model("naysayer") == "gemini-3.1-pro-preview"
+            assert router.get_backend_name_for_model("naysayer-gemini") == "gemini"
+            assert router.resolve_model("naysayer-gemini") == "gemini-3.1-pro-preview"
         finally:
             # Backends spin up httpx.AsyncClient / subprocess handles.
             import asyncio
@@ -74,7 +83,7 @@ class TestNaysayerRouteInvariance:
         """LEXORA_FRONTIER_MODEL must not perturb naysayer."""
         monkeypatch.setenv("LEXORA_FRONTIER_MODEL", "claude-opus-5-20260601")
         settings = create_settings(REPO_CONFIG)
-        assert settings.routing.tiers["naysayer"].backend == "gemini"
+        assert settings.routing.tiers["naysayer"].backend == "naysayer-codex"
         assert settings.routing.tiers["naysayer"].model == "gemini-3.1-pro-preview"
 
 

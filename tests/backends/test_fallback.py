@@ -132,6 +132,8 @@ def _make(
         mode=mode,
         webhook_url=webhook,
         clock=clock or Clock(),
+        # msg-687 C: the wrapper's codex limit is what cuts codex off.
+        codex_timeout_s=timeout,
     )
     w.tier_label = "naysayer"
     if ledger:
@@ -197,7 +199,8 @@ class TestFallbackDecision:
         assert _text(resp) == GEMINI_TEXT  # a latched run's text is never returned
         assert w.fallback.calls[0]["model"] == GEMINI_MODEL  # type: ignore[attr-defined]
         route = current_answer_route()
-        assert route is not None and (route.backend, route.answered_by) == ("gemini", "gemini-fallback")
+        # msg-687 D: the constant name, not the configured `gemini`.
+        assert route is not None and (route.backend, route.answered_by) == ("gemini-fallback", "gemini-fallback")
         assert w._last_reason == reason
 
     async def test_timeout_falls_back(self, tmp_path: Path, wrappers: list) -> None:
@@ -232,7 +235,7 @@ class TestFallbackDecision:
             backend, answered_by = conn.execute(
                 "SELECT backend, answered_by FROM request_costs ORDER BY id DESC LIMIT 1"
             ).fetchone()
-        assert (backend, answered_by) == ("gemini", "gemini-fallback")
+        assert (backend, answered_by) == ("gemini-fallback", "gemini-fallback")
         await _sends(w)
         assert len(posted) == 1
         assert posted[0].startswith("[Lexora naysayer] fallback STARTED: reason=auth ")
@@ -328,7 +331,8 @@ class TestNoSwitchAfterTheFirstByte:
 
 class TestNotifications:
     async def test_start_once_then_end_once(self, tmp_path: Path, wrappers: list) -> None:
-        w = _make(wrappers, tmp_path, "quota")
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
         posted = _capture_posts(w)
         for _ in range(3):
             await w.chat_completions(REQUEST)
@@ -340,6 +344,11 @@ class TestNotifications:
         await w.chat_completions(REQUEST)
         await w.chat_completions(REQUEST)
         await _sends(w)
+        # msg-685: a codex answer does not end the period by itself...
+        assert [p.split(":")[0] for p in posted] == ["[Lexora naysayer] fallback STARTED"]
+        # ...the tick does, once the last fallback is 15 minutes old.
+        clock.now += timedelta(minutes=15)
+        await w.notice_tick()
         assert [p.split(":")[0] for p in posted] == [
             "[Lexora naysayer] fallback STARTED",
             "[Lexora naysayer] fallback ENDED",
@@ -425,7 +434,7 @@ class TestLedger:
         await w.chat_completions(REQUEST)
         w.ledger.record(model=GEMINI_MODEL, endpoint="/v1/chat/completions", tokens_input=1000, tokens_output=100, backend="naysayer-fb")
         row = self._rows(tmp_path / "costs.db")[-1]
-        assert (row["backend"], row["answered_by"], row["model"]) == ("gemini", "gemini-fallback", GEMINI_MODEL)
+        assert (row["backend"], row["answered_by"], row["model"]) == ("gemini-fallback", "gemini-fallback", GEMINI_MODEL)
         assert row["cost_usd"] > 0 and row["pricing_known"] == 1
         assert w.ledger.fallback_totals(w._fallback_since) == (1, row["cost_usd"])
 

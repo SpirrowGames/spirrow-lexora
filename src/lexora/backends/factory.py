@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend
 from lexora.backends.claude_code import ClaudeCodeBackend
-from lexora.backends.codex import CodexBackend
+from lexora.backends.codex import CODEX_MODEL_PIN, CodexBackend
 from lexora.backends.codex_data_controls import DataControls
 from lexora.backends.codex_verification import CodexStateStore
 from lexora.backends.fallback import WEBHOOK_ENV, FallbackBackend
@@ -180,6 +180,16 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
         codex = settings.codex
         if codex is None:  # config validator guarantees this; keep mypy honest
             raise ValueError(f"codex backend '{name}' has no 'codex:' section")
+        names = settings.get_model_names()
+        served = settings.model_mapping.get(names[0], names[0]) if names else ""
+        if served != CODEX_MODEL_PIN.model:
+            # msg-687 G: the limits in CODEX_MODEL_PIN were read for one
+            # model; serving another would make them silently wrong.
+            raise ValueError(
+                f"codex backend '{name}': configured model {served!r} is not the pinned "
+                f"model {CODEX_MODEL_PIN.model!r} (CODEX_MODEL_PIN in backends/codex.py); "
+                f"re-read the catalog and update the pin together with the config"
+            )
         logger.info(
             "creating_codex_backend",
             name=name,
@@ -209,7 +219,11 @@ def create_backend(name: str, settings: BackendSettings) -> Backend:
 
 
 def create_fallback_backend(
-    name: str, settings: BackendSettings, backends: Mapping[str, Backend]
+    name: str,
+    settings: BackendSettings,
+    backends: Mapping[str, Backend],
+    *,
+    fallback_timeout_s: float | None = None,
 ) -> FallbackBackend:
     """Build a ``type: fallback`` backend over two already-built backends.
 
@@ -217,6 +231,8 @@ def create_fallback_backend(
     that ``primary`` names a codex backend and ``fallback`` a gemini one; the
     isinstance check keeps that honest at runtime. The webhook URL is read
     from ``LEXORA_FALLBACK_WEBHOOK_URL`` here and nowhere else (B-3).
+    ``fallback_timeout_s``: the Gemini backend's own configured timeout
+    (msg-687 C); the router passes it, ``None`` means unknown.
     """
     section = settings.fallback
     if section is None:  # config validator guarantees this
@@ -238,4 +254,9 @@ def create_fallback_backend(
         fallback_name=section.fallback,
         mode=section.mode,
         webhook_url=os.environ.get(WEBHOOK_ENV) or None,
+        caller_budget_s=section.caller_budget_s,
+        slot_wait_s=section.slot_wait_s,
+        codex_timeout_s=section.codex_timeout_s,
+        fallback_floor_s=section.fallback_floor_s,
+        fallback_timeout_s=fallback_timeout_s,
     )
