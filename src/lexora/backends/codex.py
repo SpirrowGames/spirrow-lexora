@@ -1442,7 +1442,22 @@ class CodexBackend(Backend):
         ``lexora_thinking_tokens`` and ``prompt_tokens_details.cached_tokens``
         exactly as the gemini backend does, so the ledger reads both
         (msg-687 H-2); either is ``None`` (NULL) when the CLI did not report
-        it. ``total_tokens`` is input + output with thinking included."""
+        it. ``total_tokens`` is input + output with thinking included.
+
+        ``completion_tokens`` EXCLUDES thinking on purpose, the same
+        deliberate deviation from OpenAI arithmetic the gemini backend
+        already ships (``gemini.py``, T-ledger-gemini-thinking-tokens D-3 /
+        msg-455 (a)). Every ledger site records ``tokens_output =
+        usage["completion_tokens"]`` and ``tokens_thinking`` from
+        ``lexora_thinking_tokens`` (``routes._ledger_token_extras``), so
+        folding thinking in here would bill it in both columns. Thus
+        ``total_tokens == prompt + completion + lexora_thinking_tokens``, not
+        ``prompt + completion``. The naysayer tier sits on both backends, so
+        codex must keep gemini's shape; changing it is a cross-backend ledger
+        change, not a codex fix (answer to the PR-gate on lexora#78).
+        Thinking is also NOT sent as ``completion_tokens_details
+        .reasoning_tokens``, which OpenAI defines as a part of
+        ``completion_tokens``."""
         usage_block: dict[str, Any] = {
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,

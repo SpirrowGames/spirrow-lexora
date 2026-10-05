@@ -42,9 +42,10 @@ GEMINI_TEXT = "Looks fine.\n\nVERDICT: APPROVE"
 class FakeGemini(Backend):
     fills_usage_sink = True
 
-    def __init__(self, text: str = GEMINI_TEXT, delay: float = 0.0) -> None:
+    def __init__(self, text: str = GEMINI_TEXT, delay: float = 0.0, error: Exception | None = None) -> None:
         self.text = text
         self.delay = delay
+        self.error = error
         self.calls: list[dict[str, Any]] = []
 
     def _response(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -60,6 +61,8 @@ class FakeGemini(Backend):
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(request)
         await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
         return self._response(request)
 
     async def chat_completions_stream(
@@ -71,6 +74,8 @@ class FakeGemini(Backend):
             usage_sink.prompt_tokens, usage_sink.completion_tokens = 100, 10
         for delta in ({"role": "assistant", "content": ""}, {"content": self.text}):
             yield f"data: {json.dumps({'choices': [{'index': 0, 'delta': delta}]})}\n\n".encode()
+            if self.error is not None:  # fail mid-stream, after the first chunk
+                raise self.error
         yield b"data: [DONE]\n\n"
 
     async def completions(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -444,6 +449,167 @@ class TestNotifications:
         await w.notice_tick()
         assert w._pending_notice is not None and "fallback ENDED" in w._pending_notice
 
+    async def test_stale_failed_ended_does_not_park_over_a_newer_started(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate lexora#78 (fallback.py:578, ABA): ENDED is in flight with
+        nothing parked; STARTED begins, is delivered (parked stays None), and
+        only then the ENDED post fails. The stale ENDED must not park."""
+        w = _make(wrappers, tmp_path, "quota")
+        ended_gate = asyncio.Event()
+        results: dict[str, bool] = {}
+
+        async def post(text: str) -> bool:
+            if "ENDED" in text:
+                await ended_gate.wait()
+                results["ENDED"] = False
+                return False
+            results["STARTED"] = True
+            return True
+
+        w._post = post  # type: ignore[method-assign]
+        assert w._pending_notice is None
+        ended = asyncio.create_task(w._deliver_state(w._notice_text("ENDED")))
+        await asyncio.sleep(0)  # ENDED is now awaiting its post
+        assert await w._deliver_state(w._notice_text("STARTED")) is True
+        assert w._pending_notice is None
+        ended_gate.set()
+        assert await ended is False
+        assert results == {"STARTED": True, "ENDED": False}
+        assert w._pending_notice is None  # was "ENDED" before the fix
+        later = _capture_posts(w)
+        await w.notice_tick()
+        assert not any("ENDED" in p for p in later)
+
+    async def test_newest_failed_state_still_parks_when_an_older_one_lands_later(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """The counter keeps newest-wins: STARTED (newer) fails first, then
+        the older ENDED post succeeds -- STARTED stays parked."""
+        w = _make(wrappers, tmp_path, "quota")
+        ended_gate = asyncio.Event()
+
+        async def post(text: str) -> bool:
+            if "ENDED" in text:
+                await ended_gate.wait()
+                return True
+            return False
+
+        w._post = post  # type: ignore[method-assign]
+        ended = asyncio.create_task(w._deliver_state(w._notice_text("ENDED")))
+        await asyncio.sleep(0)
+        assert await w._deliver_state(w._notice_text("STARTED")) is False
+        ended_gate.set()
+        assert await ended is True
+        assert w._pending_notice is not None and "fallback STARTED" in w._pending_notice
+
+    async def test_tick_delivery_covers_a_same_state_post_that_failed_meanwhile(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate advisory on lexora#79 (msg-724): the tick retries a parked
+        STARTED; while it is in flight a post of the same STARTED begins and
+        fails. The tick's delivery covers it -- nothing stays parked."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        started = w._notice_text("STARTED")
+        w._pending_notice = started
+        tick_gate = asyncio.Event()
+        calls = 0
+
+        async def post(text: str) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # the tick's retry: lands after the other fails
+                await tick_gate.wait()
+                return True
+            return False
+
+        w._post = post  # type: ignore[method-assign]
+        tick = asyncio.create_task(w.notice_tick())
+        await asyncio.sleep(0)  # the tick is awaiting its retry
+        assert await w._deliver_state(started) is False
+        assert w._pending_notice == started  # parked for now: nothing delivered yet
+        tick_gate.set()
+        await tick
+        assert w._pending_notice is None  # stayed parked before the fix
+        later = _capture_posts(w)
+        await w.notice_tick()
+        assert later == []
+
+    async def test_same_state_post_failing_after_its_delivery_does_not_park(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """The other order: the tick delivers STARTED first, then the
+        concurrent post of the same STARTED fails -- it must not park."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        started = w._notice_text("STARTED")
+        w._pending_notice = started
+        fail_gate = asyncio.Event()
+        calls = 0
+
+        async def post(text: str) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # the concurrent post: fails after the tick lands
+                await fail_gate.wait()
+                return False
+            return True
+
+        w._post = post  # type: ignore[method-assign]
+        failing = asyncio.create_task(w._deliver_state(started))
+        await asyncio.sleep(0)
+        await w.notice_tick()  # delivers the parked STARTED
+        fail_gate.set()
+        assert await failing is False
+        assert w._pending_notice is None
+
+    async def test_a_different_period_still_parks_after_a_delivery(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """The key is (event, period): a failed STARTED of a new period is not
+        covered by the delivered STARTED of an earlier one."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        _capture_posts(w)
+        assert await w._deliver_state(w._notice_text("STARTED")) is True
+        w._fallback_since = clock.now + timedelta(hours=1)
+        _capture_posts(w, ok=False)
+        newer = w._notice_text("STARTED")
+        assert await w._deliver_state(newer) is False
+        assert w._pending_notice == newer
+
+    async def test_tick_retry_overtaken_by_a_newer_delivery_keeps_the_newer_key(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate advisory on lexora#81: the tick retries a parked STARTED;
+        while it is in flight ENDED is delivered. The tick landing later must
+        not move ``_delivered_key`` back to STARTED."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        started = w._notice_text("STARTED")
+        ended = w._notice_text("ENDED")
+        w._pending_notice = started
+        tick_gate = asyncio.Event()
+
+        async def post(text: str) -> bool:
+            if "STARTED" in text:
+                await tick_gate.wait()
+            return True
+
+        w._post = post  # type: ignore[method-assign]
+        tick = asyncio.create_task(w.notice_tick())
+        await asyncio.sleep(0)  # the tick is awaiting its retry
+        assert await w._deliver_state(ended) is True
+        tick_gate.set()
+        await tick
+        assert w._delivered_key == ("ENDED", clock.now.isoformat())
+        assert w._pending_notice is None
+
     async def test_delivered_reminder_clears_a_parked_started(self, tmp_path: Path, wrappers: list) -> None:
         clock = Clock()
         w = _make(wrappers, tmp_path, "quota", clock=clock)
@@ -607,6 +773,80 @@ class TestShadow:
         await _shadow_idle(w)
         [row] = w.ledger.shadow_comparisons()
         assert (row["codex_verdict"], row["codex_reason"]) == ("error", "timeout")
+
+    async def test_cancelled_chat_cancels_its_shadow_and_frees_the_slot(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate lexora#78 (fallback.py:721): the caller disconnects while
+        Gemini is answering; the shadow codex run must not keep the single
+        slot until codex_timeout_s."""
+        w = _make(wrappers, tmp_path, "sleep", mode="shadow", gemini=FakeGemini(delay=5.0), timeout=30.0)
+        req = asyncio.create_task(w.chat_completions(REQUEST))
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if w.primary.inflight_runs() == 1:
+                break
+        assert w.primary.inflight_runs() == 1
+        shadow = w._shadow_task
+        req.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await req
+        assert shadow is not None
+        with pytest.raises(asyncio.CancelledError):
+            await shadow
+        assert w.primary.inflight_runs() == 0
+        assert not w.primary._semaphore.locked()
+        assert w.ledger.shadow_comparisons() == []  # no pair to compare
+
+    async def test_closed_stream_cancels_its_shadow(self, tmp_path: Path, wrappers: list) -> None:
+        """The consumer stops reading (aclose at a yield): same as a cancel."""
+        w = _make(wrappers, tmp_path, "sleep", mode="shadow", timeout=30.0)
+        agen = w.chat_completions_stream(REQUEST, UsageSink())
+        await agen.__anext__()
+        shadow = w._shadow_task
+        await agen.aclose()
+        assert shadow is not None
+        with pytest.raises(asyncio.CancelledError):
+            await shadow
+        assert not w.primary._semaphore.locked()
+
+    async def test_failed_gemini_stream_keeps_its_shadow_and_records_codex(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate lexora#79 (fallback.py:713) considered: a Gemini error is
+        not a caller going away. The shadow run is kept because its result is
+        not discarded -- it lands in a row with gemini_verdict="error" and
+        codex's own verdict (the chat path is pinned by
+        test_gemini_failure_is_recorded_as_error)."""
+        w = _make(wrappers, tmp_path, mode="shadow", gemini=FakeGemini(error=RuntimeError("gemini reset")))
+        agen = w.chat_completions_stream(REQUEST, UsageSink())
+        await agen.__anext__()
+        shadow = w._shadow_task
+        with pytest.raises(RuntimeError, match="gemini reset"):
+            await agen.__anext__()
+        assert shadow is not None
+        await shadow
+        assert not shadow.cancelled()
+        [row] = w.ledger.shadow_comparisons()
+        assert (row["gemini_verdict"], row["codex_verdict"], row["codex_reason"]) == ("error", "unparsed", None)
+        assert not w.primary._semaphore.locked()
+
+    async def test_a_skipped_request_does_not_cancel_the_running_shadow(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """Only the request that started a shadow run may cancel it."""
+        w = _make(wrappers, tmp_path, "sleep", mode="shadow", gemini=FakeGemini(delay=0.5), timeout=2.0)
+        await w.chat_completions(REQUEST)  # starts the shadow, returns
+        shadow = w._shadow_task
+        second = asyncio.create_task(w.chat_completions(REQUEST))  # skipped
+        await asyncio.sleep(0.05)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        assert w.shadow_skipped == 1
+        assert shadow is not None and not shadow.cancelled()
+        await _shadow_idle(w)
+        assert not shadow.cancelled()
 
     async def test_no_shadow_run_during_a_hold_but_a_not_run_row(self, tmp_path: Path, wrappers: list) -> None:
         """B-5 no run during a hold; B-5' (msg-498) still one `not_run` row."""
