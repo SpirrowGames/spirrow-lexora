@@ -249,6 +249,19 @@ def _sse_text(chunks: list[bytes]) -> str:
     return "".join(parts)
 
 
+_STATE_KEY_RE = re.compile(r"fallback (STARTED|ENDED): .*?\bfallback_since=(\S+)")
+
+
+def _state_key(text: str) -> tuple[str, str] | None:
+    """(event, fallback_since) of a STARTED / ENDED notice text, else None.
+
+    Both texts carry the period's ``fallback_since`` (ENDED builds its text
+    before the period is cleared), so the key names one state change of one
+    period; CONTINUING / EXPIRING texts have no key."""
+    match = _STATE_KEY_RE.search(text)
+    return (match.group(1), match.group(2)) if match else None
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -324,6 +337,12 @@ class FallbackBackend(Backend):
         #: started meanwhile. Identity checks on the parked value were ABA-prone
         #: (PR-gate on lexora#78: None -> None let a stale ENDED park).
         self._notice_seq = 0
+        #: (event, fallback_since) of the last state notice actually delivered,
+        #: in completion order. A notice with the same key adds nothing for the
+        #: reader, so it is never left parked (PR-gate advisory on lexora#79,
+        #: msg-724: a tick retry delivered a parked STARTED while a concurrent
+        #: post of the same STARTED failed, and the counter alone kept it parked).
+        self._delivered_key: tuple[str, str] | None = None
         # msg-685: the two inputs of ENDED. Codex answers set the flag only.
         self._last_fallback_at: datetime | None = None
         self._answered_since_fallback = False
@@ -587,9 +606,29 @@ class FallbackBackend(Backend):
         self._notice_seq += 1
         seq = self._notice_seq
         delivered = await self._post(text)
+        if delivered:
+            self._mark_delivered(text)
         if self._notice_seq == seq:
-            self._pending_notice = None if delivered else text
+            if delivered or _state_key(text) == self._delivered_key:
+                # Delivered, or the same state of the same period already
+                # reached the reader by another post (a tick retry).
+                self._pending_notice = None
+            else:
+                self._pending_notice = text
         return delivered
+
+    def _mark_delivered(self, text: str) -> None:
+        """Record a delivered state notice; drop a parked one it duplicates.
+
+        Runs regardless of ``_notice_seq``: a parked notice whose key equals
+        the one just delivered (same event, same period) is redundant however
+        it got parked, while a parked notice of a different key is kept."""
+        key = _state_key(text)
+        if key is None:
+            return
+        self._delivered_key = key
+        if self._pending_notice is not None and _state_key(self._pending_notice) == key:
+            self._pending_notice = None
 
     async def _post(self, text: str) -> bool:
         if not self.webhook_url:
@@ -624,6 +663,9 @@ class FallbackBackend(Backend):
             if await self._post(text):
                 if self._notice_seq == seq and self._pending_notice == text:
                     self._pending_notice = None
+                # A newer post of the same state may have failed and parked
+                # meanwhile; this delivery covers it (msg-724 advisory).
+                self._mark_delivered(text)
         now = self._clock()
         if self._recovered(now):
             await self._end_fallback()

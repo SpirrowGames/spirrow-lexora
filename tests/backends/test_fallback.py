@@ -503,6 +503,85 @@ class TestNotifications:
         assert await ended is True
         assert w._pending_notice is not None and "fallback STARTED" in w._pending_notice
 
+    async def test_tick_delivery_covers_a_same_state_post_that_failed_meanwhile(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate advisory on lexora#79 (msg-724): the tick retries a parked
+        STARTED; while it is in flight a post of the same STARTED begins and
+        fails. The tick's delivery covers it -- nothing stays parked."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        started = w._notice_text("STARTED")
+        w._pending_notice = started
+        tick_gate = asyncio.Event()
+        calls = 0
+
+        async def post(text: str) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # the tick's retry: lands after the other fails
+                await tick_gate.wait()
+                return True
+            return False
+
+        w._post = post  # type: ignore[method-assign]
+        tick = asyncio.create_task(w.notice_tick())
+        await asyncio.sleep(0)  # the tick is awaiting its retry
+        assert await w._deliver_state(started) is False
+        assert w._pending_notice == started  # parked for now: nothing delivered yet
+        tick_gate.set()
+        await tick
+        assert w._pending_notice is None  # stayed parked before the fix
+        later = _capture_posts(w)
+        await w.notice_tick()
+        assert later == []
+
+    async def test_same_state_post_failing_after_its_delivery_does_not_park(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """The other order: the tick delivers STARTED first, then the
+        concurrent post of the same STARTED fails -- it must not park."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        started = w._notice_text("STARTED")
+        w._pending_notice = started
+        fail_gate = asyncio.Event()
+        calls = 0
+
+        async def post(text: str) -> bool:
+            nonlocal calls
+            calls += 1
+            if calls == 1:  # the concurrent post: fails after the tick lands
+                await fail_gate.wait()
+                return False
+            return True
+
+        w._post = post  # type: ignore[method-assign]
+        failing = asyncio.create_task(w._deliver_state(started))
+        await asyncio.sleep(0)
+        await w.notice_tick()  # delivers the parked STARTED
+        fail_gate.set()
+        assert await failing is False
+        assert w._pending_notice is None
+
+    async def test_a_different_period_still_parks_after_a_delivery(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """The key is (event, period): a failed STARTED of a new period is not
+        covered by the delivered STARTED of an earlier one."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        _capture_posts(w)
+        assert await w._deliver_state(w._notice_text("STARTED")) is True
+        w._fallback_since = clock.now + timedelta(hours=1)
+        _capture_posts(w, ok=False)
+        newer = w._notice_text("STARTED")
+        assert await w._deliver_state(newer) is False
+        assert w._pending_notice == newer
+
     async def test_delivered_reminder_clears_a_parked_started(self, tmp_path: Path, wrappers: list) -> None:
         clock = Clock()
         w = _make(wrappers, tmp_path, "quota", clock=clock)
