@@ -343,6 +343,11 @@ class FallbackBackend(Backend):
         #: msg-724: a tick retry delivered a parked STARTED while a concurrent
         #: post of the same STARTED failed, and the counter alone kept it parked).
         self._delivered_key: tuple[str, str] | None = None
+        #: Bumped on every recorded delivery, so a tick retry can tell whether
+        #: another notice was delivered while its own post was in flight and
+        #: must not move ``_delivered_key`` back to its older key (PR-gate
+        #: advisory on lexora#81).
+        self._delivered_gen = 0
         # msg-685: the two inputs of ENDED. Codex answers set the flag only.
         self._last_fallback_at: datetime | None = None
         self._answered_since_fallback = False
@@ -617,16 +622,20 @@ class FallbackBackend(Backend):
                 self._pending_notice = text
         return delivered
 
-    def _mark_delivered(self, text: str) -> None:
+    def _mark_delivered(self, text: str, *, record: bool = True) -> None:
         """Record a delivered state notice; drop a parked one it duplicates.
 
         Runs regardless of ``_notice_seq``: a parked notice whose key equals
         the one just delivered (same event, same period) is redundant however
-        it got parked, while a parked notice of a different key is kept."""
+        it got parked, while a parked notice of a different key is kept.
+        ``record=False`` (a tick retry that another delivery overtook) still
+        drops the duplicate but leaves ``_delivered_key`` at the newer key."""
         key = _state_key(text)
         if key is None:
             return
-        self._delivered_key = key
+        if record:
+            self._delivered_key = key
+            self._delivered_gen += 1
         if self._pending_notice is not None and _state_key(self._pending_notice) == key:
             self._pending_notice = None
 
@@ -660,12 +669,15 @@ class FallbackBackend(Backend):
         if self._pending_notice is not None:
             text = self._pending_notice
             seq = self._notice_seq
+            gen = self._delivered_gen
             if await self._post(text):
                 if self._notice_seq == seq and self._pending_notice == text:
                     self._pending_notice = None
                 # A newer post of the same state may have failed and parked
-                # meanwhile; this delivery covers it (msg-724 advisory).
-                self._mark_delivered(text)
+                # meanwhile; this delivery covers it (msg-724 advisory). If
+                # another notice was delivered meanwhile, it is the newer one:
+                # keep its key (lexora#81 advisory).
+                self._mark_delivered(text, record=self._delivered_gen == gen)
         now = self._clock()
         if self._recovered(now):
             await self._end_fallback()
