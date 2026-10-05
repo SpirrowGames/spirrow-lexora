@@ -20,6 +20,21 @@ backends, and a ``mode``:
   skipped and counted in ``shadow_skipped``. A comparison row -- verdicts and
   timings, never text -- goes to ``shadow_comparisons`` in the cost DB.
 
+**Time budget (msg-687 C).** Each request's deadline is its arrival at
+the wrapper plus ``caller_budget_s`` (930s, what mindwire's client waits).
+Codex waits at most ``slot_wait_s`` for its single slot and runs at most
+``codex_timeout_s``; the fallback call is cut at ``min(Gemini's own
+timeout, deadline - now)`` and then raises ``FallbackDeadlineExceeded``
+(a plain ``BackendError``: never retried). ``slot_wait_s + codex_timeout_s
++ fallback_floor_s <= caller_budget_s`` is checked at start-up, so Gemini
+always keeps at least ``fallback_floor_s``. Shadow mode's Gemini answer is
+not cut: it is today's naysayer call and must stay as it is (msg-687 E).
+
+**Ledger row of a fallback answer (msg-687 D).** ``backend`` and
+``answered_by`` are both the constant ``gemini-fallback``, whatever the
+``fallback`` setting names: that setting only chooses which backend is
+called.
+
 ``CodexAuthError`` falls back too (msg-498 B-1'): an expired or revoked
 device login is a known, recoverable state, and the "started" notice carries
 ``reason=auth`` so the operator learns a re-login is needed. Errors that do
@@ -34,10 +49,26 @@ Lexora -- not a chatroom thread, not mindwire's notifier, not the daily
 digest (msg-267 scope 4). If the variable is unset, one WARNING is logged at
 construction and nothing is sent; a failed post is logged at WARNING and
 retried on the next 10-minute cycle; neither ever blocks a request. Sent
-once when fallback starts, every 6 hours while it lasts, once when codex
-answers again. Body: fixed format, at most 500 characters, carrying only
-the event, the reason, ``fallback_since``, the Gemini calls and their cost
-in that period (counted from the ledger), and ``quota_hold_until``.
+once when fallback starts (STARTED), every 6 hours while it lasts
+(CONTINUING), and once when codex is back (ENDED). Body: fixed format, at
+most 500 characters, carrying only the event, the reason,
+``fallback_since``, the Gemini calls and their cost in that period
+(counted from the ledger), and ``quota_hold_until``.
+
+ENDED (msg-685 / msg-687 F) is sent by ``notice_tick``, not by the codex
+answer, when all three hold: a fallback period is open, codex has answered
+at least once since the last fallback (``_answered_since_fallback``), and
+the last fallback (``_last_fallback_at``) is at least 15 minutes old. A
+codex answer only sets the flag and never moves the time, so a steady run
+of codex answers cannot postpone ENDED; a fallback inside the 15 minutes
+clears the flag and the period simply goes on (no new STARTED); a period
+with no requests at all never ends by itself (codex has not answered).
+
+**Shadow mode sends no state notice (msg-679 / msg-687 F).** In shadow
+mode Gemini always answers, so a codex failure there is not a routing
+change: ``_falling_back`` and ``_codex_answered`` return at once and
+touch no state. The codex latches (``quota_hold``, ``slot_hold``) live
+in ``CodexBackend`` and apply to both modes alike (msg-681).
 
 **Data controls (A-15-2b, msg-535).** Codex closes with
 ``reason=data_controls_unverified`` when the human check of the ChatGPT
@@ -50,10 +81,13 @@ expiry, the notice loop posts one EXPIRING notice per UTC calendar day
 state is the UTC date of the last EXPIRING notice sent; a failed post
 leaves the date unset, so the next 10-minute tick retries. The notice loop
 runs from start-up (``start``), not only during a fallback, so the warning
-goes out even while codex is answering everything. Re-verifying (updating
+goes out even while codex is answering everything, and in shadow mode too:
+it is a real warning, not a state change. Its body names ``mode=<mode>``,
+so in shadow mode it is not read as "production routing will switch". Re-verifying (updating
 the file) needs no restart: the next request re-reads it.
 
-State (``fallback_since``, the last notification time, ``shadow_skipped``,
+State (``fallback_since``, ``_last_fallback_at``,
+``_answered_since_fallback``, the last notification time, ``shadow_skipped``,
 the date of the last EXPIRING notice) is in memory. That is system-wide
 because B-7 guarantees one process (``services/process_lock.py``). A
 restart during fallback re-sends "start"; accepted in msg-448 B-3. A
@@ -80,7 +114,7 @@ from lexora.backends.answer_route import (
     AnswerRoute,
     set_answer_route,
 )
-from lexora.backends.base import Backend, UsageSink
+from lexora.backends.base import Backend, BackendError, UsageSink
 from lexora.backends.codex import (
     CodexAuthError,
     CodexAvailability,
@@ -89,6 +123,7 @@ from lexora.backends.codex import (
     CodexLaunchError,
     CodexNotVerifiedError,
     CodexQuotaError,
+    CodexSlotTimeout,
     CodexTimeout,
     CodexToolUseViolation,
     CodexUnverifiableRun,
@@ -97,6 +132,7 @@ from lexora.backends.codex_data_controls import (
     REASON_DATA_CONTROLS_UNVERIFIED,
     RUNBOOK_POINTER,
 )
+from lexora.config import check_fallback_budget
 from lexora.services.trace import current_trace_id
 from lexora.utils.logging import get_logger
 
@@ -110,6 +146,11 @@ WEBHOOK_ENV = "LEXORA_FALLBACK_WEBHOOK_URL"
 NOTICE_MAX_CHARS = 500
 CHECK_INTERVAL_S = 600.0
 REMIND_AFTER = timedelta(hours=6)
+#: ENDED waits until the last fallback is this old (msg-685).
+RECOVER_AFTER = timedelta(minutes=15)
+#: The ledger's ``backend`` for a fallback answer, whatever the ``fallback``
+#: setting names (msg-687 D); equals ``answered_by``.
+BACKEND_GEMINI_FALLBACK = ANSWERED_BY_GEMINI_FALLBACK
 #: ``shadow_comparisons.codex_verdict`` when the gate was closed and codex
 #: did not run (B-5'); ``codex_reason`` then holds the gate's reason.
 SHADOW_NOT_RUN = "not_run"
@@ -122,8 +163,15 @@ FALLBACK_ERRORS: tuple[type[CodexError], ...] = (
     CodexAuthError,
     CodexLaunchError,
     CodexTimeout,
+    CodexSlotTimeout,
     CodexToolUseViolation,
 )
+
+
+class FallbackDeadlineExceeded(BackendError):
+    """The fallback answer did not finish by the request's deadline
+    (msg-687 C). A plain ``BackendError``: the retry handler never retries
+    it, since a retry would run past the caller's budget anyway."""
 
 
 def fallback_reason(exc: CodexError) -> str:
@@ -138,6 +186,8 @@ def fallback_reason(exc: CodexError) -> str:
         return "launch_failed"
     if isinstance(exc, CodexTimeout):
         return "timeout"
+    if isinstance(exc, CodexSlotTimeout):
+        return "slot_wait_timeout"
     if isinstance(exc, CodexUnverifiableRun):
         return "unverifiable_run"
     if isinstance(exc, CodexToolUseViolation):
@@ -223,10 +273,21 @@ class FallbackBackend(Backend):
         webhook_url: str | None = None,
         check_interval_s: float = CHECK_INTERVAL_S,
         remind_after: timedelta = REMIND_AFTER,
+        recover_after: timedelta = RECOVER_AFTER,
         clock: Callable[[], datetime] = _utcnow,
+        caller_budget_s: float = 930.0,
+        slot_wait_s: float = 30.0,
+        codex_timeout_s: float = 300.0,
+        fallback_floor_s: float = 600.0,
+        fallback_timeout_s: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if mode not in ("fallback", "shadow"):
             raise ValueError(f"fallback backend '{name}': mode must be 'fallback' or 'shadow', not {mode!r}")
+        try:
+            check_fallback_budget(caller_budget_s, slot_wait_s, codex_timeout_s, fallback_floor_s)
+        except ValueError as exc:
+            raise ValueError(f"fallback backend '{name}': {exc}") from exc
         self.name = name
         self.primary = primary
         self.fallback = fallback
@@ -235,7 +296,17 @@ class FallbackBackend(Backend):
         self.webhook_url = webhook_url
         self.check_interval_s = check_interval_s
         self.remind_after = remind_after
+        self.recover_after = recover_after
         self._clock = clock
+        # msg-687 C.
+        self.caller_budget_s = caller_budget_s
+        self.slot_wait_s = slot_wait_s
+        self.codex_timeout_s = codex_timeout_s
+        self.fallback_floor_s = fallback_floor_s
+        #: Gemini's own configured timeout (the router passes it); ``None``
+        #: when unknown, and then only the deadline bounds the call.
+        self.fallback_timeout_s = fallback_timeout_s
+        self._monotonic = monotonic
         #: Attached by ``main.lifespan`` (``attach_ledger``); None in tests
         #: that do not need counts, and then counts read as unknown.
         self.ledger: CostTracker | None = None
@@ -247,6 +318,9 @@ class FallbackBackend(Backend):
         self._last_hold: datetime | None = None
         self._last_notice_at: datetime | None = None
         self._pending_notice: str | None = None
+        # msg-685: the two inputs of ENDED. Codex answers set the flag only.
+        self._last_fallback_at: datetime | None = None
+        self._answered_since_fallback = False
         self._loop_task: asyncio.Task[None] | None = None
         self._send_tasks: set[asyncio.Task[None]] = set()
         # A-15-2b pre-expiry warning: UTC date of the last EXPIRING notice
@@ -285,7 +359,62 @@ class FallbackBackend(Backend):
         set_answer_route(AnswerRoute(self.primary.name, answered_by, self._codex_model()))
 
     def _route_gemini(self, answered_by: str | None) -> None:
-        set_answer_route(AnswerRoute(self.fallback_name, answered_by))
+        # msg-687 D: a fallback answer is recorded under the constant name;
+        # the Gemini answer of shadow mode keeps the Gemini backend's name,
+        # exactly as a direct naysayer -> gemini row does today (msg-687 E).
+        backend = BACKEND_GEMINI_FALLBACK if answered_by == ANSWERED_BY_GEMINI_FALLBACK else self.fallback_name
+        set_answer_route(AnswerRoute(backend, answered_by))
+
+    def _deadline(self) -> float:
+        """This request's deadline on the monotonic clock (msg-687 C)."""
+        return self._monotonic() + self.caller_budget_s
+
+    def fallback_budget(self, deadline: float) -> float:
+        """Seconds the fallback call may take: ``min(Gemini's timeout,
+        deadline - now)``, never below 0 (msg-687 C)."""
+        left = deadline - self._monotonic()
+        if self.fallback_timeout_s is not None:
+            left = min(self.fallback_timeout_s, left)
+        return max(left, 0.0)
+
+    def _deadline_error(self, budget: float) -> FallbackDeadlineExceeded:
+        logger.warning("naysayer_fallback_deadline", backend=self.name, budget_s=round(budget, 1))
+        return FallbackDeadlineExceeded(
+            f"fallback answer did not finish within the request budget ({budget:.0f}s left of "
+            f"caller_budget_s={self.caller_budget_s:.0f})"
+        )
+
+    async def _bounded_fallback_chat(self, request: dict[str, Any], deadline: float) -> dict[str, Any]:
+        budget = self.fallback_budget(deadline)
+        try:
+            async with asyncio.timeout(budget):
+                return await self.fallback.chat_completions(request)
+        except TimeoutError as exc:
+            raise self._deadline_error(budget) from exc
+
+    async def _bounded_fallback_stream(
+        self, request: dict[str, Any], usage_sink: UsageSink | None, deadline: float
+    ) -> AsyncIterator[bytes]:
+        """The Gemini stream, cut when the budget runs out. The timeout
+        covers each ``__anext__`` only, never a ``yield``, so it cannot fire
+        while the caller is busy with a chunk."""
+        budget = self.fallback_budget(deadline)
+        ends = self._monotonic() + budget
+        stream = self.fallback.chat_completions_stream(request, usage_sink)
+        try:
+            while True:
+                try:
+                    async with asyncio.timeout(max(ends - self._monotonic(), 0.0)):
+                        chunk = await stream.__anext__()
+                except StopAsyncIteration:
+                    return
+                except TimeoutError as exc:
+                    raise self._deadline_error(budget) from exc
+                yield chunk
+        finally:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     # ---- fallback mode (B-1) ------------------------------------------------
 
@@ -293,12 +422,18 @@ class FallbackBackend(Backend):
         self._ensure_loop()
         if self.mode == "shadow":
             return await self._shadow_chat(request)
+        deadline = self._deadline()
         availability = await self.primary.codex_availability()
         self._last_hold = availability.quota_hold_until
         reason = availability.reason
         if availability.open:
             try:
-                response = await self.primary.chat_completions(self._codex_request(request), availability)
+                response = await self.primary.chat_completions(
+                    self._codex_request(request),
+                    availability,
+                    timeout=self.codex_timeout_s,
+                    slot_wait_s=self.slot_wait_s,
+                )
             except FALLBACK_ERRORS as exc:
                 reason = fallback_reason(exc)
                 self._note_quota(exc)
@@ -308,7 +443,7 @@ class FallbackBackend(Backend):
                 return response
         self._falling_back(reason)
         self._route_gemini(ANSWERED_BY_GEMINI_FALLBACK)
-        return await self.fallback.chat_completions(request)
+        return await self._bounded_fallback_chat(request, deadline)
 
     async def chat_completions_stream(
         self, request: dict[str, Any], usage_sink: UsageSink | None = None
@@ -318,12 +453,17 @@ class FallbackBackend(Backend):
             async for chunk in self._shadow_stream(request, usage_sink):
                 yield chunk
             return
+        deadline = self._deadline()
         availability = await self.primary.codex_availability()
         self._last_hold = availability.quota_hold_until
         reason = availability.reason
         if availability.open:
             codex_stream = self.primary.chat_completions_stream(
-                self._codex_request(request), usage_sink, availability
+                self._codex_request(request),
+                usage_sink,
+                availability,
+                timeout=self.codex_timeout_s,
+                slot_wait_s=self.slot_wait_s,
             )
             try:
                 # codex finishes its run before the first chunk: every
@@ -342,7 +482,7 @@ class FallbackBackend(Backend):
                 return
         self._falling_back(reason)
         self._route_gemini(ANSWERED_BY_GEMINI_FALLBACK)
-        async for chunk in self.fallback.chat_completions_stream(request, usage_sink):
+        async for chunk in self._bounded_fallback_stream(request, usage_sink, deadline):
             yield chunk
 
     def _note_quota(self, exc: CodexError) -> None:
@@ -352,9 +492,15 @@ class FallbackBackend(Backend):
     # ---- notifications (B-3) --------------------------------------------------
 
     def _falling_back(self, reason: str | None) -> None:
+        """A request is about to be answered by Gemini as a fallback.
+        Shadow mode: nothing (msg-679 / msg-687 F)."""
+        if self.mode == "shadow":
+            return
+        now = self._clock()
         self._last_reason = reason
+        self._last_fallback_at = now
+        self._answered_since_fallback = False
         if self._fallback_since is None:
-            now = self._clock()
             self._fallback_since = now
             self._last_notice_at = now
             logger.warning("naysayer_fallback_started", backend=self.name, reason=reason)
@@ -362,13 +508,31 @@ class FallbackBackend(Backend):
         self._ensure_loop()
 
     def _codex_answered(self) -> None:
-        if self._fallback_since is None:
+        """Codex answered. Only marks the period as recoverable; ENDED is
+        ``notice_tick``'s (msg-685). Shadow mode: nothing (msg-679)."""
+        if self.mode == "shadow" or self._fallback_since is None:
             return
+        self._answered_since_fallback = True
+
+    def _recovered(self, now: datetime) -> bool:
+        """The three ENDED conditions of msg-685 / msg-687 F."""
+        return (
+            self._fallback_since is not None
+            and self._answered_since_fallback
+            and self._last_fallback_at is not None
+            and now - self._last_fallback_at >= self.recover_after
+        )
+
+    async def _end_fallback(self) -> None:
+        assert self._fallback_since is not None
         text = self._notice_text("ENDED")
         logger.info("naysayer_fallback_ended", backend=self.name, since=self._fallback_since.isoformat())
         self._fallback_since = None
         self._last_notice_at = None
-        self._notify(text)
+        self._last_fallback_at = None
+        self._answered_since_fallback = False
+        if self.webhook_url:
+            await self._deliver_state(text)
 
     def _totals(self) -> tuple[int, float] | None:
         if self.ledger is None or self._fallback_since is None:
@@ -402,9 +566,22 @@ class FallbackBackend(Backend):
         task.add_done_callback(self._send_tasks.discard)
 
     async def _deliver_or_park(self, text: str) -> None:
-        if not await self._post(text):
-            self._pending_notice = text
+        if not await self._deliver_state(text):
             self._ensure_loop()
+
+    async def _deliver_state(self, text: str) -> bool:
+        """Post a state notice (STARTED / ENDED); the newest state wins.
+
+        A parked notice is an older state, so it is obsolete once this one
+        is delivered: success clears it, failure replaces it (PR-gate on
+        lexora#76: a parked STARTED must not follow a delivered ENDED).
+        Either write happens only if nothing newer was parked while the
+        post was in flight."""
+        parked = self._pending_notice
+        delivered = await self._post(text)
+        if self._pending_notice is parked:
+            self._pending_notice = None if delivered else text
+        return delivered
 
     async def _post(self, text: str) -> bool:
         if not self.webhook_url:
@@ -430,23 +607,31 @@ class FallbackBackend(Backend):
             await self.notice_tick()
 
     async def notice_tick(self) -> None:
-        """One 10-minute check: retry a parked notice, remind if due, then
-        the daily data-controls EXPIRING notice if due."""
+        """One 10-minute check: retry a parked notice, end the fallback
+        period if codex is back (msg-685), else remind if due, then the
+        daily data-controls EXPIRING notice if due."""
         if self._pending_notice is not None:
             text = self._pending_notice
             if await self._post(text):
                 if self._pending_notice == text:
                     self._pending_notice = None
-        if self._fallback_since is not None and self._last_notice_at is not None:
-            now = self._clock()
+        now = self._clock()
+        if self._recovered(now):
+            await self._end_fallback()
+        elif self._fallback_since is not None and self._last_notice_at is not None:
             if now - self._last_notice_at >= self.remind_after:
+                parked = self._pending_notice
                 if not self.webhook_url or await self._post(self._notice_text("CONTINUING")):
                     self._last_notice_at = now
+                    # CONTINUING restates the open period: a parked notice
+                    # (its STARTED) would only arrive after it, out of order.
+                    if self.webhook_url and self._pending_notice is parked:
+                        self._pending_notice = None
         await self._expiry_tick()
 
     def _expiry_text(self, days_left: int, expires_at: datetime, verified_at: datetime) -> str:
         text = (
-            f"[Lexora naysayer] data controls EXPIRING: codex stops in {days_left} day(s) "
+            f"[Lexora naysayer] data controls EXPIRING (mode={self.mode}): codex stops in {days_left} day(s) "
             f"at expires_at={expires_at.isoformat()} (verified_at={verified_at.isoformat()}); "
             f"then reason={REASON_DATA_CONTROLS_UNVERIFIED} and Gemini answers. "
             f"Re-verify per runbook={RUNBOOK_POINTER}; no restart needed."
@@ -552,18 +737,28 @@ class FallbackBackend(Backend):
         codex_text: str | None = None
         codex_reason: str | None = None
         try:
-            response = await self.primary.chat_completions(request, availability)
+            # Same codex limits as fallback mode, so the shadow period
+            # measures what production would do (msg-680/681).
+            response = await self.primary.chat_completions(
+                request, availability, timeout=self.codex_timeout_s, slot_wait_s=self.slot_wait_s
+            )
         except CodexError as exc:
             codex_reason = fallback_reason(exc)
         else:
             codex_text = _response_text(response)
             usage = response.get("usage") or {}
+            details = usage.get("prompt_tokens_details")
+            cached = details.get("cached_tokens") if isinstance(details, dict) else None
+            thinking = usage.get("lexora_thinking_tokens")
             if self.ledger is not None:
                 self.ledger.record(
                     model=self._codex_model(),
                     endpoint="shadow",
                     tokens_input=int(usage.get("prompt_tokens", 0)),
                     tokens_output=int(usage.get("completion_tokens", 0)),
+                    # msg-687 H-2: NULL when the CLI did not report them.
+                    tokens_thinking=None if thinking is None else int(thinking),
+                    tokens_cached_input=None if cached is None else int(cached),
                     tier=self.tier_label,
                     # Set by the handler before it called this wrapper; the
                     # task copied that context when `_start_shadow` made it.
@@ -613,7 +808,8 @@ class FallbackBackend(Backend):
         ``fallback`` before any request has fallen back (B-4's preflight
         reads this). ``fallback_since`` / the counts describe the period
         the notifications describe: from the first fallback answer to the
-        next codex answer.
+        ENDED notice (msg-685: codex answered, and no fallback for 15
+        minutes).
         """
         if self.mode == "shadow":
             mode = "shadow"

@@ -44,6 +44,7 @@ from lexora.backends.codex import (
     request_to_prompt,
     run_verdict,
     usage_from_events,
+    CodexUsage,
 )
 from lexora.backends.codex import CodexRun
 from lexora.backends.codex_data_controls import DataControls
@@ -190,7 +191,7 @@ class TestGate:
             setattr(other, attr, value)
             assert other.config_hash() != h, attr
         # Fields that do not reach the command line do not close the gate.
-        other = CodexBackend(codex_home="/srv/codex", state_store=base.state_store, models=["m"], timeout=1, max_concurrency=9)
+        other = CodexBackend(codex_home="/srv/codex", state_store=base.state_store, models=["m"], timeout=1, max_concurrency=1)
         assert other.config_hash() == h
 
     async def test_verified_request_is_served(self, tmp_path: Path) -> None:
@@ -200,7 +201,15 @@ class TestGate:
         text = response["choices"][0]["message"]["content"]
         assert text.startswith("REVIEW: [system]")
         assert response["model"] == "gpt-5-codex"
-        assert response["usage"] == {"prompt_tokens": 120, "completion_tokens": 7, "total_tokens": 127}
+        # msg-687 H-2: cached input is reported; this event has no
+        # reasoning_output_tokens, so thinking stays None (NULL), not 0.
+        assert response["usage"] == {
+            "prompt_tokens": 120,
+            "completion_tokens": 7,
+            "total_tokens": 127,
+            "prompt_tokens_details": {"cached_tokens": 20},
+            "lexora_thinking_tokens": None,
+        }
 
     async def test_stream_emits_only_after_completion_and_fills_sink(self, tmp_path: Path) -> None:
         backend = make_backend(tmp_path, "ok")
@@ -508,7 +517,7 @@ class TestClassification:
             {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 1}},
             {"type": "turn.completed", "usage": {"input_tokens": 9, "output_tokens": 2}},
         ]
-        assert usage_from_events(events) == (9, 2)
+        assert usage_from_events(events) == CodexUsage(prompt_tokens=9, completion_tokens=2)
 
 
 # --------------------------------------------------------------------------
@@ -841,8 +850,8 @@ class TestConfig:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
         settings = BackendSettings(
             type="codex",
-            models=["gpt-5-codex"],
-            codex={"codex_home": str(tmp_path / "home"), "state_db_path": str(tmp_path / "codex.db"), "max_concurrency": 2},
+            models=["gpt-6.1-sol"],
+            codex={"codex_home": str(tmp_path / "home"), "state_db_path": str(tmp_path / "codex.db"), "max_concurrency": 1},
         )
         backend = create_backend("codex_naysayer", settings)
         assert isinstance(backend, CodexBackend)
