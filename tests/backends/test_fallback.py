@@ -388,6 +388,79 @@ class TestNotifications:
         assert retried and "fallback STARTED" in retried[0]
         assert w._pending_notice is None
 
+    async def test_delivered_ended_clears_a_parked_started(self, tmp_path: Path, wrappers: list) -> None:
+        """PR-gate lexora#76 (fallback.py:165): STARTED parked, its retry
+        fails, then ENDED is delivered -- the stale STARTED must not follow."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        _capture_posts(w, ok=False)
+        await w.chat_completions(REQUEST)
+        await _sends(w)
+        assert w._pending_notice is not None and "fallback STARTED" in w._pending_notice
+        w.primary._quota_hold_until = None
+        w.primary._scenario = "ok"  # type: ignore[attr-defined]
+        await w.chat_completions(REQUEST)
+        clock.now += timedelta(minutes=15)
+        posted: list[str] = []
+
+        async def post(text: str) -> bool:  # the webhook recovers between the two posts
+            posted.append(text)
+            return "ENDED" in text
+
+        w._post = post  # type: ignore[method-assign]
+        await w.notice_tick()
+        assert [p.split(":")[0] for p in posted] == [
+            "[Lexora naysayer] fallback STARTED",
+            "[Lexora naysayer] fallback ENDED",
+        ]
+        assert w._fallback_since is None and w._pending_notice is None
+        later = _capture_posts(w)
+        clock.now += timedelta(minutes=10)
+        await w.notice_tick()
+        assert later == []
+
+    async def test_delivered_started_clears_a_parked_ended(self, tmp_path: Path, wrappers: list) -> None:
+        """The mirror case: an ENDED left parked must not arrive inside the
+        next period once that period's STARTED was delivered."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._pending_notice = w._notice_text("ENDED")
+        posted = _capture_posts(w)
+        await w.chat_completions(REQUEST)
+        await _sends(w)
+        assert [p.split(":")[0] for p in posted] == ["[Lexora naysayer] fallback STARTED"]
+        assert w._pending_notice is None
+
+    async def test_failed_ended_replaces_a_parked_started(self, tmp_path: Path, wrappers: list) -> None:
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        _capture_posts(w, ok=False)
+        await w.chat_completions(REQUEST)
+        await _sends(w)
+        w.primary._quota_hold_until = None
+        w.primary._scenario = "ok"  # type: ignore[attr-defined]
+        await w.chat_completions(REQUEST)
+        clock.now += timedelta(minutes=15)
+        await w.notice_tick()
+        assert w._pending_notice is not None and "fallback ENDED" in w._pending_notice
+
+    async def test_delivered_reminder_clears_a_parked_started(self, tmp_path: Path, wrappers: list) -> None:
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        _capture_posts(w, ok=False)
+        await w.chat_completions(REQUEST)
+        await _sends(w)
+        clock.now += timedelta(hours=6)
+        posted: list[str] = []
+
+        async def post(text: str) -> bool:
+            posted.append(text)
+            return "CONTINUING" in text
+
+        w._post = post  # type: ignore[method-assign]
+        await w.notice_tick()
+        assert "fallback CONTINUING" in posted[-1] and w._pending_notice is None
+
     async def test_no_webhook_sends_nothing(self, tmp_path: Path, wrappers: list) -> None:
         w = _make(wrappers, tmp_path, "quota", webhook=None)
         posted = _capture_posts(w)

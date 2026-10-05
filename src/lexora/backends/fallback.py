@@ -531,8 +531,8 @@ class FallbackBackend(Backend):
         self._last_notice_at = None
         self._last_fallback_at = None
         self._answered_since_fallback = False
-        if self.webhook_url and not await self._post(text):
-            self._pending_notice = text
+        if self.webhook_url:
+            await self._deliver_state(text)
 
     def _totals(self) -> tuple[int, float] | None:
         if self.ledger is None or self._fallback_since is None:
@@ -566,9 +566,22 @@ class FallbackBackend(Backend):
         task.add_done_callback(self._send_tasks.discard)
 
     async def _deliver_or_park(self, text: str) -> None:
-        if not await self._post(text):
-            self._pending_notice = text
+        if not await self._deliver_state(text):
             self._ensure_loop()
+
+    async def _deliver_state(self, text: str) -> bool:
+        """Post a state notice (STARTED / ENDED); the newest state wins.
+
+        A parked notice is an older state, so it is obsolete once this one
+        is delivered: success clears it, failure replaces it (PR-gate on
+        lexora#76: a parked STARTED must not follow a delivered ENDED).
+        Either write happens only if nothing newer was parked while the
+        post was in flight."""
+        parked = self._pending_notice
+        delivered = await self._post(text)
+        if self._pending_notice is parked:
+            self._pending_notice = None if delivered else text
+        return delivered
 
     async def _post(self, text: str) -> bool:
         if not self.webhook_url:
@@ -607,8 +620,13 @@ class FallbackBackend(Backend):
             await self._end_fallback()
         elif self._fallback_since is not None and self._last_notice_at is not None:
             if now - self._last_notice_at >= self.remind_after:
+                parked = self._pending_notice
                 if not self.webhook_url or await self._post(self._notice_text("CONTINUING")):
                     self._last_notice_at = now
+                    # CONTINUING restates the open period: a parked notice
+                    # (its STARTED) would only arrive after it, out of order.
+                    if self.webhook_url and self._pending_notice is parked:
+                        self._pending_notice = None
         await self._expiry_tick()
 
     def _expiry_text(self, days_left: int, expires_at: datetime, verified_at: datetime) -> str:
