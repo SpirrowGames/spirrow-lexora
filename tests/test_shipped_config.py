@@ -204,8 +204,10 @@ async def test_shipped_listing_is_the_tiers_plus_the_declared_concrete_names() -
     ids = [m["id"] for m in listing["data"]]
     assert ids == [
         "gemini-3.1-pro-preview",
-        # codex: on no tier, but declared, so routable by name; the
-        # verify gate refuses every request until it is opened.
+        # codex: on no tier directly (the naysayer tier reaches it through
+        # the shadow wrapper `naysayer-codex`, which declares no model), but
+        # declared, so routable by name; the verify gate refuses every
+        # request until it is opened.
         "gpt-6.1-sol",
         "claude-code-opus",
         "claude-code-sonnet",
@@ -215,6 +217,7 @@ async def test_shipped_listing_is_the_tiers_plus_the_declared_concrete_names() -
         "medium",
         "heavy",
         "naysayer",
+        "naysayer-gemini",
         "frontier",
     ], f"Advertised ids changed. Got: {ids}"
     assert "Qwen3.8-27B" not in ids

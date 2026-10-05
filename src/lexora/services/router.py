@@ -90,7 +90,17 @@ class BackendRouter:
             )
             for name, settings in ordered:
                 if settings.type == "fallback":
-                    self._backends[name] = create_fallback_backend(name, settings, self._backends)
+                    # Gemini's own timeout bounds the fallback call too
+                    # (msg-687 C: min(gemini timeout, deadline - now)).
+                    target = settings.fallback.fallback if settings.fallback else None
+                    fallback_timeout_s = (
+                        routing_settings.backends[target].timeout
+                        if target in routing_settings.backends
+                        else None
+                    )
+                    self._backends[name] = create_fallback_backend(
+                        name, settings, self._backends, fallback_timeout_s=fallback_timeout_s
+                    )
                 else:
                     self._backends[name] = create_backend(name, settings)
                 self._health_checked[name] = settings.health_check

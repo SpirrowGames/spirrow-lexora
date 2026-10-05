@@ -314,7 +314,7 @@ class TestClearViolationCli:
             "  backends:\n"
             "    codex:\n"
             "      type: codex\n"
-            "      models: [gpt-5-codex]\n"
+            "      models: [gpt-6.1-sol]\n"
             "      codex:\n"
             f"        codex_home: {(tmp_path / 'home').as_posix()}\n"
             f"        state_db_path: {(tmp_path / 'codex.db').as_posix()}\n",

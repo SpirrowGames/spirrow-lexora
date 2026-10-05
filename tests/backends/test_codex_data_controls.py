@@ -217,6 +217,7 @@ class TestGate:
             "codex",
             BackendSettings(
                 type="codex",
+                models=["gpt-6.1-sol"],
                 codex={
                     "codex_home": str(tmp_path / "home"),
                     "state_db_path": str(tmp_path / "codex.db"),
@@ -248,9 +249,10 @@ class TestFallbackNotices:
     async def test_unverified_falls_back_with_reason_and_runbook_then_ends(
         self, tmp_path: Path, wrappers: list
     ) -> None:
-        w = _make(wrappers, tmp_path)
-        posted = _capture_posts(w)
         now = datetime.now(timezone.utc)
+        clock = _clock(now)
+        w = _make(wrappers, tmp_path, clock=clock)
+        posted = _capture_posts(w)
         dc, path = _dc(tmp_path, _clock(now), verified_at=now - DATA_CONTROLS_TTL - timedelta(days=1))
         w.primary.data_controls = dc
         await w.chat_completions(REQUEST)
@@ -259,11 +261,15 @@ class TestFallbackNotices:
         assert posted[0].startswith(f"[Lexora naysayer] fallback STARTED: reason={REASON_DATA_CONTROLS_UNVERIFIED} ")
         assert f"runbook={RUNBOOK_POINTER}" in posted[0]
         assert len(posted[0]) <= NOTICE_MAX_CHARS
-        # Re-verified: the next request is codex's, and fallback ENDED goes out.
+        # Re-verified: the next request is codex's; fallback ENDED goes out
+        # from the tick once the last fallback is 15 minutes old (msg-685).
         _write(path, now)
         await w.chat_completions(REQUEST)
         await _sends(w)
         assert len(w.fallback.calls) == 1  # type: ignore[attr-defined]
+        assert not posted[-1].startswith("[Lexora naysayer] fallback ENDED")
+        clock.now = clock.now + timedelta(minutes=15)
+        await w.notice_tick()
         assert posted[-1].startswith("[Lexora naysayer] fallback ENDED")
 
     async def test_other_reasons_carry_no_runbook_pointer(self, tmp_path: Path, wrappers: list) -> None:
@@ -293,7 +299,7 @@ class TestExpiringNotice:
         w, posted, clock = self._setup(tmp_path, wrappers, start)
         await w.notice_tick()
         assert len(posted) == 1
-        assert posted[0].startswith("[Lexora naysayer] data controls EXPIRING: codex stops in 7 day(s) ")
+        assert posted[0].startswith("[Lexora naysayer] data controls EXPIRING (mode=fallback): codex stops in 7 day(s) ")
         assert f"runbook={RUNBOOK_POINTER}" in posted[0]
         assert len(posted[0]) <= NOTICE_MAX_CHARS
         clock.now = start + timedelta(hours=12)  # same UTC day (03:00 -> 15:00)

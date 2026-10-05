@@ -110,6 +110,11 @@ UNPREFIXED_ENV: dict[str, str] = {
     "ERROR_PASSTHROUGH": "true",
     "CODEX": "{}",
     "FALLBACK": "envfallback",
+    # FallbackSettings (msg-687 C)
+    "CALLER_BUDGET_S": "2000",
+    "SLOT_WAIT_S": "1",
+    "CODEX_TIMEOUT_S": "2",
+    "FALLBACK_FLOOR_S": "3",
     # ModelInfo
     "NAME": "envname",
     "CAPABILITIES": '["envcap"]',

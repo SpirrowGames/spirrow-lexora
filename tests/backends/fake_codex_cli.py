@@ -220,6 +220,28 @@ def main() -> int:
         if last_message:
             Path(last_message).write_text(text)
         return 0
+    if scenario in ("slow_ok", "ok_reasoning"):
+        # msg-687 B: "slow_ok" holds the only slot for a while (CODEX_HOME/
+        # slow_s, default 1.5s). msg-687 H-2: "ok_reasoning" reports the
+        # 0.160.0 usage shape with reasoning_output_tokens.
+        if scenario == "slow_ok":
+            slow = Path(os.environ["CODEX_HOME"]) / "slow_s"
+            time.sleep(float(slow.read_text()) if slow.exists() else 1.5)
+        text = "REVIEW: " + prompt[:40]
+        emit({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": text}})
+        usage = {"input_tokens": 120, "cached_input_tokens": 20, "output_tokens": 7}
+        if scenario == "ok_reasoning":
+            usage = {
+                "input_tokens": 1000,
+                "cached_input_tokens": 400,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 300,
+                "reasoning_output_tokens": 250,
+            }
+        emit({"type": "turn.completed", "usage": usage})
+        if last_message:
+            Path(last_message).write_text(text)
+        return 0
     if scenario == "no_usage":
         text = "REVIEW: " + prompt[:40]
         emit({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": text}})

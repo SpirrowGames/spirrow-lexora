@@ -105,7 +105,8 @@ class TestLedgerThroughTheRoutes:
         response = _client(_wrapper(tmp_path, verified=False), ledger).post(path, json={**body, "stream": stream})
         assert response.status_code == 200, response.text
         [(backend, answered_by, model, cost, known, tier)] = _rows(tmp_path / "costs.db")
-        assert (backend, answered_by, model, known, tier) == ("gemini", "gemini-fallback", GEMINI_MODEL, 1, "naysayer")
+        # msg-687 D: backend is the constant `gemini-fallback`, not the configured name.
+        assert (backend, answered_by, model, known, tier) == ("gemini-fallback", "gemini-fallback", GEMINI_MODEL, 1, "naysayer")
         assert cost > 0
 
     @pytest.mark.parametrize("stream", [False, True], ids=["plain", "stream"])

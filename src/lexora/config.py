@@ -284,7 +284,14 @@ class CodexSettings(BaseModel):
         ),
     )
     max_concurrency: int = Field(
-        default=2, ge=1, description="Concurrent ``codex exec`` processes."
+        default=1,
+        ge=1,
+        le=1,
+        description=(
+            "Concurrent ``codex exec`` processes. Fixed at 1 (T-naysayer-codex-"
+            "backend msg-687 A): one CLI login must not be refreshed by two "
+            "runs at once, and ``slot_hold`` assumes a single slot."
+        ),
     )
 
     @model_validator(mode="after")
@@ -363,6 +370,17 @@ class CodexSettings(BaseModel):
     )
 
 
+# The backend's time limit mindwire assumes (ADR-14, under "同時実行は 1 つまでです"):
+# a copy of mindwire's ``lexora/client.py`` ``LEXORA_BACKEND_TIMEOUT_SECONDS``
+# (900.0 on mindwire main). mindwire cannot be imported here, so the value is
+# duplicated and pinned by a test. Not 930: that is 900 + the client-side
+# margin (``_CLIENT_DEFAULT_MARGIN_SECONDS``, 30), which belongs to the client
+# and must not be spent inside the backend. Source: spirrow-mindwire
+# T-D8-codex-backend-adr14-15-amendment msg-6612 section 2; adopted in
+# T-naysayer-codex-backend msg-702.
+LEXORA_BACKEND_TIMEOUT_S = 900.0
+
+
 class FallbackSettings(BaseModel):
     """Settings for a ``fallback`` backend (T-naysayer-codex-backend msg-448 B-1).
 
@@ -378,6 +396,55 @@ class FallbackSettings(BaseModel):
     primary: str = Field(description="Name of the codex backend tried first.")
     fallback: str = Field(description="Name of the gemini backend used when codex cannot answer.")
     mode: Literal["fallback", "shadow"] = Field(default="fallback")
+    # Time budget of one request (msg-687 C, from msg-677 objection 2).
+    caller_budget_s: float = Field(
+        default=LEXORA_BACKEND_TIMEOUT_S,
+        gt=0,
+        le=LEXORA_BACKEND_TIMEOUT_S,
+        description=(
+            "The backend's time limit for one answer (ADR-14: mindwire's "
+            "LEXORA_BACKEND_TIMEOUT_SECONDS, 900s; never more). Each request's "
+            "deadline is its arrival at the wrapper plus this."
+        ),
+    )
+    slot_wait_s: float = Field(
+        default=30.0, gt=0, description="Longest wait for the codex slot before falling back."
+    )
+    codex_timeout_s: float = Field(
+        default=270.0,
+        gt=0,
+        description=(
+            "Longest a codex run may take when called through this wrapper "
+            "(270 = 900 - 30 - 600: the share the budget cuts, msg-702)."
+        ),
+    )
+    fallback_floor_s: float = Field(
+        default=600.0,
+        gt=0,
+        description="Time Gemini is guaranteed to get after codex has used its whole share.",
+    )
+
+    @model_validator(mode="after")
+    def _budget_holds(self) -> "FallbackSettings":
+        """``slot_wait_s + codex_timeout_s + fallback_floor_s <= caller_budget_s``
+        (msg-687 C): otherwise a request that waits for the slot and then
+        times out in codex leaves Gemini less than its floor. Refused at
+        load time, so Lexora does not start with such a budget."""
+        check_fallback_budget(self.caller_budget_s, self.slot_wait_s, self.codex_timeout_s, self.fallback_floor_s)
+        return self
+
+
+def check_fallback_budget(
+    caller_budget_s: float, slot_wait_s: float, codex_timeout_s: float, fallback_floor_s: float
+) -> None:
+    """Raise ``ValueError`` unless the msg-687 C inequality holds."""
+    used = slot_wait_s + codex_timeout_s + fallback_floor_s
+    if used > caller_budget_s:
+        raise ValueError(
+            f"fallback budget does not hold: slot_wait_s ({slot_wait_s}) + codex_timeout_s "
+            f"({codex_timeout_s}) + fallback_floor_s ({fallback_floor_s}) = {used} > "
+            f"caller_budget_s ({caller_budget_s})"
+        )
 
 
 class BackendSettings(BaseModel):

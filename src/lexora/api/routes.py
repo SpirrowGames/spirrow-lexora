@@ -92,8 +92,10 @@ def _ledger_token_extras(source: UsageSink | Any) -> dict[str, int | None]:
     OpenAI-shaped ``usage`` dict of a non-streaming response.
 
     From a dict, both values are taken only when the response carries
-    ``lexora_thinking_tokens``, a key only Lexora's ``gemini`` backend
-    writes. That key is the marker for "this backend measured these". Without
+    ``lexora_thinking_tokens``, a key only Lexora's ``gemini`` and ``codex``
+    backends write. That key is the marker for "this backend measured these";
+    the codex backend may put ``None`` under it (or under ``cached_tokens``)
+    for a count its CLI did not report, which stays NULL. Without
     it both are None (NULL in the ledger) even if an upstream relayed its own
     ``prompt_tokens_details.cached_tokens``: D-1 fixes NULL to mean "this
     backend is not measured here", and pricing the cache of other vendors is
@@ -107,10 +109,14 @@ def _ledger_token_extras(source: UsageSink | Any) -> dict[str, int | None]:
     if not isinstance(source, dict) or "lexora_thinking_tokens" not in source:
         return {"tokens_thinking": None, "tokens_cached_input": None}
     details = source.get("prompt_tokens_details")
-    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    cached = details.get("cached_tokens") if isinstance(details, dict) else 0
+    thinking = source.get("lexora_thinking_tokens")
     return {
-        "tokens_thinking": int(source.get("lexora_thinking_tokens") or 0),
-        "tokens_cached_input": int(cached or 0),
+        # An explicit None under the marker is the codex backend saying "the
+        # CLI did not report this" (msg-687 H-2): NULL, not 0. The gemini
+        # backend always writes integers, so its rows are unchanged.
+        "tokens_thinking": None if thinking is None else int(thinking),
+        "tokens_cached_input": None if cached is None else int(cached),
     }
 
 

@@ -19,7 +19,7 @@ def _backends(tmp_path: Path, **fallback: Any) -> dict[str, Any]:
         "gemini": {"type": "gemini", "url": "https://example.invalid", "models": ["gemini-3.1-pro-preview"]},
         "codex": {
             "type": "codex",
-            "models": ["gpt-5-codex"],
+            "models": ["gpt-6.1-sol"],
             "codex": {"codex_home": str(tmp_path / "home"), "state_db_path": str(tmp_path / "codex.db")},
         },
         "naysayer-fb": {"type": "fallback", "fallback": {"primary": "codex", "fallback": "gemini", **fallback}},
