@@ -319,6 +319,11 @@ class FallbackBackend(Backend):
         self._last_hold: datetime | None = None
         self._last_notice_at: datetime | None = None
         self._pending_notice: str | None = None
+        #: Bumped each time a state notice (STARTED / ENDED) starts its post.
+        #: A post writes ``_pending_notice`` afterwards only if no newer one
+        #: started meanwhile. Identity checks on the parked value were ABA-prone
+        #: (PR-gate on lexora#78: None -> None let a stale ENDED park).
+        self._notice_seq = 0
         # msg-685: the two inputs of ENDED. Codex answers set the flag only.
         self._last_fallback_at: datetime | None = None
         self._answered_since_fallback = False
@@ -576,11 +581,13 @@ class FallbackBackend(Backend):
         A parked notice is an older state, so it is obsolete once this one
         is delivered: success clears it, failure replaces it (PR-gate on
         lexora#76: a parked STARTED must not follow a delivered ENDED).
-        Either write happens only if nothing newer was parked while the
-        post was in flight."""
-        parked = self._pending_notice
+        Either write happens only if no newer state notice started while
+        this post was in flight (``_notice_seq``, a counter, so a parked
+        value that changed and changed back still counts as newer)."""
+        self._notice_seq += 1
+        seq = self._notice_seq
         delivered = await self._post(text)
-        if self._pending_notice is parked:
+        if self._notice_seq == seq:
             self._pending_notice = None if delivered else text
         return delivered
 
@@ -613,8 +620,9 @@ class FallbackBackend(Backend):
         daily data-controls EXPIRING notice if due."""
         if self._pending_notice is not None:
             text = self._pending_notice
+            seq = self._notice_seq
             if await self._post(text):
-                if self._pending_notice == text:
+                if self._notice_seq == seq and self._pending_notice == text:
                     self._pending_notice = None
         now = self._clock()
         if self._recovered(now):
@@ -622,11 +630,12 @@ class FallbackBackend(Backend):
         elif self._fallback_since is not None and self._last_notice_at is not None:
             if now - self._last_notice_at >= self.remind_after:
                 parked = self._pending_notice
+                seq = self._notice_seq
                 if not self.webhook_url or await self._post(self._notice_text("CONTINUING")):
                     self._last_notice_at = now
                     # CONTINUING restates the open period: a parked notice
                     # (its STARTED) would only arrive after it, out of order.
-                    if self.webhook_url and self._pending_notice is parked:
+                    if self.webhook_url and self._notice_seq == seq and self._pending_notice is parked:
                         self._pending_notice = None
         await self._expiry_tick()
 
@@ -668,18 +677,34 @@ class FallbackBackend(Backend):
 
     # ---- shadow mode (B-5) -------------------------------------------------
 
-    def _start_shadow(self, request: dict[str, Any]) -> asyncio.Future[tuple[str | None, float | None]] | None:
+    def _start_shadow(
+        self, request: dict[str, Any]
+    ) -> tuple[asyncio.Future[tuple[str | None, float | None]], asyncio.Task[None]] | None:
         if self._shadow_task is not None and not self._shadow_task.done():
             self.shadow_skipped += 1
             logger.info("naysayer_shadow_skipped", backend=self.name, skipped=self.shadow_skipped)
             return None
         loop = asyncio.get_running_loop()
         gemini_done: asyncio.Future[tuple[str | None, float | None]] = loop.create_future()
-        self._shadow_task = loop.create_task(self._shadow_run(self._codex_request(request), gemini_done))
-        return gemini_done
+        task = loop.create_task(self._shadow_run(self._codex_request(request), gemini_done))
+        self._shadow_task = task
+        return gemini_done, task
+
+    def _cancel_shadow(self, task: asyncio.Task[None] | None) -> None:
+        """The caller went away (PR-gate on lexora#78): stop this request's
+        shadow run so it does not keep codex's single slot for up to
+        ``codex_timeout_s``. Cancelling kills and reaps the codex process and
+        gives the slot back (``CodexBackend._execute``). No comparison row is
+        written for it: Gemini never finished either, so there is no pair.
+        Only a cancel/close calls this -- a Gemini *error* still yields a
+        comparison row (gemini_verdict="error"), so that shadow run is kept."""
+        if task is not None and not task.done():
+            logger.info("naysayer_shadow_cancelled", backend=self.name, reason="caller_gone")
+            task.cancel()
 
     async def _shadow_chat(self, request: dict[str, Any]) -> dict[str, Any]:
-        gemini_done = self._start_shadow(request)
+        started_shadow = self._start_shadow(request)
+        gemini_done, shadow_task = started_shadow if started_shadow is not None else (None, None)
         self._route_gemini(None)
         started = time.monotonic()
         text: str | None = None
@@ -687,6 +712,16 @@ class FallbackBackend(Backend):
             response = await self.fallback.chat_completions(request)
             text = _response_text(response)
             return response
+        except asyncio.CancelledError:
+            self._cancel_shadow(shadow_task)
+            raise
+        # An ordinary Gemini error (5xx, timeout, ReadError) deliberately does
+        # NOT cancel the shadow run (PR-gate on lexora#79 considered): its
+        # result is not discarded. `finally` hands it (None, None) and it
+        # writes a row with gemini_verdict="error" and codex's own verdict --
+        # what codex did on a request Gemini failed, which is exactly the
+        # evidence the fallback-mode switch is judged on. It holds the slot no
+        # longer than any other shadow run (codex_timeout_s).
         finally:
             if gemini_done is not None and not gemini_done.done():
                 gemini_done.set_result((text, time.monotonic() - started if text is not None else None))
@@ -694,7 +729,8 @@ class FallbackBackend(Backend):
     async def _shadow_stream(
         self, request: dict[str, Any], usage_sink: UsageSink | None
     ) -> AsyncIterator[bytes]:
-        gemini_done = self._start_shadow(request)
+        started_shadow = self._start_shadow(request)
+        gemini_done, shadow_task = started_shadow if started_shadow is not None else (None, None)
         self._route_gemini(None)
         started = time.monotonic()
         chunks: list[bytes] = []
@@ -704,6 +740,12 @@ class FallbackBackend(Backend):
                 chunks.append(chunk)
                 yield chunk
             completed = True
+        except (asyncio.CancelledError, GeneratorExit):
+            # Cancelled mid-await, or closed at a `yield` (the consumer
+            # stopped reading): either way the caller is gone.
+            self._cancel_shadow(shadow_task)
+            raise
+        # A Gemini stream error does not cancel it either: see _shadow_chat.
         finally:
             if gemini_done is not None and not gemini_done.done():
                 result = (_sse_text(chunks), time.monotonic() - started) if completed else (None, None)
