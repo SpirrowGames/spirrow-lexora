@@ -695,7 +695,9 @@ class FallbackBackend(Backend):
         shadow run so it does not keep codex's single slot for up to
         ``codex_timeout_s``. Cancelling kills and reaps the codex process and
         gives the slot back (``CodexBackend._execute``). No comparison row is
-        written for it: Gemini never finished either, so there is no pair."""
+        written for it: Gemini never finished either, so there is no pair.
+        Only a cancel/close calls this -- a Gemini *error* still yields a
+        comparison row (gemini_verdict="error"), so that shadow run is kept."""
         if task is not None and not task.done():
             logger.info("naysayer_shadow_cancelled", backend=self.name, reason="caller_gone")
             task.cancel()
@@ -713,6 +715,13 @@ class FallbackBackend(Backend):
         except asyncio.CancelledError:
             self._cancel_shadow(shadow_task)
             raise
+        # An ordinary Gemini error (5xx, timeout, ReadError) deliberately does
+        # NOT cancel the shadow run (PR-gate on lexora#79 considered): its
+        # result is not discarded. `finally` hands it (None, None) and it
+        # writes a row with gemini_verdict="error" and codex's own verdict --
+        # what codex did on a request Gemini failed, which is exactly the
+        # evidence the fallback-mode switch is judged on. It holds the slot no
+        # longer than any other shadow run (codex_timeout_s).
         finally:
             if gemini_done is not None and not gemini_done.done():
                 gemini_done.set_result((text, time.monotonic() - started if text is not None else None))
@@ -736,6 +745,7 @@ class FallbackBackend(Backend):
             # stopped reading): either way the caller is gone.
             self._cancel_shadow(shadow_task)
             raise
+        # A Gemini stream error does not cancel it either: see _shadow_chat.
         finally:
             if gemini_done is not None and not gemini_done.done():
                 result = (_sse_text(chunks), time.monotonic() - started) if completed else (None, None)

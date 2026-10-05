@@ -42,9 +42,10 @@ GEMINI_TEXT = "Looks fine.\n\nVERDICT: APPROVE"
 class FakeGemini(Backend):
     fills_usage_sink = True
 
-    def __init__(self, text: str = GEMINI_TEXT, delay: float = 0.0) -> None:
+    def __init__(self, text: str = GEMINI_TEXT, delay: float = 0.0, error: Exception | None = None) -> None:
         self.text = text
         self.delay = delay
+        self.error = error
         self.calls: list[dict[str, Any]] = []
 
     def _response(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -60,6 +61,8 @@ class FakeGemini(Backend):
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(request)
         await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
         return self._response(request)
 
     async def chat_completions_stream(
@@ -71,6 +74,8 @@ class FakeGemini(Backend):
             usage_sink.prompt_tokens, usage_sink.completion_tokens = 100, 10
         for delta in ({"role": "assistant", "content": ""}, {"content": self.text}):
             yield f"data: {json.dumps({'choices': [{'index': 0, 'delta': delta}]})}\n\n".encode()
+            if self.error is not None:  # fail mid-stream, after the first chunk
+                raise self.error
         yield b"data: [DONE]\n\n"
 
     async def completions(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -696,6 +701,27 @@ class TestShadow:
         assert shadow is not None
         with pytest.raises(asyncio.CancelledError):
             await shadow
+        assert not w.primary._semaphore.locked()
+
+    async def test_failed_gemini_stream_keeps_its_shadow_and_records_codex(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate lexora#79 (fallback.py:713) considered: a Gemini error is
+        not a caller going away. The shadow run is kept because its result is
+        not discarded -- it lands in a row with gemini_verdict="error" and
+        codex's own verdict (the chat path is pinned by
+        test_gemini_failure_is_recorded_as_error)."""
+        w = _make(wrappers, tmp_path, mode="shadow", gemini=FakeGemini(error=RuntimeError("gemini reset")))
+        agen = w.chat_completions_stream(REQUEST, UsageSink())
+        await agen.__anext__()
+        shadow = w._shadow_task
+        with pytest.raises(RuntimeError, match="gemini reset"):
+            await agen.__anext__()
+        assert shadow is not None
+        await shadow
+        assert not shadow.cancelled()
+        [row] = w.ledger.shadow_comparisons()
+        assert (row["gemini_verdict"], row["codex_verdict"], row["codex_reason"]) == ("error", "unparsed", None)
         assert not w.primary._semaphore.locked()
 
     async def test_a_skipped_request_does_not_cancel_the_running_shadow(
