@@ -847,6 +847,13 @@ class CodexBackend(Backend):
         # bound after which ``codex_availability`` ignores it.) Read by
         # ``codex_availability`` alone, so both wrapper modes see it alike.
         self._slot_hold: tuple[float, float] | None = None
+        # msg-702 (PR-gate advisory, msg-700): the ``run_limit`` of the run
+        # that holds the slot, set when it takes the slot and cleared when it
+        # gives it back. A waiter that times out bounds ``_slot_hold`` by the
+        # HOLDER's limit, not its own: a direct 600s run must not look stale
+        # to a 270s wrapper waiter after 300s. Safe without a lock because
+        # ``max_concurrency`` is fixed at 1 (msg-687 A).
+        self._holder_limit: float | None = None
 
     # ---- configuration identity -------------------------------------
 
@@ -1082,9 +1089,10 @@ class CodexBackend(Backend):
            up waiting while another run holds the only slot, and that run
            has not given it back yet. Kept apart from ``quota_hold`` so the
            shadow report and the notices tell a busy slot from an exhausted
-           window. A slot hold older than ``codex_timeout_s + slot_wait_s``
-           cannot be legitimate (the holder is cut off by then and its
-           ``finally`` clears it): it is ignored with a WARNING each time.
+           window. A slot hold older than the HOLDER's run limit +
+           ``slot_wait_s`` (msg-702) cannot be legitimate (the holder is cut
+           off by then and its ``finally`` clears it): it is ignored with a
+           WARNING each time.
         3. ``_check_version()`` -- ``verification_stale`` on a version
            change, ``launch_failed`` when the CLI cannot be run.
 
@@ -1198,6 +1206,7 @@ class CodexBackend(Backend):
                         raise CodexTimeout(f"codex exec timed out after {limit}s") from exc
                     raise
             finally:
+                self._holder_limit = None
                 self._semaphore.release()
                 # This run held the only slot: whoever gave up waiting for it
                 # may run again now (msg-683: no idle codex while Gemini pays).
@@ -1223,6 +1232,7 @@ class CodexBackend(Backend):
         """Take the slot, waiting at most ``slot_wait_s`` (msg-687 B)."""
         if slot_wait_s is None:
             await self._semaphore.acquire()
+            self._holder_limit = run_limit
             return
         try:
             async with asyncio.timeout(slot_wait_s):
@@ -1231,9 +1241,13 @@ class CodexBackend(Backend):
             # Only while the slot is really taken: a hold set after its
             # holder has already let go would have nobody to clear it.
             if self._semaphore.locked():
-                self._slot_hold = (time.monotonic(), run_limit + slot_wait_s)
+                # The holder's limit (msg-702); the waiter's own only when the
+                # holder is unknown (the slot taken outside ``_execute``).
+                holder = self._holder_limit if self._holder_limit is not None else run_limit
+                self._slot_hold = (time.monotonic(), holder + slot_wait_s)
                 logger.warning("codex_slot_hold", backend=self.name, slot_wait_s=slot_wait_s)
             raise CodexSlotTimeout(f"no codex slot free within {slot_wait_s}s") from exc
+        self._holder_limit = run_limit
 
     async def _run_unverified(
         self,

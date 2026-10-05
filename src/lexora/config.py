@@ -370,6 +370,17 @@ class CodexSettings(BaseModel):
     )
 
 
+# The backend's time limit mindwire assumes (ADR-14, under "同時実行は 1 つまでです"):
+# a copy of mindwire's ``lexora/client.py`` ``LEXORA_BACKEND_TIMEOUT_SECONDS``
+# (900.0 on mindwire main). mindwire cannot be imported here, so the value is
+# duplicated and pinned by a test. Not 930: that is 900 + the client-side
+# margin (``_CLIENT_DEFAULT_MARGIN_SECONDS``, 30), which belongs to the client
+# and must not be spent inside the backend. Source: spirrow-mindwire
+# T-D8-codex-backend-adr14-15-amendment msg-6612 section 2; adopted in
+# T-naysayer-codex-backend msg-702.
+LEXORA_BACKEND_TIMEOUT_S = 900.0
+
+
 class FallbackSettings(BaseModel):
     """Settings for a ``fallback`` backend (T-naysayer-codex-backend msg-448 B-1).
 
@@ -387,18 +398,25 @@ class FallbackSettings(BaseModel):
     mode: Literal["fallback", "shadow"] = Field(default="fallback")
     # Time budget of one request (msg-687 C, from msg-677 objection 2).
     caller_budget_s: float = Field(
-        default=930.0,
+        default=LEXORA_BACKEND_TIMEOUT_S,
         gt=0,
+        le=LEXORA_BACKEND_TIMEOUT_S,
         description=(
-            "How long the caller waits for one answer (mindwire's client waits "
-            "930s). Each request's deadline is its arrival at the wrapper plus this."
+            "The backend's time limit for one answer (ADR-14: mindwire's "
+            "LEXORA_BACKEND_TIMEOUT_SECONDS, 900s; never more). Each request's "
+            "deadline is its arrival at the wrapper plus this."
         ),
     )
     slot_wait_s: float = Field(
         default=30.0, gt=0, description="Longest wait for the codex slot before falling back."
     )
     codex_timeout_s: float = Field(
-        default=300.0, gt=0, description="Longest a codex run may take when called through this wrapper."
+        default=270.0,
+        gt=0,
+        description=(
+            "Longest a codex run may take when called through this wrapper "
+            "(270 = 900 - 30 - 600: the share the budget cuts, msg-702)."
+        ),
     )
     fallback_floor_s: float = Field(
         default=600.0,
