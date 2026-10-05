@@ -24,6 +24,7 @@ from lexora.backends.codex import (
     CodexBackend,
     CodexLaunchError,
     CodexSlotTimeout,
+    CodexTimeout,
     CodexUsage,
     usage_from_events,
 )
@@ -36,7 +37,7 @@ from lexora.backends.fallback import (
     FallbackDeadlineExceeded,
     fallback_reason,
 )
-from lexora.config import BackendSettings, CodexSettings, FallbackSettings
+from lexora.config import LEXORA_BACKEND_TIMEOUT_S, BackendSettings, CodexSettings, FallbackSettings
 from lexora.services.cost_tracker import CostTracker
 from tests.backends.test_codex import make_backend, record_pass
 from tests.backends.test_fallback import (  # noqa: F401 - fixture
@@ -268,11 +269,45 @@ class TestSlotHold:
         assert (await backend.codex_availability()).reason == "slot_hold"
 
     async def test_wrapper_sets_the_bound_from_its_limits(self, tmp_path: Path, wrappers: list) -> None:
-        w = _build(wrappers, tmp_path, codex_timeout_s=300.0, slot_wait_s=SHORT_WAIT)
-        await _take_slot(w.primary)
+        w = _build(wrappers, tmp_path, codex_timeout_s=270.0, slot_wait_s=SHORT_WAIT)
+        await _take_slot(w.primary)  # held outside ``_execute``: holder limit unknown
         await w.chat_completions(REQUEST)
         assert w.primary._slot_hold is not None
-        assert w.primary._slot_hold[1] == pytest.approx(300.0 + SHORT_WAIT)
+        assert w.primary._slot_hold[1] == pytest.approx(270.0 + SHORT_WAIT)
+
+    async def test_hold_is_bounded_by_the_holders_limit_not_the_waiters(
+        self, tmp_path: Path, wrappers: list, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """msg-700 advisory / msg-702 3: a direct 600s run holds the slot; a
+        270s wrapper request gives up waiting. Past 330s the hold must still
+        close codex, without ``codex_slot_hold_stale_ignored``."""
+        import lexora.backends.codex as codex_module
+
+        warned: list[str] = []
+
+        class Recorder:
+            def warning(self, event: str, **_kw: Any) -> None:
+                warned.append(event)
+
+        w = _build(wrappers, tmp_path, "sleep", codex_timeout_s=270.0, slot_wait_s=SHORT_WAIT)
+        holder = asyncio.create_task(w.primary.chat_completions(REQUEST, timeout=600.0))
+        while not w.primary._semaphore.locked():
+            await asyncio.sleep(0.01)
+        assert w.primary._holder_limit == 600.0
+        try:
+            await w.chat_completions(REQUEST)  # the wrapper's waiter times out
+            set_at, bound = w.primary._slot_hold  # type: ignore[misc]
+            assert bound == pytest.approx(600.0 + SHORT_WAIT)
+            monkeypatch.setattr(codex_module, "logger", Recorder())
+            w.primary._slot_hold = (set_at - 331.0, bound)  # 331s later
+            assert (await w.primary.codex_availability()).reason == "slot_hold"
+            assert "codex_slot_hold_stale_ignored" not in warned
+        finally:
+            holder.cancel()
+            with pytest.raises(BaseException):
+                await holder
+        assert w.primary._holder_limit is None
+        assert w.primary._slot_hold is None
 
 
 # --------------------------------------------------------------------------
@@ -283,17 +318,34 @@ class TestSlotHold:
 class TestBudget:
     def test_defaults_are_the_agreed_values(self) -> None:
         s = FallbackSettings(primary="codex", fallback="gemini")
-        assert (s.caller_budget_s, s.slot_wait_s, s.codex_timeout_s, s.fallback_floor_s) == (930, 30, 300, 600)
+        assert (s.caller_budget_s, s.slot_wait_s, s.codex_timeout_s, s.fallback_floor_s) == (900, 30, 270, 600)
+
+    def test_backend_timeout_constant_is_mindwires(self) -> None:
+        """A copy of mindwire's ``LEXORA_BACKEND_TIMEOUT_SECONDS`` (ADR-14,
+        msg-6612 section 2): pinned so the copy cannot drift silently."""
+        assert LEXORA_BACKEND_TIMEOUT_S == 900.0
+        assert FallbackSettings(primary="codex", fallback="gemini").caller_budget_s == LEXORA_BACKEND_TIMEOUT_S
+
+    def test_caller_budget_above_the_backend_limit_does_not_start(self) -> None:
+        FallbackSettings(primary="codex", fallback="gemini", caller_budget_s=900)
+        with pytest.raises(ValidationError, match="less than or equal to 900"):
+            FallbackSettings(primary="codex", fallback="gemini", caller_budget_s=901)
+        with pytest.raises(ValidationError, match="less than or equal to 900"):
+            FallbackSettings(primary="codex", fallback="gemini", caller_budget_s=930)
+
+    def test_old_codex_share_no_longer_fits(self) -> None:
+        with pytest.raises(ValidationError, match="fallback budget does not hold"):
+            FallbackSettings(primary="codex", fallback="gemini", codex_timeout_s=300)
 
     @pytest.mark.parametrize(
         ("values", "ok"),
         [
             ({}, True),
-            ({"caller_budget_s": 930, "slot_wait_s": 30, "codex_timeout_s": 300, "fallback_floor_s": 600}, True),
-            ({"caller_budget_s": 929}, False),
-            ({"codex_timeout_s": 301}, False),
+            ({"caller_budget_s": 900, "slot_wait_s": 30, "codex_timeout_s": 270, "fallback_floor_s": 600}, True),
+            ({"caller_budget_s": 899}, False),
+            ({"codex_timeout_s": 271}, False),
             ({"fallback_floor_s": 900}, False),
-            ({"caller_budget_s": 2000, "codex_timeout_s": 600, "fallback_floor_s": 900}, True),
+            ({"caller_budget_s": 800, "codex_timeout_s": 170, "fallback_floor_s": 600}, True),
         ],
     )
     def test_inequality_is_checked_at_load(self, values: dict[str, float], ok: bool) -> None:
@@ -329,7 +381,7 @@ class TestBudget:
 
         w.fallback_budget = spy  # type: ignore[method-assign]
         assert _text(await w.chat_completions(REQUEST)) == GEMINI_TEXT
-        assert budgets == [900.0]  # min(900, 930 - 0.5)
+        assert budgets == [pytest.approx(899.5)]  # min(900, 900 - 0.5)
 
     def test_budget_after_codex_used_its_whole_share_is_the_floor(self, tmp_path: Path) -> None:
         mono = Mono()
@@ -343,10 +395,35 @@ class TestBudget:
             monotonic=mono,
         )
         deadline = w._deadline()
-        mono.now += 30.0 + 300.0
+        mono.now += 30.0 + 270.0
         assert w.fallback_budget(deadline) == pytest.approx(600.0)
         mono.now += 1000.0
         assert w.fallback_budget(deadline) == 0.0
+
+    async def test_worst_path_answers_within_the_backend_limit(self, tmp_path: Path, wrappers: list) -> None:
+        """Slot wait to its limit, codex to its limit, then Gemini to its cut:
+        arrival to answer stays within ``LEXORA_BACKEND_TIMEOUT_S`` (msg-702)."""
+        mono = Mono()
+        w = _build(wrappers, tmp_path, slot_wait_s=30.0, codex_timeout_s=270.0, fallback_timeout_s=900.0, monotonic=mono)
+        arrival = mono.now
+
+        async def worst_codex(request: dict[str, Any], availability: Any = None, **kw: Any) -> dict[str, Any]:
+            mono.now += kw["slot_wait_s"] + kw["timeout"]
+            raise CodexTimeout("codex exec timed out")
+
+        budgets: list[float] = []
+        real = w.fallback_budget
+
+        def spy(deadline: float) -> float:
+            budgets.append(real(deadline))
+            return budgets[-1]
+
+        w.primary.chat_completions = worst_codex  # type: ignore[method-assign]
+        w.fallback_budget = spy  # type: ignore[method-assign]
+        assert _text(await w.chat_completions(REQUEST)) == GEMINI_TEXT
+        assert budgets == [pytest.approx(600.0)]
+        mono.now += budgets[0]  # Gemini uses its whole cut
+        assert mono.now - arrival <= LEXORA_BACKEND_TIMEOUT_S
 
     async def test_fallback_is_cut_at_the_deadline(self, tmp_path: Path, wrappers: list) -> None:
         w = _build(wrappers, tmp_path, verified=False, gemini=FakeGemini(delay=5.0), fallback_timeout_s=0.2)

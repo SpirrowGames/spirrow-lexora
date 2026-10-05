@@ -208,17 +208,19 @@ routing:
     # verdict を比較する (shadow_comparisons)。fallback への切替は Tier-C。
     # 時間の予算 (msg-687 C): slot_wait_s + codex_timeout_s + fallback_floor_s
     # <= caller_budget_s を起動時に検査し、成り立たなければ起動しない。
-    # caller_budget_s=930 は mindwire の client が待つ時間 (gemini backend の
-    # timeout コメント参照)。
+    # caller_budget_s=900 は ADR-14 の backend 上限 (mindwire lexora/client.py の
+    # LEXORA_BACKEND_TIMEOUT_SECONDS、Lexora 側は config.LEXORA_BACKEND_TIMEOUT_S)。
+    # 930 (= 900 + client 側の余裕 30) ではない。900 を超える値は起動しない。
+    # codex_timeout_s=270 は 30 + 270 + 600 = 900 に収めるため (msg-702)。
     naysayer-codex:
       type: "fallback"
       fallback:
         primary: "codex"
         fallback: "gemini"
         mode: "shadow"
-        caller_budget_s: 930
+        caller_budget_s: 900
         slot_wait_s: 30
-        codex_timeout_s: 300
+        codex_timeout_s: 270
         fallback_floor_s: 600
 
     # Claude Code CLI (non-interactive mode)

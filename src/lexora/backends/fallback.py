@@ -21,7 +21,8 @@ backends, and a ``mode``:
   timings, never text -- goes to ``shadow_comparisons`` in the cost DB.
 
 **Time budget (msg-687 C).** Each request's deadline is its arrival at
-the wrapper plus ``caller_budget_s`` (930s, what mindwire's client waits).
+the wrapper plus ``caller_budget_s`` (900s, ``LEXORA_BACKEND_TIMEOUT_S``:
+the backend limit mindwire assumes under ADR-14; msg-702).
 Codex waits at most ``slot_wait_s`` for its single slot and runs at most
 ``codex_timeout_s``; the fallback call is cut at ``min(Gemini's own
 timeout, deadline - now)`` and then raises ``FallbackDeadlineExceeded``
@@ -132,7 +133,7 @@ from lexora.backends.codex_data_controls import (
     REASON_DATA_CONTROLS_UNVERIFIED,
     RUNBOOK_POINTER,
 )
-from lexora.config import check_fallback_budget
+from lexora.config import LEXORA_BACKEND_TIMEOUT_S, check_fallback_budget
 from lexora.services.trace import current_trace_id
 from lexora.utils.logging import get_logger
 
@@ -275,9 +276,9 @@ class FallbackBackend(Backend):
         remind_after: timedelta = REMIND_AFTER,
         recover_after: timedelta = RECOVER_AFTER,
         clock: Callable[[], datetime] = _utcnow,
-        caller_budget_s: float = 930.0,
+        caller_budget_s: float = LEXORA_BACKEND_TIMEOUT_S,
         slot_wait_s: float = 30.0,
-        codex_timeout_s: float = 300.0,
+        codex_timeout_s: float = 270.0,
         fallback_floor_s: float = 600.0,
         fallback_timeout_s: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
