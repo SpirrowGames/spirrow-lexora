@@ -582,6 +582,34 @@ class TestNotifications:
         assert await w._deliver_state(newer) is False
         assert w._pending_notice == newer
 
+    async def test_tick_retry_overtaken_by_a_newer_delivery_keeps_the_newer_key(
+        self, tmp_path: Path, wrappers: list
+    ) -> None:
+        """PR-gate advisory on lexora#81: the tick retries a parked STARTED;
+        while it is in flight ENDED is delivered. The tick landing later must
+        not move ``_delivered_key`` back to STARTED."""
+        clock = Clock()
+        w = _make(wrappers, tmp_path, "quota", clock=clock)
+        w._fallback_since = clock.now
+        started = w._notice_text("STARTED")
+        ended = w._notice_text("ENDED")
+        w._pending_notice = started
+        tick_gate = asyncio.Event()
+
+        async def post(text: str) -> bool:
+            if "STARTED" in text:
+                await tick_gate.wait()
+            return True
+
+        w._post = post  # type: ignore[method-assign]
+        tick = asyncio.create_task(w.notice_tick())
+        await asyncio.sleep(0)  # the tick is awaiting its retry
+        assert await w._deliver_state(ended) is True
+        tick_gate.set()
+        await tick
+        assert w._delivered_key == ("ENDED", clock.now.isoformat())
+        assert w._pending_notice is None
+
     async def test_delivered_reminder_clears_a_parked_started(self, tmp_path: Path, wrappers: list) -> None:
         clock = Clock()
         w = _make(wrappers, tmp_path, "quota", clock=clock)
