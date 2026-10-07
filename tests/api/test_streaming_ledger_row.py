@@ -131,9 +131,8 @@ pattern found 3, expected 3, replaced 3, each time.
   `AssertionError` on the identity (`[1791057648.4..., ...] == [4.75, 8.25]`),
   not a crash -- `_SteppingClock.__getattr__` delegates `time()` to the real
   module, so the mutant reads a real clock and the equality is what kills it.
-  SUITE-WIDE, at `fbbfdea` on win32 / CPython 3.12.13: 3 failed / 1418 passed
-  / 1 skipped / 2 deselected, and the three are these cases and nothing else.
-  That is what this row establishes: the identity also holds the
+  Run suite-wide, the three that red are these cases and nothing else (the
+  run's counts are in PR #75, not here). That is what this row establishes: the identity also holds the
   clock-provenance half for THESE THREE SITES -- both endpoints must resolve
   through `routes.time.monotonic` -- and no other case in the suite does,
   including every case in `test_interval_clock.py`, none of which is
