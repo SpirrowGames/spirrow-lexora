@@ -241,6 +241,18 @@ class CodexFailed(CodexError):
     """Any failure the classifier could not place in a narrower class."""
 
 
+class CodexFailureHold(CodexError):
+    """Codex is held after an unclassified failure (``failure_hold``,
+    msg-765 L-2a); no subprocess was started.
+
+    Deliberately NOT a ``CodexFailed`` (PR-gate on #85): a ``CodexFailed``
+    is a real run's failure and carries its stderr snippet, which the
+    fallback wrapper logs as ``naysayer_codex_failed_fallback``. A request
+    refused by the hold has no snippet, so it must never be counted, logged
+    or reported as one.
+    """
+
+
 class CodexNotVerifiedError(CodexError):
     """The verification gate is closed; no subprocess was started.
 
@@ -1132,7 +1144,7 @@ class CodexBackend(Backend):
             return CodexAvailability("quota_hold", error, quota_hold_until=hold)
         failure_hold = self._failure_hold_until
         if failure_hold is not None and failure_hold > datetime.now(timezone.utc):
-            error = CodexFailed(
+            error = CodexFailureHold(
                 f"codex held after an unclassified failure until {failure_hold.isoformat()}"
             )
             return CodexAvailability("failure_hold", error)

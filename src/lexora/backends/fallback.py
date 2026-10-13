@@ -128,6 +128,7 @@ from lexora.backends.codex import (
     CodexBackend,
     CodexError,
     CodexFailed,
+    CodexFailureHold,
     CodexLaunchError,
     CodexNotVerifiedError,
     CodexQuotaError,
@@ -175,6 +176,7 @@ FALLBACK_ERRORS: tuple[type[CodexError], ...] = (
     CodexSlotTimeout,
     CodexToolUseViolation,
     CodexFailed,
+    CodexFailureHold,
 )
 
 
@@ -204,6 +206,8 @@ def fallback_reason(exc: CodexError) -> str:
         return "tool_use_violation"
     if isinstance(exc, CodexFailed):
         return "codex_failed"
+    if isinstance(exc, CodexFailureHold):
+        return "failure_hold"
     return type(exc).__name__
 
 
