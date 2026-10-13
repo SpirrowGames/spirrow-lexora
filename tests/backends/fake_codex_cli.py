@@ -34,7 +34,9 @@ Scenarios for the backend:
 Scenarios for V-2'-control and V-2' (talk to the mock model named by the
 provider override). The CLI declares ``shell`` and ``read_file`` in its first
 request. ``DISABLE_FLAG`` among the ``-c`` overrides is the stand-in for the
-real (unmeasured) tool-disabling setting; the control run drops it.
+real tool-disabling setting; the control run drops it. With the flag, the
+contained scenarios declare no tool at all, as the real CLI does under the
+shipped overrides (V-2/3); ``executes`` and ``crash`` still declare theirs.
 
 * ``contained``   -- runs its tools only when the flag is absent: control
                      executes, production refuses -> pass.
@@ -57,6 +59,10 @@ real (unmeasured) tool-disabling setting; the control run drops it.
                       ``custom_tool_call`` of ``exec`` reaches a tool; any
                       other call is "unsupported call". Responses wire only.
 * ``code_mode_executes`` -- ``code_mode`` that always runs its tools.
+* ``namespaced``   -- like ``contained``, but the tools come as plain
+                      functions inside an ``additional_tools`` namespace with
+                      no top-level ``tools`` (the measured shape for a model
+                      that is not in code mode). Responses wire only.
 
 A tool run emits ``item.started`` then ``item.completed`` (ASSUMED order).
 The stderr probe (``sh -c <script> lexora-probe OUT NONCE ERR NONCE``) is
@@ -233,12 +239,16 @@ def v2(scenario: str, overrides: dict[str, str], prompt: str, last_message: str 
     chat = overrides.get("model_providers.lexora_verify.wire_api") == "chat"
     url = base + ("/chat/completions" if chat else "/responses")
     code_mode = scenario in ("code_mode", "code_mode_executes")
+    declares = not (disabled and scenario in ("contained", "stderr_leak", "no_item_started", "code_mode", "namespaced"))
     known = {"exec_real"} if scenario == "wrong_names" else KNOWN_TOOLS
-    decls = [] if scenario == "wrong_names" else TOOL_DECLARATIONS
+    decls = [] if scenario == "wrong_names" or not declares else TOOL_DECLARATIONS
     user_message = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}
     if code_mode:
         known = CODE_MODE_KNOWN
-        first_body = {"input": [*CODE_MODE_FIRST_INPUT, user_message]}
+        first_body = {"input": [*(CODE_MODE_FIRST_INPUT if declares else []), user_message]}
+    elif scenario == "namespaced":
+        namespace = {"type": "additional_tools", "role": "developer", "tools": [{"type": "namespace", "name": "functions", "tools": decls}]}
+        first_body = {"input": [*([namespace] if declares else []), user_message]}
     elif chat:
         first_body = {"messages": [{"role": "user", "content": prompt}], "tools": [{"type": "function", "function": {k: v for k, v in d.items() if k != "type"}} for d in decls]}
     else:
@@ -248,7 +258,7 @@ def v2(scenario: str, overrides: dict[str, str], prompt: str, last_message: str 
         sys.stderr.write("thread 'main' panicked at codex-rs/core/src/tool.rs:1:1\n")
         sys.stderr.flush()
         os._exit(101)
-    contained_like = scenario in ("contained", "stderr_leak", "no_item_started", "code_mode")
+    contained_like = scenario in ("contained", "stderr_leak", "no_item_started", "code_mode", "namespaced")
     run_tools = scenario in ("executes", "crash", "code_mode_executes") or (contained_like and not disabled)
     results = []
     for call in calls:
@@ -285,7 +295,7 @@ def main() -> int:
     scenario = sys.argv[1]
     overrides, last_message = parse_args(sys.argv[2:])
     prompt = sys.stdin.read()
-    if scenario in ("contained", "executes", "no_connect", "crash", "wrong_names", "stderr_leak", "no_item_started", "code_mode", "code_mode_executes"):
+    if scenario in ("contained", "executes", "no_connect", "crash", "wrong_names", "stderr_leak", "no_item_started", "code_mode", "code_mode_executes", "namespaced"):
         return v2(scenario, overrides, prompt, last_message)
     if scenario == "sleep":
         ticks = Path(os.environ["CODEX_HOME"]) / "ticks"

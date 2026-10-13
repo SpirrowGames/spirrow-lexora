@@ -285,3 +285,28 @@ async def test_shipped_claude_code_models_are_advertised_and_route() -> None:
     # hardcoded empty list — so both rows exist on this gateway's own
     # authority, which is what ``owned_by`` records.
     assert rows["claude-code-opus"]["owned_by"] == "lexora"
+
+
+def test_shipped_codex_turns_every_tool_off() -> None:
+    """The shipped codex backend sets exactly the measured tool-disabling
+    overrides: every key in TOOL_DISABLE_OVERRIDE_KEYS (so the V-2'-control
+    differs from production in nothing else) and every flag with its value,
+    and names a catalog inside codex_home (the only host directory the
+    sandboxed CLI can read). Whether the CLI then declares no tool is
+    verify_codex's V-2/3, measured on the host."""
+    from pathlib import PurePosixPath
+
+    from lexora.backends.codex import (
+        TOOL_DISABLE_FEATURE_OVERRIDES,
+        TOOL_DISABLE_OVERRIDE_KEYS,
+        model_catalog_path,
+        override_key,
+    )
+
+    codex = create_settings(SHIPPED_CONFIG).routing.backends["codex"].codex
+    assert codex is not None
+    assert sorted(override_key(o) for o in codex.cli_overrides) == sorted(TOOL_DISABLE_OVERRIDE_KEYS)
+    assert set(TOOL_DISABLE_FEATURE_OVERRIDES) <= set(codex.cli_overrides)
+    catalog = model_catalog_path(codex.cli_overrides)
+    assert catalog is not None
+    assert PurePosixPath(codex.codex_home) in PurePosixPath(catalog).parents
