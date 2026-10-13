@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -101,7 +102,9 @@ def test_catalog_path_last_override_wins() -> None:
 def test_catalog_content_is_part_of_the_config_hash(tmp_path: Path) -> None:
     catalog = tmp_path / "cat.json"
     catalog.write_text('{"models": []}')
-    backend = _backend(tmp_path, [f'model_catalog_json="{catalog}"'])
+    # as_posix: the override value is parsed like a TOML string, so a Windows
+    # path's backslashes would be read as escapes on a dev host.
+    backend = _backend(tmp_path, [f'model_catalog_json="{catalog.as_posix()}"'])
     first = backend.config_hash()
     assert backend.config_hash() == first
     catalog.write_text('{"models": [{"slug": "x"}]}')
@@ -186,6 +189,10 @@ def test_target_requires_the_override(tmp_path: Path) -> None:
         cc.target_path(_backend(tmp_path, list(TOOL_DISABLE_FEATURE_OVERRIDES)))
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="target_path validates POSIX paths: the catalog is only ever written on the Linux (bwrap) host",
+)
 class TestMain:
     @pytest.fixture
     def backend(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> CodexBackend:

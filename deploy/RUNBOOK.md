@@ -188,18 +188,21 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 - 送ったことはメモリに持っています。その日のうちに Lexora を再起動すると、同じ日にもう 1 回届くことがあります。送信に失敗したときは、10 分後の確認でもう一度送ります。
 - 期限が切れた後は予告は止まり、上のフォールバック通知（STARTED、6 時間ごとの CONTINUING、ENDED）に替わります。shadow モードでは Gemini が答えるのでフォールバック通知は出ません。止まっている間は、`shadow_report` の `codex_not_run` に `data_controls_unverified` として数えられます。
 
-## 9. codex を primary に切り替える手順（msg-763 / msg-765）
+## 9. codex を primary に切り替える手順（msg-763 / msg-765 / msg-778）
 
-出典: `T-naysayer-codex-backend` の msg-762（Takahito の Tier-C 判断）、msg-763（手順）、msg-765（`failure_hold` と C-3 の注）、Einstein の承認。
-ホスト上の作業は Takahito が {{HOST_SERVICES}}（[[platform:infra-registry]]）で行います。
+出典: `T-naysayer-codex-backend` の msg-762（Takahito の Tier-C 判断）、msg-763（手順）、msg-765（`failure_hold` と C-3 の注）、msg-778（順序 (a) と条件 1〜3。下の 10 の変更で前提が変わったための書き直し）、Einstein の承認。
+ホスト上の作業は Takahito か、ホスト上の operator lane が {{HOST_SERVICES}}（[[platform:infra-registry]]）で行います。
+
+> 注: 下の 10 の変更以降、`verify_codex` の `pass` は **deploy されたコードと設定でしか取れません**。config hash に `cli_overrides`・`ro_binds`・カタログの中身が入っているためです。deploy の前の Lexora で取った `pass` は、deploy の後に `verification_stale` になります。したがって `verify_codex` はフェーズ 0 ではなく、フェーズ 1 の C-2′ で撃ちます。
 
 ### 順序と fail-closed の窓
 
 - 順序は **Lexora の deploy が先、mindwire の #463/#464 の main merge と mindwire の deploy が後** です（#463 の HOLD 条件 (i′) が「本番 Lexora が fallback で動き、status が `codex_disabled_reason: null`」のため）。
 - その間は、codex が答えた行が旧 mindwire（`expected=gemini`）の attestation で落ち、naysayer の呼び出しが fail closed になります。間違った verdict が通ることはなく、gate や design レビューが止まって後でやり直されるだけです。
-- 窓を短くするため、ホスト上の作業（フェーズ 0）はすべて切り替えの前に shadow のまま済ませ、フェーズ 1 は 1 回の作業で続けて行い、naysayer の呼び出しが流れていない時間帯を選びます。
+- deploy（C-2）から `verify_codex` の `pass`（C-2′）までの間（約 1 分）は codex が閉じているので、Gemini が `gemini-fallback` で答えます。これも旧 mindwire が弾くので、同じ種類の fail-closed の窓です。
+- 窓を短くするため、フェーズ 0 はすべて切り替えの前に済ませ、フェーズ 1 は 1 回の作業で続けて行い、naysayer の呼び出しが流れていない時間帯を選びます。shadow のリリースを挟む案（msg-777 の (b)）は採りません（msg-778）。
 
-### フェーズ 0: 切り替えの前（shadow のまま。費用は変わらない）
+### フェーズ 0: 切り替えの前（今の deploy のまま。費用は変わらない）
 
 - **H-1**（msg-267）: ChatGPT Pro $100 を契約し、ChatGPT のセキュリティ設定で device code 認証を有効にします。済んでいれば飛ばします。
 - **H-2**: Lexora の**サービスユーザ**として、設定の `codex_home` にログインします。`~/.codex` にログインしても Lexora からは見えません。
@@ -211,33 +214,38 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 
   - `auth.json` はパスワードと同じ扱いです（リポジトリ・ログ・チャットに出さない）。
 - **H-3**（上の 8）: データ設定を確かめ、`data/codex_data_controls.yaml` に記録します。30 日ごとに繰り返す作業で、期限の 7 日前から webhook に予告が届きます。
-- **H-4**（上の 2、下の 10）: `python -m lexora.tools.codex_catalog` でモデルカタログを書き、続けて `python -m lexora.tools.verify_codex` で `pass` を取り、status が `codex.codex_disabled_reason: null` になることを確かめます。
-  - **`pass` は、ツールを無効にする設定（下の 10）が入った Lexora が deploy された後でしか取れません。** config hash に `cli_overrides`・`ro_binds`・カタログの中身が入るためです。それより前の Lexora の上で取った `pass` は、deploy の後に `verification_stale` になります。
-  - V-2′-control（tool を有効にした dummy home で tool が実際に走ること）は毎回の実行に組み込まれています。別に手で撃つ必要はありません。
-  - `mode` は codex の config hash に入っていないので、ここで取った `pass` は fallback への切り替え後も `verification_stale` になりません。
+- **H-4′**（下の 10）: リリースのコードの**新しいチェックアウト**から `python -m lexora.tools.codex_catalog` を撃ち、`codex_home` にカタログを置いておきます（`--check` で exit 0 になること）。
+  - deploy の**前**に書きます。deploy の後で書き直すと、C-2′ で取る `pass` の hash とずれます。
+  - 再起動は要りません。カタログの sha256 は `config_hash()` を呼ぶたびにファイルから計算し直しており、起動時にキャッシュしていません（`backends/codex.py` の `model_catalog_digest`）。新しいカタログを読むのは C-2 で起動する新しいサービスです。
+  - 今動いている旧サービス（`dbe1170`）には影響しません。旧設定には `cli_overrides` が無く（`model_catalog_json` も無い）、旧コードの config hash はカタログの中身を含まないので、`codex_home` にファイルが 1 つ増えても CLI も hash も変わりません。
 - **H-5**（上の 6）: `systemctl cat lexora` で `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` があること、起動ログに `fallback_webhook_unset` が出ていないことを確かめます。書き足したら上の 1 の手順で再起動します。
-- **H-6**（上の 7）: 数時間たったら `python -m lexora.tools.shadow_report --db data/costs.db` を実行し、次をすべて満たすことを確かめます。**これが切り替えに進む条件です。**
-  - `compared` が 5 件以上ある。
-  - `codex_failures` に `tool_use_violation`、`unverifiable_run`、`CodexFailed`（`codex_failed`）が無い。
-  - status の `codex.codex_disabled_reason` が `failure_hold` を繰り返していない。
+- **H-6′**（msg-778。shadow_report による旧 H-6 の置き換え）: deploy の前に、本番の `codex_home` で `CodexBackend.chat_completions` 経由の本物の run を 1 本流し、`tool_use_violation` が記録されないこと、`agent_message` と `turn.completed` が届くこと、usage が読めることを確かめます。shadow_report は使いません（2026-10-13 に operator が実施済み、msg-777）。
 
 ### フェーズ 1: 切り替え（1 回の作業で続けて行う）
 
-- **C-1**: Lexora のリリース PR（`naysayer-codex` を `mode: fallback` にするもの）を main に merge します。
+- **C-1**: Lexora のリリース PR（`naysayer-codex` を `mode: fallback` にし、下の 10 の設定を含むもの）を main に merge します。
 - **C-2**（上の 1）: `codex.inflight_runs == 0` を確かめてから、Lexora の deploy request を出します（前回の deploy と同じ経路）。
+- **C-2′**（msg-778 の条件 2）: deploy の直後、`codex.inflight_runs == 0` を確かめて `python -m lexora.tools.verify_codex` を撃ち、`pass` を取ります。
+  - **deploy から 1 分以内に `pass` が取れなければ、窓を延ばさずに下のロールバックに進みます。**
 - **C-3**: status が `mode: codex`、`codex.codex_disabled_reason: null` になることを確かめます。ならなければ、下のロールバックに進みます。
   - 注: status の `mode` は設定の値ではなく、**次のリクエストの経路**を返します（`fallback.py` の `status_fields`）。設定が `fallback` で codex が開いていれば `codex` になります。`codex` なら成功、`fallback` なら codex が閉じています（`codex_disabled_reason` を見る）。
 - **C-4**: mindwire の #463/#464 を main に merge し、mindwire を deploy します。
-- **C-5**: 最初の naysayer の呼び出しで、台帳に `answered_by='codex'` の行ができ、tokens が 0 でないこと、mindwire の attestation が通ることを確かめます。
+- **C-5**（msg-778 の条件 3 を含む）: 最初の数本の naysayer の呼び出しで、次をすべて確かめます。
+  - 台帳に `answered_by='codex'` の行ができ、tokens が 0 でないこと。
+  - mindwire の attestation が通ること。
+  - status の `codex.codex_disabled_reason` が `failure_hold` を繰り返していないこと。
+  - `tool_use_violation` が出ていないこと。
 
   ```sh
   sqlite3 data/costs.db "SELECT id, backend, answered_by, tokens_input, tokens_output FROM request_costs ORDER BY id DESC LIMIT 5;"
   ```
 
+  - C-4 の前に `failure_hold` の繰り返しが見えたら、#463/#464 は merge しません。
+
 ### ロールバック
 
-- C-3 で `mode: codex` かつ `codex_disabled_reason: null` にならなければ、#463/#464 は merge しません。
-- Lexora を直前の deploy（shadow）に戻します。戻せば旧 mindwire と組み合わせて元どおり動きます。
+- C-2′ で 1 分以内に `pass` が取れない、C-3 で `mode: codex` かつ `codex_disabled_reason: null` にならない、または C-5 で `failure_hold` を繰り返す場合は、#463/#464 は merge しません。
+- Lexora を直前の deploy（`dbe1170`、shadow）に戻します。戻せば旧 mindwire と組み合わせて元どおり動きます。
 
 ### 実際に枠が切れるまで確かめられないこと
 
