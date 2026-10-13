@@ -42,7 +42,7 @@
 | `quota_hold` | 枠切れのあと、`quota_hold_until` まで codex を止めている | 待つ（その間は Gemini にフォールバック） |
 | `failure_hold` | 分類できない失敗（`CodexFailed`）のあと、5 分 codex を止めている（msg-765 L-2a） | 待つ（その間は Gemini にフォールバック）。繰り返すなら、ログの `naysayer_codex_failed_fallback` の snippet を見る（下の 6 の 4） |
 | `launch_failed` | `codex --version` が動かない | CLI のインストールと PATH を確かめる |
-| `verification_missing` / `verification_stale` | verification が無いか、設定や CLI の版が変わった | `python -m lexora.tools.verify_codex` を通す |
+| `verification_missing` / `verification_stale` | verification が無いか、設定・CLI の版・モデルカタログの中身が変わった | CLI の版が変わったなら先に `python -m lexora.tools.codex_catalog`（下の 10）。それから `python -m lexora.tools.verify_codex` を通す |
 | `tool_use_violation` / `run_unfinished` | latch 中 | 下の 3 |
 | `schema_outdated` | state DB が古い schema | 下の 4 |
 | `state_unreadable` / `state_unwritable` | state DB が読めない・書けない | ディスクと権限を確かめ、Lexora を再起動 |
@@ -211,7 +211,8 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 
   - `auth.json` はパスワードと同じ扱いです（リポジトリ・ログ・チャットに出さない）。
 - **H-3**（上の 8）: データ設定を確かめ、`data/codex_data_controls.yaml` に記録します。30 日ごとに繰り返す作業で、期限の 7 日前から webhook に予告が届きます。
-- **H-4**（上の 2）: `python -m lexora.tools.verify_codex` で `pass` を取り、status が `mode: shadow`、`codex.codex_disabled_reason: null` になることを確かめます。
+- **H-4**（上の 2、下の 10）: `python -m lexora.tools.codex_catalog` でモデルカタログを書き、続けて `python -m lexora.tools.verify_codex` で `pass` を取り、status が `codex.codex_disabled_reason: null` になることを確かめます。
+  - **`pass` は、ツールを無効にする設定（下の 10）が入った Lexora が deploy された後でしか取れません。** config hash に `cli_overrides`・`ro_binds`・カタログの中身が入るためです。それより前の Lexora の上で取った `pass` は、deploy の後に `verification_stale` になります。
   - V-2′-control（tool を有効にした dummy home で tool が実際に走ること）は毎回の実行に組み込まれています。別に手で撃つ必要はありません。
   - `mode` は codex の config hash に入っていないので、ここで取った `pass` は fallback への切り替え後も `verification_stale` になりません。
 - **H-5**（上の 6）: `systemctl cat lexora` で `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` があること、起動ログに `fallback_webhook_unset` が出ていないことを確かめます。書き足したら上の 1 の手順で再起動します。
@@ -241,3 +242,32 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 ### 実際に枠が切れるまで確かめられないこと
 
 - 枠切れのときの stderr の文言と、リセット時刻の書式です。文言が想定と違っても、その失敗は `CodexFailed` として Gemini に落ち、通知は `reason=codex_failed` で届きます（上の 6 の 4）。そうなったら、ログの snippet をもとに `_QUOTA_RE` と `parse_reset_at` を直す別スレッドを切ります。
+
+## 10. ツールを全部無効にする設定とモデルカタログ（2026-10-13 実測、codex-cli 0.160.0）
+
+naysayer の codex はツール無しで動かします（Takahito の方針、spirrow-mindwire D8 msg-6050。`auth.json` が同じ sandbox にあるので、ファイルを読めるツールがあると読めてしまいます）。
+
+### 設定の中身
+
+- `config/lexora_config.yaml` の `codex.cli_overrides` に、フラグ（`features.*=false` と `tools.experimental_request_user_input.enabled=false`）と `model_catalog_json` を入れています。
+  - 何がどのツールを消すかの根拠は `backends/codex.py` の `TOOL_DISABLE_FEATURE_OVERRIDES` と `CATALOG_KEYS_*` にあります。
+  - フラグだけでは、code mode の `exec`、`apply_patch`、`collaboration.*`（`spawn_agent` など）、`clock.*` が残ります。そこで、pin したモデルの項目からそれらを外したモデルカタログを `model_catalog_json` で渡します。
+  - `features.apps=false` が無いと、ログイン済みの `codex_home` では ChatGPT のコネクタ（MCP）のツールが付きます。空の `codex_home` で試すと出ないので注意してください。
+- これらのキーは `TOOL_DISABLE_OVERRIDE_KEYS` と同じ集合です（`tests/test_shipped_config.py` が検査します）。V-2′-control はこのキーをすべて外して走るので、control は CLI の既定（code mode の `exec_command`）でツールを実行し、本番の設定では宣言されるツールがゼロであることを `V-2/3_no_tools_declared` が確かめます。
+
+### カタログを書く
+
+```sh
+python -m lexora.tools.codex_catalog            # codex_home にカタログを書く（600）
+python -m lexora.tools.codex_catalog --check    # 書かずに比べる。違えば exit 1
+python -m lexora.tools.verify_codex             # カタログを書いたら必ずやり直す
+```
+
+- カタログは、インストールされた CLI の同梱カタログ（`codex debug models`、空の `CODEX_HOME` で実行）から pin したモデルだけを取り出し、ツールの項目を編集したものです。context window が `CODEX_MODEL_PIN` と合わなければ書きません（pin を読み直してください）。
+- **カタログの中身の sha256 は config hash に入ります。** カタログを書き直すと `verification_stale` になり、`verify_codex` の `pass` までゲートは閉じます。
+- CLI を上げたときは、`codex_catalog` → `verify_codex` の順にやり直します。
+
+### sandbox の中の DNS
+
+- このホストの `/etc/resolv.conf` は systemd-resolved の `stub-resolv.conf` への symlink です。bwrap は `/run` を入れないので、そのままでは sandbox の中で名前解決ができず、`codex exec` は `workspace routing discovery failed` で落ちます。
+- そのため `codex.ro_binds` に `stub-resolv.conf` のファイル 1 つだけを入れています（同じディレクトリにある resolved の制御ソケットは入れません）。別のホストに移すときは、そのホストの `/etc/resolv.conf` の実体を確かめてください。

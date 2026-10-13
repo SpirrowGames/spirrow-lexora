@@ -206,6 +206,31 @@ routing:
       codex:
         codex_home: "/srv/lexora/codex-home"
         max_concurrency: 1
+        # sandbox の中の DNS (2026-10-13 実測)。このホストの /etc/resolv.conf は
+        # systemd-resolved の stub-resolv.conf への symlink で、bwrap は /run を入れないので
+        # 中では名前解決ができず、codex exec は「workspace routing discovery failed」で落ちる。
+        # ファイル 1 つだけを読み取り専用で入れる (同じディレクトリの resolved の制御ソケットは入れない)。
+        ro_binds:
+          - "/run/systemd/resolve/stub-resolv.conf"
+        # ツールを全部無効にする設定 (2026-10-13 実測、codex-cli 0.160.0)。
+        # naysayer はツール無しで動かす (Takahito の方針、mindwire D8 msg-6050:
+        # auth.json が同じ sandbox にあるので、ファイルを読めるツールがあると読めてしまう)。
+        # apps を切らないと、ログイン済みの codex_home では ChatGPT のコネクタ (MCP) が付く。
+        # フラグだけでは code mode の exec・apply_patch・collaboration.* が残るので、
+        # pin したモデルの項目からそれらを外したカタログ (model_catalog_json) と組み合わせる。
+        # カタログは `python -m lexora.tools.codex_catalog` が codex_home に書く。
+        # カタログの中身の sha256 も config hash に入るので、書き直したら verify_codex をやり直す。
+        # 中身と根拠は backends/codex.py の TOOL_DISABLE_FEATURE_OVERRIDES / CATALOG_KEYS_*。
+        # ここのキーは TOOL_DISABLE_OVERRIDE_KEYS と一致させる (test_shipped_config が検査)。
+        cli_overrides:
+          - 'model_catalog_json="/srv/lexora/codex-home/lexora_model_catalog.json"'
+          - "features.shell_tool=false"
+          - "features.view_image=false"
+          - "features.goals=false"
+          - "features.multi_agent=false"
+          - "tools.experimental_request_user_input.enabled=false"
+          - "features.apps=false"
+          - "features.plugins=false"
 
     # naysayer ティアの実体 (T-naysayer-codex-backend msg-687 E)。
     # mode: fallback — codex が答え、codex が閉じている・枠切れ・失敗した時だけ

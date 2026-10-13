@@ -34,6 +34,12 @@ Verdict:
 * 条件 1: no request the mock received contains the canary value or tool
   output.
 * 条件 2: no tool-execution event on ``--json``.
+* 条件 3: the CLI's first request declares no tool at all -- no top-level
+  ``tools`` and nothing in an ``additional_tools`` item (Takahito's policy,
+  spirrow-mindwire D8 msg-6050: the naysayer runs with every tool off, since
+  ``auth.json`` shares the sandbox). 条件 0-2 only exercise the shell / read
+  tools the control found; this one also covers tools nobody scripted
+  (``apply_patch``, ``spawn_agent``, ...).
 
 **V-2'-control (msg-315 #3, every run).** Before the production-config run,
 the same command runs with a dummy ``CODEX_HOME`` and with only the
@@ -67,7 +73,7 @@ mock), ``ERR+nonce`` absent from the classifier's text, and an
 ``item.started`` of a tool type in the stream. Either assumption failing
 keeps the gate closed.
 
-``pass`` iff V-1 passes, the control executed, 条件 0, 1, 2 all hold and
+``pass`` iff V-1 passes, the control executed, 条件 0, 1, 2, 3 all hold and
 ``V-2'/tool_stderr_isolated`` holds. No model output and no
 tool output is stored; ``checks_json`` holds check names, verdicts and short
 machine details only.
@@ -361,6 +367,28 @@ def _additional_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             out.append(tool)
     return out
+
+
+def declared_tools(raw_request: str) -> list[str] | None:
+    """Every tool one request offers the model, by name (by type for a
+    nameless one): top-level ``tools`` in either wire shape plus the
+    ``additional_tools`` input items. ``None`` when the request is not a JSON
+    object, so an unreadable request can never count as "no tools"."""
+    try:
+        body = json.loads(raw_request)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    names: list[str] = []
+    for tool in [*(body.get("tools") or []), *_additional_tools(body)]:
+        if not isinstance(tool, dict):
+            names.append(repr(tool))
+            continue
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = fn.get("name")
+        names.append(name if isinstance(name, str) and name else str(tool.get("type")))
+    return names
 
 
 def discover_tools(raw_request: str) -> list[ToolSpec]:
@@ -807,6 +835,13 @@ def evaluate_v2(
             f"tool_executed_under_prod_config: {findings.kinds()}" if bad else "",
         )
     )
+    first = next((raw for raw in state.requests if state.nonce in raw), None)
+    declared = declared_tools(first) if first is not None else None
+    if declared is None:
+        detail = "no readable request carried the nonce"
+    else:
+        detail = f"tools_declared_under_prod_config: {declared}" if declared else ""
+    checks.append(Check("V-2/3_no_tools_declared", declared == [], detail))
     return checks
 
 
@@ -927,6 +962,8 @@ async def verify(
     reasons = []
     if "V-2/2_no_tool_events" in failed:
         reasons.append("tool_executed_under_prod_config")
+    if "V-2/3_no_tools_declared" in failed:
+        reasons.append("tools_declared_under_prod_config")
     if "V-2c/tool_executed_under_control" in failed:
         reasons.append("control_tool_not_executed")
     if "V-2'/tool_stderr_isolated" in failed:
