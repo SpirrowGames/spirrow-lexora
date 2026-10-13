@@ -21,6 +21,7 @@ from lexora.backends.codex import (
     CodexAuthError,
     CodexBackend,
     CodexFailed,
+    CodexFailureHold,
     CodexQuotaError,
     CodexUnsupportedInputError,
 )
@@ -317,7 +318,13 @@ class TestCodexFailedFallsBack:
         await _sends(w)
         assert posted and posted[0].startswith("[Lexora naysayer] fallback STARTED: reason=codex_failed ")
 
-    async def test_next_request_skips_codex_during_the_failure_hold(self, tmp_path: Path, wrappers: list) -> None:
+    async def test_next_request_skips_codex_during_the_failure_hold(
+        self, tmp_path: Path, wrappers: list, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR-gate #85: a request refused by the hold is reported as
+        ``failure_hold`` and does NOT log ``naysayer_codex_failed_fallback``
+        (that line is only for a real run's failure and its snippet)."""
+        warnings = self._record_warnings(monkeypatch)
         w = _make(wrappers, tmp_path, "failed")
         await w.chat_completions(REQUEST)
         runs = len(w.primary.state_store.runs())
@@ -327,6 +334,27 @@ class TestCodexFailedFallsBack:
         availability = await w.primary.codex_availability()
         assert availability.reason == "failure_hold"
         assert w.status_fields(availability)["mode"] == "fallback"  # C-3: codex closed reads `fallback`
+        logged = [kw for event, kw in warnings if event == "naysayer_codex_failed_fallback"]
+        assert len(logged) == 1  # the first, real failure only
+        assert "something unforeseen went wrong" in logged[0]["error"]
+
+    async def test_hold_error_reaching_the_wrapper_is_failure_hold_not_codex_failed(
+        self, tmp_path: Path, wrappers: list, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Should a ``CodexFailureHold`` ever be raised by the call itself
+        (not just reported by availability), it still falls back as
+        ``failure_hold`` and logs no snippet line."""
+        warnings = self._record_warnings(monkeypatch)
+        w = _make(wrappers, tmp_path)
+
+        async def held(*_a: Any, **_k: Any) -> Any:
+            raise CodexFailureHold("codex held after an unclassified failure until ...")
+
+        w.primary.chat_completions = held  # type: ignore[method-assign]
+        assert _text(await w.chat_completions(REQUEST)) == GEMINI_TEXT
+        assert w._last_reason == "failure_hold"
+        assert not issubclass(CodexFailureHold, CodexFailed)
+        assert [e for e, _ in warnings if e == "naysayer_codex_failed_fallback"] == []
 
 
     async def test_quota_hold_skips_codex_on_the_next_request(self, tmp_path: Path, wrappers: list) -> None:

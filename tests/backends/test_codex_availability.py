@@ -23,6 +23,7 @@ from lexora.backends.codex import (
     QUOTA_HOLD_FALLBACK,
     CodexBackend,
     CodexFailed,
+    CodexFailureHold,
     CodexLaunchError,
     CodexNotVerifiedError,
     CodexQuotaError,
@@ -337,7 +338,9 @@ class TestFailureHold:
         assert backend._quota_hold_until is None  # not reported as a quota stop
         availability = await backend.codex_availability()
         assert availability.reason == "failure_hold"
-        assert isinstance(availability.error, CodexFailed)
+        # Its own class, never a CodexFailed: no snippet to log (PR-gate #85).
+        assert isinstance(availability.error, CodexFailureHold)
+        assert not isinstance(availability.error, CodexFailed)
         assert availability.quota_hold_until is None
 
     async def test_no_subprocess_during_the_failure_hold(self, tmp_path: Path) -> None:
@@ -347,7 +350,7 @@ class TestFailureHold:
             await backend.chat_completions(REQUEST)
         runs = len(backend.state_store.runs())
         versions = _count_versions(backend)
-        with pytest.raises(CodexFailed, match="held after an unclassified failure"):
+        with pytest.raises(CodexFailureHold, match="held after an unclassified failure"):
             await backend.chat_completions(REQUEST)
         assert len(backend.state_store.runs()) == runs  # codex was not started
         assert versions[0] == 0  # nor `codex --version`
@@ -368,7 +371,7 @@ class TestFailureHold:
         assert backend.state_store.violations() == []  # not a latch
         runs = len(backend.state_store.runs())
         assert (await backend.codex_availability()).reason == "failure_hold"
-        with pytest.raises(CodexFailed, match="held after an unclassified failure"):
+        with pytest.raises(CodexFailureHold, match="held after an unclassified failure"):
             await backend.chat_completions(REQUEST)
         assert len(backend.state_store.runs()) == runs  # codex was not started again
 
