@@ -167,6 +167,12 @@ class TestCodeMode:
         assert {"V-2/1_no_leak_to_model", "V-2/2_no_tool_events", "V-2/0c_refusal_evidence"} <= _names(checks, False)
         assert "tool_executed_under_prod_config" in _note(backend)["fail_reasons"]
 
+    async def test_contained_namespaced_cli_passes(self, tmp_path: Path) -> None:
+        result, checks = await vc.verify(v2_backend(tmp_path, "namespaced"))
+        assert result == "pass", [c for c in checks if not c.ok]
+        sent = next(c for c in checks if c.name == "V-2c/0b_tool_calls_sent")
+        assert sent.detail == "tools=['read_file', 'shell']"
+
     async def test_without_code_mode_discovery_the_control_cannot_execute(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -260,6 +266,26 @@ class TestDiscovery:
         tools = vc.discover_tools(raw)
         assert [(t.name, t.role) for t in tools] == [("view_image", "read")]
         assert 'tools["view_image"]({"path": "/c"})' in vc.calls_for(tools, "/c")[0].arguments["input"]
+
+    def test_namespaced_functions_are_discovered(self) -> None:
+        """A model not in code mode: plain functions inside an
+        ``additional_tools`` namespace, no top-level ``tools`` (PR-gate on
+        #85 @ 27d9ad1, msg-776)."""
+        raw = json.dumps({"input": [{"type": "additional_tools", "tools": [{"type": "namespace", "name": "functions", "tools": [
+            {"type": "function", "name": "exec_command", "parameters": {"properties": {"cmd": {"type": "string"}}}},
+            {"type": "function", "name": "request_user_input"},
+            {"type": "local_shell"},
+        ]}]}]})
+        tools = vc.discover_tools(raw)
+        assert [(t.kind, t.name, t.role) for t in tools] == [("function", "exec_command", "shell"), ("local_shell", "local_shell", "shell")]
+        assert vc.calls_for(tools, "/c")[0].arguments == {"cmd": "cat /c"}
+
+    def test_code_mode_namespace_functions_are_not_shell_or_read(self) -> None:
+        """The functions code mode puts next to ``exec`` (``wait``, ``sleep``,
+        ...) match neither name pattern, so only ``exec``'s nested tools are
+        scripted."""
+        raw = json.dumps({"input": [*fake_cli.CODE_MODE_FIRST_INPUT]})
+        assert [t.kind for t in vc.discover_tools(raw)] == ["code_mode"]
 
     def test_custom_tool_other_than_exec_is_ignored(self) -> None:
         description = "declare const tools: { exec_command(args: {\n  cmd: string;\n}): Promise<unknown>; };"

@@ -396,8 +396,12 @@ def discover_tools(raw_request: str) -> list[ToolSpec]:
 
     Reads ``tools`` in both the Responses shape (``{"type": "function",
     "name", "parameters"}`` / ``{"type": "local_shell"}``) and the chat shape
-    (``{"type": "function", "function": {...}}``), then the nested tools of a
-    code-mode ``exec`` declared in an ``additional_tools`` input item.
+    (``{"type": "function", "function": {...}}``), and the same shapes inside
+    ``additional_tools`` input items. A model that is not in code mode gets
+    its tools there as plain functions under ``namespace: functions``
+    (measured 2026-10-13: a ``function_call`` named ``exec_command``, with no
+    namespace field, runs it). A custom ``exec`` there is code mode: its
+    nested tools are read from its description.
     """
     try:
         body = json.loads(raw_request)
@@ -405,10 +409,14 @@ def discover_tools(raw_request: str) -> list[ToolSpec]:
         return []
     if not isinstance(body, dict):
         return []
-    tools = body.get("tools")
     found: list[ToolSpec] = []
-    for tool in tools or []:
+    for tool in [*(body.get("tools") or []), *_additional_tools(body)]:
         if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "custom":
+            description = tool.get("description")
+            if tool.get("name") == CODE_MODE_ENTRY and isinstance(description, str):
+                found.extend(_code_mode_tools(description))
             continue
         if tool.get("type") == "local_shell":
             found.append(ToolSpec("local_shell", "local_shell", "shell"))
@@ -422,10 +430,6 @@ def discover_tools(raw_request: str) -> list[ToolSpec]:
             found.append(ToolSpec("function", name, "shell", params))
         elif _READ_NAME_RE.search(name):
             found.append(ToolSpec("function", name, "read", params))
-    for tool in _additional_tools(body):
-        description = tool.get("description")
-        if tool.get("type") == "custom" and tool.get("name") == CODE_MODE_ENTRY and isinstance(description, str):
-            found.extend(_code_mode_tools(description))
     return found
 
 
