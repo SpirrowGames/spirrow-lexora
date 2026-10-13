@@ -40,6 +40,7 @@
 |---|---|---|
 | `null` | codex が使える | なし |
 | `quota_hold` | 枠切れのあと、`quota_hold_until` まで codex を止めている | 待つ（その間は Gemini にフォールバック） |
+| `failure_hold` | 分類できない失敗（`CodexFailed`）のあと、5 分 codex を止めている（msg-765 L-2a） | 待つ（その間は Gemini にフォールバック）。繰り返すなら、ログの `naysayer_codex_failed_fallback` の snippet を見る（下の 6 の 4） |
 | `launch_failed` | `codex --version` が動かない | CLI のインストールと PATH を確かめる |
 | `verification_missing` / `verification_stale` | verification が無いか、設定や CLI の版が変わった | `python -m lexora.tools.verify_codex` を通す |
 | `tool_use_violation` / `run_unfinished` | latch 中 | 下の 3 |
@@ -114,9 +115,13 @@
    - `mode`: 次のリクエストが `codex` / `fallback` / `shadow` のどれで処理されるか。
    - `fallback_since`、`fallback_calls`、`fallback_cost_usd`。
    - `codex.codex_disabled_reason`、`codex.quota_hold_until`。
-2. `codex_disabled_reason` が `quota_hold` 以外なら、上の 2 の表に従って対処します。`quota_hold` なら、待てば戻ります。
+2. `codex_disabled_reason` が `quota_hold` / `failure_hold` 以外なら、上の 2 の表に従って対処します。`quota_hold` / `failure_hold` なら、待てば戻ります。
 3. 通知の `reason=auth` は、codex の device login が期限切れか失効していることを表します（msg-498 B-1'）。この理由は `codex_disabled_reason` には出ません。{{HOST_SERVICES}}（[[platform:infra-registry]]）で `codex login --device-auth` をやり直してください。やり直すまでは、リクエストのたびに codex が起動して auth で失敗し、Gemini が答えます。
-4. 期間中の費用は、台帳でも確かめられます。
+4. 通知の `reason=codex_failed` は、codex が分類できない失敗で終わったことを表します（msg-763 / msg-765 L-2）。そのリクエストは Gemini が答え、codex は 5 分止まります（`failure_hold`）。
+   - ログの `naysayer_codex_failed_fallback`（WARNING）に、例外の class 名と stderr の先頭 300 字（`error`）が出ます。
+   - 枠切れの文言（usage limit / rate limit など）が出ているなら、それは `_QUOTA_RE` が拾えなかった本物の枠切れです。その snippet を添えて、`_QUOTA_RE` と `parse_reset_at` を直すスレッドを切ってください。それまでは 5 分ごとに 1 回 codex が落ちて Gemini が答えるだけで、答えは止まりません。
+   - 枠切れでない文言が繰り返すなら、snippet をもとに原因を調べます。
+5. 期間中の費用は、台帳でも確かめられます。
 
    ```sh
    sqlite3 data/costs.db "SELECT COUNT(*), SUM(cost_usd) FROM request_costs WHERE answered_by='gemini-fallback' AND timestamp >= '<fallback_since>';"
@@ -124,6 +129,7 @@
 
 ## 7. shadow モードと `shadow_report`（msg-448 B-5）
 
+- **出荷時の mode は `fallback` です**（2026-10-13、msg-762 / msg-763 L-1）。codex が答え、codex が閉じている間だけ Gemini が答えます。`shadow` は、比較を取り直すときにだけ使います（`config/lexora_config.yaml` の `naysayer-codex.fallback.mode`）。
 - `mode: shadow` のとき、答えを返すのは常に Gemini です。codex は、同じリクエストを裏で 1 本まで走らせます。
 - 結果は `data/costs.db` の `shadow_comparisons` に、verdict と所要時間だけが残ります。本文は残りません。
 - 集計を出すには、次を実行します。
@@ -181,3 +187,57 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 - 期限の 7 日前から、フォールバック通知と同じ webhook に、UTC の 1 日 1 回、`data controls EXPIRING: codex stops in N day(s)` が届きます。
 - 送ったことはメモリに持っています。その日のうちに Lexora を再起動すると、同じ日にもう 1 回届くことがあります。送信に失敗したときは、10 分後の確認でもう一度送ります。
 - 期限が切れた後は予告は止まり、上のフォールバック通知（STARTED、6 時間ごとの CONTINUING、ENDED）に替わります。shadow モードでは Gemini が答えるのでフォールバック通知は出ません。止まっている間は、`shadow_report` の `codex_not_run` に `data_controls_unverified` として数えられます。
+
+## 9. codex を primary に切り替える手順（msg-763 / msg-765）
+
+出典: `T-naysayer-codex-backend` の msg-762（Takahito の Tier-C 判断）、msg-763（手順）、msg-765（`failure_hold` と C-3 の注）、Einstein の承認。
+ホスト上の作業は Takahito が {{HOST_SERVICES}}（[[platform:infra-registry]]）で行います。
+
+### 順序と fail-closed の窓
+
+- 順序は **Lexora の deploy が先、mindwire の #463/#464 の main merge と mindwire の deploy が後** です（#463 の HOLD 条件 (i′) が「本番 Lexora が fallback で動き、status が `codex_disabled_reason: null`」のため）。
+- その間は、codex が答えた行が旧 mindwire（`expected=gemini`）の attestation で落ち、naysayer の呼び出しが fail closed になります。間違った verdict が通ることはなく、gate や design レビューが止まって後でやり直されるだけです。
+- 窓を短くするため、ホスト上の作業（フェーズ 0）はすべて切り替えの前に shadow のまま済ませ、フェーズ 1 は 1 回の作業で続けて行い、naysayer の呼び出しが流れていない時間帯を選びます。
+
+### フェーズ 0: 切り替えの前（shadow のまま。費用は変わらない）
+
+- **H-1**（msg-267）: ChatGPT Pro $100 を契約し、ChatGPT のセキュリティ設定で device code 認証を有効にします。済んでいれば飛ばします。
+- **H-2**: Lexora の**サービスユーザ**として、設定の `codex_home` にログインします。`~/.codex` にログインしても Lexora からは見えません。
+
+  ```sh
+  CODEX_HOME="<config/lexora_config.yaml の codex.codex_home>" codex login --device-auth
+  codex --version   # 0.160.0 であること（CODEX_MODEL_PIN と同梱カタログの前提）
+  ```
+
+  - `auth.json` はパスワードと同じ扱いです（リポジトリ・ログ・チャットに出さない）。
+- **H-3**（上の 8）: データ設定を確かめ、`data/codex_data_controls.yaml` に記録します。30 日ごとに繰り返す作業で、期限の 7 日前から webhook に予告が届きます。
+- **H-4**（上の 2）: `python -m lexora.tools.verify_codex` で `pass` を取り、status が `mode: shadow`、`codex.codex_disabled_reason: null` になることを確かめます。
+  - V-2′-control（tool を有効にした dummy home で tool が実際に走ること）は毎回の実行に組み込まれています。別に手で撃つ必要はありません。
+  - `mode` は codex の config hash に入っていないので、ここで取った `pass` は fallback への切り替え後も `verification_stale` になりません。
+- **H-5**（上の 6）: `systemctl cat lexora` で `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` があること、起動ログに `fallback_webhook_unset` が出ていないことを確かめます。書き足したら上の 1 の手順で再起動します。
+- **H-6**（上の 7）: 数時間たったら `python -m lexora.tools.shadow_report --db data/costs.db` を実行し、次をすべて満たすことを確かめます。**これが切り替えに進む条件です。**
+  - `compared` が 5 件以上ある。
+  - `codex_failures` に `tool_use_violation`、`unverifiable_run`、`CodexFailed`（`codex_failed`）が無い。
+  - status の `codex.codex_disabled_reason` が `failure_hold` を繰り返していない。
+
+### フェーズ 1: 切り替え（1 回の作業で続けて行う）
+
+- **C-1**: Lexora のリリース PR（`naysayer-codex` を `mode: fallback` にするもの）を main に merge します。
+- **C-2**（上の 1）: `codex.inflight_runs == 0` を確かめてから、Lexora の deploy request を出します（前回の deploy と同じ経路）。
+- **C-3**: status が `mode: codex`、`codex.codex_disabled_reason: null` になることを確かめます。ならなければ、下のロールバックに進みます。
+  - 注: status の `mode` は設定の値ではなく、**次のリクエストの経路**を返します（`fallback.py` の `status_fields`）。設定が `fallback` で codex が開いていれば `codex` になります。`codex` なら成功、`fallback` なら codex が閉じています（`codex_disabled_reason` を見る）。
+- **C-4**: mindwire の #463/#464 を main に merge し、mindwire を deploy します。
+- **C-5**: 最初の naysayer の呼び出しで、台帳に `answered_by='codex'` の行ができ、tokens が 0 でないこと、mindwire の attestation が通ることを確かめます。
+
+  ```sh
+  sqlite3 data/costs.db "SELECT id, backend, answered_by, tokens_input, tokens_output FROM request_costs ORDER BY id DESC LIMIT 5;"
+  ```
+
+### ロールバック
+
+- C-3 で `mode: codex` かつ `codex_disabled_reason: null` にならなければ、#463/#464 は merge しません。
+- Lexora を直前の deploy（shadow）に戻します。戻せば旧 mindwire と組み合わせて元どおり動きます。
+
+### 実際に枠が切れるまで確かめられないこと
+
+- 枠切れのときの stderr の文言と、リセット時刻の書式です。文言が想定と違っても、その失敗は `CodexFailed` として Gemini に落ち、通知は `reason=codex_failed` で届きます（上の 6 の 4）。そうなったら、ログの snippet をもとに `_QUOTA_RE` と `parse_reset_at` を直す別スレッドを切ります。

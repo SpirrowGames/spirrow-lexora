@@ -19,8 +19,10 @@ import pytest
 
 from lexora.backends import codex as codex_mod
 from lexora.backends.codex import (
+    CODEX_FAILED_HOLD,
     QUOTA_HOLD_FALLBACK,
     CodexBackend,
+    CodexFailed,
     CodexLaunchError,
     CodexNotVerifiedError,
     CodexQuotaError,
@@ -315,6 +317,74 @@ class TestQuotaHold:
         assert (await backend.codex_availability()).reason == "quota_hold"
         await asyncio.sleep(0.2)
         await backend.chat_completions(REQUEST)
+
+
+class TestFailureHold:
+    """msg-765 L-2a: an unclassified ``CodexFailed`` holds codex for 5 minutes
+    as ``failure_hold`` (msg-267 scope 2's short backoff), apart from the
+    quota hold."""
+
+    async def test_codex_failed_run_holds_five_minutes(self, tmp_path: Path) -> None:
+        assert CODEX_FAILED_HOLD == timedelta(minutes=5)
+        backend = make_backend(tmp_path, "failed")
+        record_pass(backend)
+        before = datetime.now(timezone.utc)
+        with pytest.raises(CodexFailed):
+            await backend.chat_completions(REQUEST)
+        hold = backend._failure_hold_until
+        assert hold is not None
+        assert before + CODEX_FAILED_HOLD <= hold <= datetime.now(timezone.utc) + CODEX_FAILED_HOLD
+        assert backend._quota_hold_until is None  # not reported as a quota stop
+        availability = await backend.codex_availability()
+        assert availability.reason == "failure_hold"
+        assert isinstance(availability.error, CodexFailed)
+        assert availability.quota_hold_until is None
+
+    async def test_no_subprocess_during_the_failure_hold(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "failed")
+        record_pass(backend)
+        with pytest.raises(CodexFailed):
+            await backend.chat_completions(REQUEST)
+        runs = len(backend.state_store.runs())
+        versions = _count_versions(backend)
+        with pytest.raises(CodexFailed, match="held after an unclassified failure"):
+            await backend.chat_completions(REQUEST)
+        assert len(backend.state_store.runs()) == runs  # codex was not started
+        assert versions[0] == 0  # nor `codex --version`
+
+    async def test_exit0_without_a_final_message_holds_too(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        before = datetime.now(timezone.utc)
+        backend._hold_for_failure(CodexFailed("codex exec exited 0 without a final message"))
+        hold = backend._failure_hold_until
+        assert hold is not None and hold >= before + CODEX_FAILED_HOLD
+
+    async def test_failure_hold_ends_by_time(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "ok")
+        record_pass(backend)
+        backend._failure_hold_until = datetime.now(timezone.utc) + timedelta(milliseconds=100)
+        assert (await backend.codex_availability()).reason == "failure_hold"
+        await asyncio.sleep(0.2)
+        assert (await backend.codex_availability()).open
+        await backend.chat_completions(REQUEST)  # codex is tried again
+
+    async def test_failure_never_shortens_a_quota_hold(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        record_pass(backend)
+        reset = datetime.now(timezone.utc) + timedelta(hours=3)
+        backend._hold_for_quota(CodexQuotaError("limit", reset))
+        backend._hold_for_failure(CodexFailed("unclassified"))
+        assert backend._quota_hold_until == reset
+        availability = await backend.codex_availability()
+        assert availability.reason == "quota_hold"  # the recognised stop is reported
+        assert availability.quota_hold_until == reset
+
+    async def test_failure_hold_only_extends(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path)
+        later = datetime.now(timezone.utc) + timedelta(hours=1)
+        backend._failure_hold_until = later
+        backend._hold_for_failure(CodexFailed("unclassified"))
+        assert backend._failure_hold_until == later
 
 
 class TestSubprocessReaping:

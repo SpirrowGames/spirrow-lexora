@@ -43,15 +43,16 @@ REPO_CONFIG = Path(__file__).parent.parent / "config" / "lexora_config.yaml"
 class TestNaysayerRouteInvariance:
     """The naysayer tier resolution must survive the frontier tier addition."""
 
-    def test_shipped_config_naysayer_backend_is_gemini(self) -> None:
-        """Since T-naysayer-codex-backend msg-687 E the naysayer tier goes
-        through the fallback wrapper in shadow mode, whose answering side is
-        still the `gemini` backend; `naysayer-gemini` is the direct route."""
+    def test_shipped_config_naysayer_is_codex_with_gemini_fallback(self) -> None:
+        """The naysayer tier goes through the fallback wrapper (msg-687 E) in
+        fallback mode since T-naysayer-codex-backend msg-763 L-1: codex
+        answers, the `gemini` backend answers only when codex is closed;
+        `naysayer-gemini` is the direct route."""
         settings = create_settings(REPO_CONFIG)
         assert settings.routing.tiers["naysayer"].backend == "naysayer-codex"
         wrapper = settings.routing.backends["naysayer-codex"].fallback
         assert wrapper is not None
-        assert (wrapper.mode, wrapper.fallback) == ("shadow", "gemini")
+        assert (wrapper.mode, wrapper.primary, wrapper.fallback) == ("fallback", "codex", "gemini")
         assert settings.routing.tiers["naysayer-gemini"].backend == "gemini"
 
     def test_shipped_config_naysayer_model_is_gemini_31_pro(self) -> None:

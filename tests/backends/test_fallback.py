@@ -194,6 +194,7 @@ class TestFallbackDecision:
             pytest.param("quota", True, "quota", id="quota"),
             pytest.param("tool_use", True, "tool_use_violation", id="latch"),
             pytest.param("exit0_no_terminal", True, "unverifiable_run", id="unverifiable-latch"),
+            pytest.param("failed", True, "codex_failed", id="unclassified"),
         ],
     )
     async def test_falls_back_to_gemini(
@@ -245,27 +246,87 @@ class TestFallbackDecision:
         assert len(posted) == 1
         assert posted[0].startswith("[Lexora naysayer] fallback STARTED: reason=auth ")
 
-    @pytest.mark.parametrize(
-        "exc",
-        [CodexFailed("unclassified"), CodexUnsupportedInputError("bad input")],
-        ids=["failed", "unsupported-input"],
-    )
-    async def test_unclassified_and_caller_errors_do_not_fall_back(
-        self, tmp_path: Path, wrappers: list, exc: Exception
-    ) -> None:
-        """B-1': an unknown failure is not hidden behind Gemini, and a caller
-        error stays the caller's."""
+    async def test_caller_error_does_not_fall_back(self, tmp_path: Path, wrappers: list) -> None:
+        """B-1': a caller error stays the caller's."""
         w = _make(wrappers, tmp_path)
+        exc = CodexUnsupportedInputError("bad input")
 
         async def fails(*_a: Any, **_k: Any) -> Any:
             raise exc
 
         w.primary.chat_completions = fails  # type: ignore[method-assign]
-        with pytest.raises(type(exc)):
+        with pytest.raises(CodexUnsupportedInputError):
             await w.chat_completions(REQUEST)
         assert w.fallback.calls == []  # type: ignore[attr-defined]
-        assert not issubclass(type(exc), FALLBACK_ERRORS)
+        assert not issubclass(CodexUnsupportedInputError, FALLBACK_ERRORS)
         assert issubclass(CodexAuthError, FALLBACK_ERRORS)
+        assert issubclass(CodexFailed, FALLBACK_ERRORS)
+
+
+class TestCodexFailedFallsBack:
+    """msg-763 / msg-765 L-2: an unclassified ``CodexFailed`` (e.g. a window
+    exhaustion whose ASSUMED wording ``_QUOTA_RE`` misses) is answered by
+    Gemini, said in the notice (``reason=codex_failed``), logged with its
+    snippet, and holds codex for 5 minutes (``failure_hold``)."""
+
+    @staticmethod
+    def _record_warnings(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any]]]:
+        from lexora.backends import fallback as fallback_mod
+
+        seen: list[tuple[str, dict[str, Any]]] = []
+        real = fallback_mod.logger
+
+        class Recorder:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real, name)
+
+            def warning(self, event: str, **kw: Any) -> None:
+                seen.append((event, kw))
+                real.warning(event, **kw)
+
+        monkeypatch.setattr(fallback_mod, "logger", Recorder())
+        return seen
+
+    async def test_chat_falls_back_with_notice_and_snippet_log(
+        self, tmp_path: Path, wrappers: list, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        warnings = self._record_warnings(monkeypatch)
+        w = _make(wrappers, tmp_path, "failed")
+        posted = _capture_posts(w)
+        assert _text(await w.chat_completions(REQUEST)) == GEMINI_TEXT
+        route = current_answer_route()
+        assert route is not None and route.answered_by == "gemini-fallback"
+        assert w._last_reason == "codex_failed"
+        await _sends(w)
+        assert len(posted) == 1
+        assert posted[0].startswith("[Lexora naysayer] fallback STARTED: reason=codex_failed ")
+        logged = [kw for event, kw in warnings if event == "naysayer_codex_failed_fallback"]
+        assert len(logged) == 1
+        assert logged[0]["error_class"] == "CodexFailed"
+        assert "something unforeseen went wrong" in logged[0]["error"]
+
+    async def test_stream_falls_back_before_the_first_byte(self, tmp_path: Path, wrappers: list) -> None:
+        w = _make(wrappers, tmp_path, "failed")
+        posted = _capture_posts(w)
+        body = b"".join(await _drain(w.chat_completions_stream(REQUEST, UsageSink())))
+        assert b"VERDICT: APPROVE" in body and b"REVIEW" not in body
+        route = current_answer_route()
+        assert route is not None and route.answered_by == "gemini-fallback"
+        assert w._last_reason == "codex_failed"
+        await _sends(w)
+        assert posted and posted[0].startswith("[Lexora naysayer] fallback STARTED: reason=codex_failed ")
+
+    async def test_next_request_skips_codex_during_the_failure_hold(self, tmp_path: Path, wrappers: list) -> None:
+        w = _make(wrappers, tmp_path, "failed")
+        await w.chat_completions(REQUEST)
+        runs = len(w.primary.state_store.runs())
+        assert _text(await w.chat_completions(REQUEST)) == GEMINI_TEXT
+        assert len(w.primary.state_store.runs()) == runs  # codex not started
+        assert w._last_reason == "failure_hold"
+        availability = await w.primary.codex_availability()
+        assert availability.reason == "failure_hold"
+        assert w.status_fields(availability)["mode"] == "fallback"  # C-3: codex closed reads `fallback`
+
 
     async def test_quota_hold_skips_codex_on_the_next_request(self, tmp_path: Path, wrappers: list) -> None:
         w = _make(wrappers, tmp_path, "quota")

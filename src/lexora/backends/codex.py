@@ -744,6 +744,12 @@ class ExecProgress:
 #: Hold after a quota failure whose reset time could not be parsed
 #: (``parse_reset_at`` returned ``None``; msg-329 / PR-2).
 QUOTA_HOLD_FALLBACK = timedelta(minutes=15)
+#: Hold after an unclassified ``CodexFailed`` (T-naysayer-codex-backend
+#: msg-765 L-2a): msg-267 scope 2's "short backoff" when nothing tells us
+#: when to retry. Shorter than ``QUOTA_HOLD_FALLBACK`` because a
+#: ``CodexFailed`` may be a one-off; a real but unrecognised window
+#: exhaustion then costs one failed attempt per 5 minutes.
+CODEX_FAILED_HOLD = timedelta(minutes=5)
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
@@ -774,8 +780,8 @@ class CodexAvailability:
     and ``GET /v1/naysayer/status`` both read this, so they cannot disagree
     (Principle 2). ``reason`` is ``None`` when codex may run; otherwise it is
     the ``CodexNotVerifiedError.reason`` of the check that closed (including
-    ``data_controls_unverified``), or ``quota_hold`` / ``slot_hold`` /
-    ``launch_failed``. ``error`` is the exception the
+    ``data_controls_unverified``), or ``quota_hold`` / ``failure_hold`` /
+    ``slot_hold`` / ``launch_failed``. ``error`` is the exception the
     request path raises for that reason. ``quota_hold_until`` is reported
     whatever ``reason`` is, so a DB fault during a hold hides neither.
     ``version`` is the CLI version when open (it goes on the latch row).
@@ -841,6 +847,11 @@ class CodexBackend(Backend):
         # quota failure. A restart forgets it, which costs one codex attempt
         # that fails with quota again and re-sets it.
         self._quota_hold_until: datetime | None = None
+        # msg-765 L-2a: the same kind of in-memory hold, set after an
+        # unclassified ``CodexFailed`` for ``CODEX_FAILED_HOLD``. Kept apart
+        # from the quota hold so status tells a real (recognised) window
+        # exhaustion from an unknown failure (``failure_hold``).
+        self._failure_hold_until: datetime | None = None
         # msg-687 B: set when a request gave up waiting for the slot while
         # another run held it; cleared by that run when it gives the slot
         # back (``_execute``'s ``finally``). (monotonic time it was set, the
@@ -1085,6 +1096,10 @@ class CodexBackend(Backend):
            a quota stop.
         2. An active quota hold -> ``quota_hold``; ``codex --version`` is not
            started.
+        2a. An active failure hold -> ``failure_hold`` (msg-765 L-2a): an
+           unclassified ``CodexFailed`` happened less than
+           ``CODEX_FAILED_HOLD`` ago. After the quota hold, so a recognised
+           window exhaustion is reported as such.
         2b. An active slot hold -> ``slot_hold`` (msg-687 B): a request gave
            up waiting while another run holds the only slot, and that run
            has not given it back yet. Kept apart from ``quota_hold`` so the
@@ -1115,6 +1130,12 @@ class CodexBackend(Backend):
                 f"codex held after a usage-window failure until {hold.isoformat()}", hold
             )
             return CodexAvailability("quota_hold", error, quota_hold_until=hold)
+        failure_hold = self._failure_hold_until
+        if failure_hold is not None and failure_hold > datetime.now(timezone.utc):
+            error = CodexFailed(
+                f"codex held after an unclassified failure until {failure_hold.isoformat()}"
+            )
+            return CodexAvailability("failure_hold", error)
         slot = self._slot_hold
         if slot is not None:
             set_at, bound = slot
@@ -1143,6 +1164,17 @@ class CodexBackend(Backend):
         if self._quota_hold_until is None or until > self._quota_hold_until:
             self._quota_hold_until = until
         logger.warning("codex_quota_hold", backend=self.name, until=self._quota_hold_until.isoformat())
+
+    def _hold_for_failure(self, error: CodexFailed) -> None:
+        """Hold codex for ``CODEX_FAILED_HOLD`` after an unclassified failure
+        (msg-765 L-2a). Only ever extends, like ``_hold_for_quota``; the quota
+        hold is a separate field and is never touched here."""
+        until = datetime.now(timezone.utc) + CODEX_FAILED_HOLD
+        if self._failure_hold_until is None or until > self._failure_hold_until:
+            self._failure_hold_until = until
+        logger.warning(
+            "codex_failure_hold", backend=self.name, until=self._failure_hold_until.isoformat(), error=str(error)
+        )
 
     # ---- execution ---------------------------------------------------
 
@@ -1398,11 +1430,15 @@ class CodexBackend(Backend):
             if pending is not None:
                 if isinstance(pending, CodexQuotaError):
                     self._hold_for_quota(pending)
+                elif isinstance(pending, CodexFailed):
+                    self._hold_for_failure(pending)
                 raise pending
             assert run is not None
             text = run.last_message if run.last_message is not None else last_agent_message(run.events)
             if text is None:
-                raise CodexFailed("codex exec exited 0 without a final message")
+                missing = CodexFailed("codex exec exited 0 without a final message")
+                self._hold_for_failure(missing)
+                raise missing
             return text, usage_from_events(run.events)
         finally:
             self._in_flight.discard(run_seq)

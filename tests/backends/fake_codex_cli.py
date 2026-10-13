@@ -16,6 +16,8 @@ Scenarios for the backend:
                        (D-1c must treat it as an execution, msg-315 #4).
 * ``quota``         -- ASSUMED usage-limit wording on stderr, exit 1.
 * ``auth``          -- ASSUMED not-logged-in wording on stderr, exit 1.
+* ``failed``        -- ``turn.failed`` with wording no classifier knows,
+                       exit 1: an unclassified ``CodexFailed`` (msg-765 L-2).
 * ``sleep``         -- never finishes (timeout / cancellation path); appends a
                        byte to ``$CODEX_HOME/ticks`` every 50 ms, so a test can
                        tell whether the process is still alive.
@@ -278,6 +280,10 @@ def main() -> int:
         return 1
     if scenario == "quota":
         sys.stderr.write("ERROR: You've hit your usage limit. Try again in 2 hours 5 minutes.\n")
+        return 1
+    if scenario == "failed":
+        emit({"type": "turn.failed", "error": {"message": "something unforeseen went wrong"}})
+        sys.stderr.write("ERROR: something unforeseen went wrong\n")
         return 1
     if scenario == "auth":
         sys.stderr.write("ERROR: Not logged in. Run `codex login` to authenticate.\n")
