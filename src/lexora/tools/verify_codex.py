@@ -72,6 +72,19 @@ keeps the gate closed.
 tool output is stored; ``checks_json`` holds check names, verdicts and short
 machine details only.
 
+**Code mode (measured 2026-10-13, codex-cli 0.160.0, gpt-6.1-sol).** A model
+whose catalog entry says ``tool_mode: code_mode_only`` gets no top-level
+``tools`` at all. The CLI declares one freeform custom tool, ``exec``, inside
+an ``additional_tools`` input item (under a ``namespace``), and ``exec``'s
+description carries a TypeScript declaration for every nested tool
+(``exec_command``, ``view_image``, ...). The model calls a nested tool by
+sending ``exec`` JavaScript such as ``await tools.exec_command({cmd: ...})``.
+``discover_tools`` reads those declarations, and ``calls_for`` turns each
+scripted call into a ``custom_tool_call`` of ``exec``. Measured on the
+control run: a nested ``exec_command`` emits ``item.started`` and
+``item.completed`` of type ``command_execution`` on ``--json``, and its
+result comes back as a ``custom_tool_call_output``.
+
 Wire-format details (tool names, event shapes, refusal wording) are ASSUMED
 until measured after login; the go/no-go conditions in msg-294 decide what
 happens if they turn out not to exist.
@@ -273,15 +286,19 @@ async def run_v1(backend: CodexBackend, extra_hidden: Sequence[str] = ()) -> lis
 class ToolSpec:
     """A tool the mock will ask the CLI to run.
 
-    ``kind`` is ``function`` or ``local_shell``; ``role`` is ``shell`` or
-    ``read``; ``schema`` is the tool's JSON-schema ``parameters`` as the CLI
-    declared it (empty for the fallback set).
+    ``kind`` is ``function``, ``local_shell`` or ``code_mode``; ``role`` is
+    ``shell`` or ``read``; ``schema`` is the tool's JSON-schema
+    ``parameters`` as the CLI declared it (empty for the fallback set; for a
+    ``code_mode`` tool, the property names and array-or-not read from its
+    TypeScript declaration). ``entry`` is set only for ``code_mode``: the
+    custom tool (``exec``) whose JavaScript calls this nested tool.
     """
 
     kind: str
     name: str
     role: str
     schema: dict[str, Any] = field(default_factory=dict)
+    entry: str = ""
 
 
 #: Used only when the CLI's first request declares no recognisable tool.
@@ -297,18 +314,70 @@ _SHELL_NAME_RE = re.compile(r"shell|exec|command|bash|run", re.IGNORECASE)
 _READ_NAME_RE = re.compile(r"read|view|open|cat|file", re.IGNORECASE)
 
 
+#: The freeform custom tool that runs code-mode JavaScript (see the module
+#: docstring). Measured name on codex-cli 0.160.0.
+CODE_MODE_ENTRY = "exec"
+
+#: One nested tool in ``exec``'s description: ``declare const tools: {
+#: NAME(<parameters>): Promise<...>; };``. ``<parameters>`` is ``args: {
+#: ... }`` (one ``key?: type;`` per line, with ``//`` comments) or
+#: ``input: string`` for a freeform tool.
+_CODE_MODE_DECL_RE = re.compile(r"declare const tools: \{ ([A-Za-z_$][\w$]*)\((.*?)\): Promise<", re.DOTALL)
+_CODE_MODE_PROP_RE = re.compile(r"^\s*([A-Za-z_$][\w$]*)\??:\s*([^;\n]+);", re.MULTILINE)
+
+
+def _code_mode_tools(description: str) -> list[ToolSpec]:
+    """Shell-like and read-like nested tools declared in ``exec``'s description."""
+    found: list[ToolSpec] = []
+    for name, params in _CODE_MODE_DECL_RE.findall(description):
+        props = {
+            key: {"type": "array" if ("Array<" in typ or typ.rstrip().endswith("[]")) else typ.strip()}
+            for key, typ in _CODE_MODE_PROP_RE.findall(params)
+        }
+        schema = {"properties": props}
+        if _SHELL_NAME_RE.search(name):
+            found.append(ToolSpec("code_mode", name, "shell", schema, entry=CODE_MODE_ENTRY))
+        elif _READ_NAME_RE.search(name):
+            found.append(ToolSpec("code_mode", name, "read", schema, entry=CODE_MODE_ENTRY))
+    return found
+
+
+def _additional_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every tool in the request's ``additional_tools`` input items, with
+    ``namespace`` entries flattened (code mode declares ``exec`` this way)."""
+    out: list[dict[str, Any]] = []
+    stack: list[Any] = [
+        tool
+        for item in body.get("input") or []
+        if isinstance(item, dict) and item.get("type") == "additional_tools"
+        for tool in item.get("tools") or []
+    ]
+    while stack:
+        tool = stack.pop(0)
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "namespace":
+            stack[:0] = list(tool.get("tools") or [])
+        else:
+            out.append(tool)
+    return out
+
+
 def discover_tools(raw_request: str) -> list[ToolSpec]:
     """Shell-like and file-read-like tools declared in the CLI's request.
 
     Reads ``tools`` in both the Responses shape (``{"type": "function",
     "name", "parameters"}`` / ``{"type": "local_shell"}``) and the chat shape
-    (``{"type": "function", "function": {...}}``).
+    (``{"type": "function", "function": {...}}``), then the nested tools of a
+    code-mode ``exec`` declared in an ``additional_tools`` input item.
     """
     try:
         body = json.loads(raw_request)
     except json.JSONDecodeError:
         return []
-    tools = body.get("tools") if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        return []
+    tools = body.get("tools")
     found: list[ToolSpec] = []
     for tool in tools or []:
         if not isinstance(tool, dict):
@@ -325,13 +394,17 @@ def discover_tools(raw_request: str) -> list[ToolSpec]:
             found.append(ToolSpec("function", name, "shell", params))
         elif _READ_NAME_RE.search(name):
             found.append(ToolSpec("function", name, "read", params))
+    for tool in _additional_tools(body):
+        description = tool.get("description")
+        if tool.get("type") == "custom" and tool.get("name") == CODE_MODE_ENTRY and isinstance(description, str):
+            found.extend(_code_mode_tools(description))
     return found
 
 
 @dataclass
 class ScriptedCall:
     call_id: str
-    kind: str  # "function_call" | "local_shell_call"
+    kind: str  # "function_call" | "local_shell_call" | "custom_tool_call"
     name: str
     arguments: dict[str, Any]
 
@@ -373,6 +446,16 @@ def _read_arguments(tool: ToolSpec, path: str) -> dict[str, Any]:
     return {"path": path}
 
 
+def code_mode_input(tool: ToolSpec, arguments: dict[str, Any]) -> str:
+    """``exec`` JavaScript calling the nested ``tool`` once and returning what
+    it returned (as text) to the model. Name and arguments go in as JSON, so
+    nothing in them is parsed as code."""
+    return (
+        f"const r = await tools[{json.dumps(tool.name)}]({json.dumps(arguments)});\n"
+        'text(typeof r === "string" ? r : JSON.stringify(r));'
+    )
+
+
 def calls_for(
     tools: Sequence[ToolSpec], canary_path: str, stderr_probe_nonce: str | None = None
 ) -> list[ScriptedCall]:
@@ -388,7 +471,17 @@ def calls_for(
         shell_argvs.append(stderr_probe_argv(stderr_probe_nonce))
     calls: list[ScriptedCall] = []
     for tool in tools:
-        if tool.kind == "local_shell":
+        if tool.kind == "code_mode":
+            arg_sets = (
+                [_shell_arguments(tool, argv) for argv in shell_argvs]
+                if tool.role == "shell"
+                else [_read_arguments(tool, canary_path)]
+            )
+            for arguments in arg_sets:
+                calls.append(
+                    ScriptedCall(cid(), "custom_tool_call", tool.entry, {"input": code_mode_input(tool, arguments)})
+                )
+        elif tool.kind == "local_shell":
             for argv in shell_argvs:
                 calls.append(ScriptedCall(cid(), "local_shell_call", tool.name, {"command": argv}))
         elif tool.role == "shell":
@@ -430,6 +523,15 @@ def responses_tool_stream(calls: Sequence[ScriptedCall]) -> bytes:
                 "call_id": call.call_id,
                 "status": "completed",
                 "action": {"type": "exec", **call.arguments},
+            }
+        elif call.kind == "custom_tool_call":
+            item = {
+                "type": "custom_tool_call",
+                "id": f"ctc_{index}",
+                "call_id": call.call_id,
+                "name": call.name,
+                "input": call.arguments["input"],
+                "status": "completed",
             }
         else:
             item = {
