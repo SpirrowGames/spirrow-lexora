@@ -16,6 +16,11 @@ Scenarios for the backend:
                        (D-1c must treat it as an execution, msg-315 #4).
 * ``quota``         -- ASSUMED usage-limit wording on stderr, exit 1.
 * ``auth``          -- ASSUMED not-logged-in wording on stderr, exit 1.
+* ``exit0_no_message`` -- ``turn.completed``, exit 0, but no ``agent_message``
+                       and no ``--output-last-message`` file: the
+                       "exited 0 without a final message" ``CodexFailed``.
+* ``failed``        -- ``turn.failed`` with wording no classifier knows,
+                       exit 1: an unclassified ``CodexFailed`` (msg-765 L-2).
 * ``sleep``         -- never finishes (timeout / cancellation path); appends a
                        byte to ``$CODEX_HOME/ticks`` every 50 ms, so a test can
                        tell whether the process is still alive.
@@ -29,7 +34,9 @@ Scenarios for the backend:
 Scenarios for V-2'-control and V-2' (talk to the mock model named by the
 provider override). The CLI declares ``shell`` and ``read_file`` in its first
 request. ``DISABLE_FLAG`` among the ``-c`` overrides is the stand-in for the
-real (unmeasured) tool-disabling setting; the control run drops it.
+real tool-disabling setting; the control run drops it. With the flag, the
+contained scenarios declare no tool at all, as the real CLI does under the
+shipped overrides (V-2/3); ``executes`` and ``crash`` still declare theirs.
 
 * ``contained``   -- runs its tools only when the flag is absent: control
                      executes, production refuses -> pass.
@@ -44,6 +51,18 @@ real (unmeasured) tool-disabling setting; the control run drops it.
                       own stderr -> ``V-2'/tool_stderr_isolated`` fails.
 * ``no_item_started`` -- like ``contained``, but reports tool runs only as
                       ``item.completed`` -> ``V-2'/tool_stderr_isolated`` fails.
+* ``code_mode``    -- like ``contained``, but in the shape codex-cli 0.160.0
+                      uses for a ``code_mode_only`` model (measured
+                      2026-10-13): no top-level ``tools``; one custom tool
+                      ``exec`` inside an ``additional_tools`` input item,
+                      whose description declares the nested tools. Only a
+                      ``custom_tool_call`` of ``exec`` reaches a tool; any
+                      other call is "unsupported call". Responses wire only.
+* ``code_mode_executes`` -- ``code_mode`` that always runs its tools.
+* ``namespaced``   -- like ``contained``, but the tools come as plain
+                      functions inside an ``additional_tools`` namespace with
+                      no top-level ``tools`` (the measured shape for a model
+                      that is not in code mode). Responses wire only.
 
 A tool run emits ``item.started`` then ``item.completed`` (ASSUMED order).
 The stderr probe (``sh -c <script> lexora-probe OUT NONCE ERR NONCE``) is
@@ -56,6 +75,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import sys
@@ -69,6 +89,65 @@ TOOL_DECLARATIONS = [
     {"type": "function", "name": "shell", "parameters": {"type": "object", "properties": {"command": {"type": "array", "items": {"type": "string"}}}}},
     {"type": "function", "name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
 ]
+
+
+#: Trimmed copy of ``exec``'s description as codex-cli 0.160.0 sends it.
+CODE_MODE_DESCRIPTION = """Run JavaScript code to orchestrate/compose tool calls
+- All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`.
+
+### `apply_patch`
+The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.
+
+exec tool declaration:
+```ts
+declare const tools: { apply_patch(input: string): Promise<unknown>; };
+```
+
+### `exec_command`
+Runs a command in a PTY, returning output or a session ID for ongoing interaction.
+
+exec tool declaration:
+```ts
+declare const tools: { exec_command(args: {
+  // Shell command to execute.
+  cmd: string;
+  // True runs the shell with -l/-i semantics; false disables them. Defaults to true.
+  login?: boolean;
+  // Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"].
+  prefix_rule?: Array<string>;
+}): Promise<{
+  // Process exit code when the command finished during this call.
+  exit_code?: number;
+  // Command output text, possibly truncated.
+  output: string;
+}>; };
+```
+
+### `get_goal`
+Get the current goal for this thread.
+
+exec tool declaration:
+```ts
+declare const tools: { get_goal(args: {}): Promise<unknown>; };
+```
+"""
+CODE_MODE_FIRST_INPUT = [
+    {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "functions",
+                "description": "",
+                "tools": [{"type": "custom", "name": "exec", "description": CODE_MODE_DESCRIPTION, "format": {"type": "grammar"}}],
+            },
+            {"type": "namespace", "name": "clock", "tools": [{"type": "function", "name": "sleep", "parameters": {}}]},
+        ],
+    }
+]
+CODE_MODE_KNOWN = {"exec_command"}
+_CODE_MODE_CALL_RE = re.compile(r'tools\[("(?:[^"\\]|\\.)*")\]\((\{.*\})\);', re.DOTALL)
 
 
 def emit(event: dict) -> None:
@@ -118,7 +197,17 @@ def tool_calls_from(events: list[dict], chat: bool) -> list[dict]:
                 calls.append({"call_id": item["call_id"], "name": item["name"], "args": json.loads(item["arguments"])})
             elif item["type"] == "local_shell_call":
                 calls.append({"call_id": item["call_id"], "name": "local_shell", "args": item["action"]})
+            elif item["type"] == "custom_tool_call":
+                calls.append(code_mode_call(item))
     return calls
+
+
+def code_mode_call(item: dict) -> dict:
+    """A ``custom_tool_call`` of ``exec``, read as the nested tool it calls."""
+    match = _CODE_MODE_CALL_RE.search(item["input"]) if item["name"] == "exec" else None
+    if match is None:
+        return {"call_id": item["call_id"], "name": item["name"], "args": {}, "custom": True}
+    return {"call_id": item["call_id"], "name": json.loads(match.group(1)), "args": json.loads(match.group(2)), "custom": True, "via": "exec"}
 
 
 def really_run(call: dict) -> tuple[str, str]:
@@ -149,22 +238,33 @@ def v2(scenario: str, overrides: dict[str, str], prompt: str, last_message: str 
     base = overrides["model_providers.lexora_verify.base_url"]
     chat = overrides.get("model_providers.lexora_verify.wire_api") == "chat"
     url = base + ("/chat/completions" if chat else "/responses")
+    code_mode = scenario in ("code_mode", "code_mode_executes")
+    declares = not (disabled and scenario in ("contained", "stderr_leak", "no_item_started", "code_mode", "namespaced"))
     known = {"exec_real"} if scenario == "wrong_names" else KNOWN_TOOLS
-    decls = [] if scenario == "wrong_names" else TOOL_DECLARATIONS
-    if chat:
+    decls = [] if scenario == "wrong_names" or not declares else TOOL_DECLARATIONS
+    user_message = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}
+    if code_mode:
+        known = CODE_MODE_KNOWN
+        first_body = {"input": [*(CODE_MODE_FIRST_INPUT if declares else []), user_message]}
+    elif scenario == "namespaced":
+        namespace = {"type": "additional_tools", "role": "developer", "tools": [{"type": "namespace", "name": "functions", "tools": decls}]}
+        first_body = {"input": [*([namespace] if declares else []), user_message]}
+    elif chat:
         first_body = {"messages": [{"role": "user", "content": prompt}], "tools": [{"type": "function", "function": {k: v for k, v in d.items() if k != "type"}} for d in decls]}
     else:
-        first_body = {"input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}], "tools": decls}
+        first_body = {"input": [user_message], "tools": decls}
     calls = tool_calls_from(post(url, first_body), chat)
     if scenario == "crash" and disabled:
         sys.stderr.write("thread 'main' panicked at codex-rs/core/src/tool.rs:1:1\n")
         sys.stderr.flush()
         os._exit(101)
-    contained_like = scenario in ("contained", "stderr_leak", "no_item_started")
-    run_tools = scenario in ("executes", "crash") or (contained_like and not disabled)
+    contained_like = scenario in ("contained", "stderr_leak", "no_item_started", "code_mode", "namespaced")
+    run_tools = scenario in ("executes", "crash", "code_mode_executes") or (contained_like and not disabled)
     results = []
     for call in calls:
-        if call["name"] not in known:
+        if code_mode and call.get("via") != "exec":
+            output = f"unsupported call: {call['name']}"
+        elif call["name"] not in known:
             output = f"unknown tool: {call['name']}"
         elif run_tools:
             item = {"id": call["call_id"], "type": "command_execution", "command": call["name"]}
@@ -178,11 +278,11 @@ def v2(scenario: str, overrides: dict[str, str], prompt: str, last_message: str 
             emit({"type": "item.completed", "item": {**item, "aggregated_output": output, "exit_code": 0, "status": "completed"}})
         else:
             output = "tool call rejected: tools are disabled for this session"
-        results.append((call["call_id"], output))
+        results.append((call["call_id"], output, call.get("custom", False)))
     if chat:
-        body = {"messages": [{"role": "user", "content": prompt}] + [{"role": "tool", "tool_call_id": cid, "content": out} for cid, out in results]}
+        body = {"messages": [{"role": "user", "content": prompt}] + [{"role": "tool", "tool_call_id": cid, "content": out} for cid, out, _ in results]}
     else:
-        body = {"input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": prompt}]}] + [{"type": "function_call_output", "call_id": cid, "output": out} for cid, out in results]}
+        body = {"input": [user_message] + [{"type": "custom_tool_call_output" if custom else "function_call_output", "call_id": cid, "output": out} for cid, out, custom in results]}
     post(url, body)
     if last_message:
         Path(last_message).write_text("ok")
@@ -195,7 +295,7 @@ def main() -> int:
     scenario = sys.argv[1]
     overrides, last_message = parse_args(sys.argv[2:])
     prompt = sys.stdin.read()
-    if scenario in ("contained", "executes", "no_connect", "crash", "wrong_names", "stderr_leak", "no_item_started"):
+    if scenario in ("contained", "executes", "no_connect", "crash", "wrong_names", "stderr_leak", "no_item_started", "code_mode", "code_mode_executes", "namespaced"):
         return v2(scenario, overrides, prompt, last_message)
     if scenario == "sleep":
         ticks = Path(os.environ["CODEX_HOME"]) / "ticks"
@@ -278,6 +378,13 @@ def main() -> int:
         return 1
     if scenario == "quota":
         sys.stderr.write("ERROR: You've hit your usage limit. Try again in 2 hours 5 minutes.\n")
+        return 1
+    if scenario == "exit0_no_message":
+        emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
+        return 0
+    if scenario == "failed":
+        emit({"type": "turn.failed", "error": {"message": "something unforeseen went wrong"}})
+        sys.stderr.write("ERROR: something unforeseen went wrong\n")
         return 1
     if scenario == "auth":
         sys.stderr.write("ERROR: Not logged in. Run `codex login` to authenticate.\n")

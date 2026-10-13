@@ -10,8 +10,8 @@ V-2'-control and V-2' run the real mock model server against
 5. a control run in which no tool executes -- tool names do not match
    (``wrong_names``)
 
-The real tool-disabling setting is unmeasured, so the tests register the
-fake CLI's stand-in (``lexora_test.tools_disabled``) in
+The fake CLI does not know the real tool-disabling overrides, so the tests
+register its stand-in (``lexora_test.tools_disabled``) in
 ``TOOL_DISABLE_OVERRIDE_KEYS``. Tool names, next-turn shapes and event
 shapes the fake CLI uses are ASSUMED; the real CLI's are measured after login.
 
@@ -30,6 +30,7 @@ from lexora.backends import codex as codex_mod
 from lexora.backends.codex import CodexBackend, CodexNotVerifiedError, EventFindings
 from lexora.backends.codex_verification import ClearViolationError
 from lexora.tools import verify_codex as vc
+from tests.backends import fake_codex_cli as fake_cli
 from tests.backends.test_codex import REQUEST, VERSION, make_backend, record_pass
 
 FLAG = "lexora_test.tools_disabled"
@@ -80,6 +81,7 @@ class TestFixtures:
             "V-2c/tool_execution_events_present",
             "V-2/0c_refusal_evidence",
             "V-2/2_no_tool_events",
+            "V-2/3_no_tools_declared",
         } <= _names(checks, True)
         backend._scenario = "ok"  # type: ignore[attr-defined]
         response = await backend.chat_completions(REQUEST)
@@ -94,8 +96,8 @@ class TestFixtures:
         result, checks = await vc.verify(backend)
         assert result == "fail"
         failed = _names(checks, False)
-        assert {"V-2/1_no_leak_to_model", "V-2/2_no_tool_events", "V-2/0c_refusal_evidence"} <= failed
-        assert "tool_executed_under_prod_config" in _note(backend)["fail_reasons"]
+        assert {"V-2/1_no_leak_to_model", "V-2/2_no_tool_events", "V-2/0c_refusal_evidence", "V-2/3_no_tools_declared"} <= failed
+        assert {"tool_executed_under_prod_config", "tools_declared_under_prod_config"} <= set(_note(backend)["fail_reasons"])
         # msg-319: a verification failure is a record, never a runtime violation.
         assert backend.state_store.violations() == []
 
@@ -145,11 +147,52 @@ class TestFixtures:
         assert "LEXORA-CANARY-" not in blob and "CODEX_HOME=" not in blob
 
 
+# --------------------------------------------------------------------------
+# Code mode (codex-cli 0.160.0 + a code_mode_only model, measured 2026-10-13)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("v1_ok", "flag_registered")
+class TestCodeMode:
+    async def test_contained_code_mode_cli_passes(self, tmp_path: Path) -> None:
+        result, checks = await vc.verify(v2_backend(tmp_path, "code_mode"))
+        assert result == "pass", [c for c in checks if not c.ok]
+        sent = next(c for c in checks if c.name == "V-2c/0b_tool_calls_sent")
+        assert sent.detail == "tools=['exec_command']"
+
+    async def test_code_mode_cli_that_executes_under_prod_config_fails(self, tmp_path: Path) -> None:
+        backend = v2_backend(tmp_path, "code_mode_executes")
+        result, checks = await vc.verify(backend)
+        assert result == "fail"
+        assert {"V-2/1_no_leak_to_model", "V-2/2_no_tool_events", "V-2/0c_refusal_evidence"} <= _names(checks, False)
+        assert "tool_executed_under_prod_config" in _note(backend)["fail_reasons"]
+
+    async def test_contained_namespaced_cli_passes(self, tmp_path: Path) -> None:
+        result, checks = await vc.verify(v2_backend(tmp_path, "namespaced"))
+        assert result == "pass", [c for c in checks if not c.ok]
+        sent = next(c for c in checks if c.name == "V-2c/0b_tool_calls_sent")
+        assert sent.detail == "tools=['read_file', 'shell']"
+
+    async def test_without_code_mode_discovery_the_control_cannot_execute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure seen on the host: with ``exec``'s nested tools unread,
+        the mock falls back to function calls the CLI does not support, no
+        tool runs in the control, and the gate can never open."""
+        monkeypatch.setattr(vc, "_code_mode_tools", lambda description: [])
+        backend = v2_backend(tmp_path, "code_mode")
+        result, checks = await vc.verify(backend)
+        assert result == "fail"
+        assert "V-2c/tool_executed_under_control" in _names(checks, False)
+        assert "control_tool_not_executed" in _note(backend)["fail_reasons"]
+
+
 @pytest.mark.usefixtures("v1_ok")
-async def test_cannot_pass_until_the_tool_disable_key_is_registered(tmp_path: Path) -> None:
-    """With TOOL_DISABLE_OVERRIDE_KEYS empty (shipped state) the control
-    equals production, so a contained CLI refuses in the control too."""
-    assert codex_mod.TOOL_DISABLE_OVERRIDE_KEYS == frozenset()
+async def test_cannot_pass_while_the_disable_key_is_unregistered(tmp_path: Path) -> None:
+    """A disabling override whose key is not in TOOL_DISABLE_OVERRIDE_KEYS
+    stays on in the control, so the control equals production and a
+    contained CLI refuses in the control too."""
+    assert FLAG not in codex_mod.TOOL_DISABLE_OVERRIDE_KEYS
     result, checks = await vc.verify(v2_backend(tmp_path, "contained"))
     assert result == "fail"
     assert "V-2c/tool_executed_under_control" in _names(checks, False)
@@ -199,6 +242,66 @@ class TestDiscovery:
     def test_no_tools_declared(self) -> None:
         assert vc.discover_tools(json.dumps({"input": []})) == []
 
+    def test_code_mode_shape(self) -> None:
+        """No top-level ``tools``: the nested tools are declared in the
+        description of ``exec``, inside a namespace of ``additional_tools``."""
+        user = {"type": "message", "role": "user", "content": []}
+        raw = json.dumps({"input": [*fake_cli.CODE_MODE_FIRST_INPUT, user]})
+        tools = vc.discover_tools(raw)
+        assert [(t.kind, t.name, t.role, t.entry) for t in tools] == [("code_mode", "exec_command", "shell", "exec")]
+        assert tools[0].schema["properties"]["cmd"] == {"type": "string"}
+        assert tools[0].schema["properties"]["prefix_rule"] == {"type": "array"}
+        calls = vc.calls_for(tools, "/h/canary")
+        assert [(c.kind, c.name) for c in calls] == [("custom_tool_call", "exec")] * 2
+        assert calls[0].arguments["input"].startswith('const r = await tools["exec_command"]({"cmd": "cat /h/canary"});')
+
+    def test_code_mode_read_tool(self) -> None:
+        description = (
+            "declare const tools: { view_image(args: {\n"
+            "  // Local filesystem path to an image file.\n"
+            "  path: string;\n"
+            "}): Promise<{\n  image_url: string;\n}>; };"
+        )
+        raw = json.dumps({"input": [{"type": "additional_tools", "tools": [{"type": "custom", "name": "exec", "description": description}]}]})
+        tools = vc.discover_tools(raw)
+        assert [(t.name, t.role) for t in tools] == [("view_image", "read")]
+        assert 'tools["view_image"]({"path": "/c"})' in vc.calls_for(tools, "/c")[0].arguments["input"]
+
+    def test_namespaced_functions_are_discovered(self) -> None:
+        """A model not in code mode: plain functions inside an
+        ``additional_tools`` namespace, no top-level ``tools`` (PR-gate on
+        #85 @ 27d9ad1, msg-776)."""
+        raw = json.dumps({"input": [{"type": "additional_tools", "tools": [{"type": "namespace", "name": "functions", "tools": [
+            {"type": "function", "name": "exec_command", "parameters": {"properties": {"cmd": {"type": "string"}}}},
+            {"type": "function", "name": "request_user_input"},
+            {"type": "local_shell"},
+        ]}]}]})
+        tools = vc.discover_tools(raw)
+        assert [(t.kind, t.name, t.role) for t in tools] == [("function", "exec_command", "shell"), ("local_shell", "local_shell", "shell")]
+        assert vc.calls_for(tools, "/c")[0].arguments == {"cmd": "cat /c"}
+
+    def test_code_mode_namespace_functions_are_not_shell_or_read(self) -> None:
+        """The functions code mode puts next to ``exec`` (``wait``, ``sleep``,
+        ...) match neither name pattern, so only ``exec``'s nested tools are
+        scripted."""
+        raw = json.dumps({"input": [*fake_cli.CODE_MODE_FIRST_INPUT]})
+        assert [t.kind for t in vc.discover_tools(raw)] == ["code_mode"]
+
+    def test_custom_tool_other_than_exec_is_ignored(self) -> None:
+        description = "declare const tools: { exec_command(args: {\n  cmd: string;\n}): Promise<unknown>; };"
+        raw = json.dumps({"input": [{"type": "additional_tools", "tools": [{"type": "custom", "name": "apply_patch", "description": description}]}]})
+        assert vc.discover_tools(raw) == []
+
+    def test_responses_stream_sends_custom_tool_call(self) -> None:
+        tool = vc.ToolSpec("code_mode", "exec_command", "shell", {"properties": {"cmd": {"type": "string"}}}, entry="exec")
+        call = vc.calls_for([tool], "/c")[0]
+        lines = vc.responses_tool_stream([call]).decode().splitlines()
+        events = [json.loads(line[6:]) for line in lines if line.startswith("data: ")]
+        items = [e["item"] for e in events if e["type"] == "response.output_item.done"]
+        assert items == [
+            {"type": "custom_tool_call", "id": "ctc_0", "call_id": call.call_id, "name": "exec", "input": call.arguments["input"], "status": "completed"}
+        ]
+
 
 def test_unknown_event_is_not_refusal_evidence() -> None:
     """msg-315 #4: an unrecognised event naming the call and saying
@@ -216,6 +319,33 @@ def test_unknown_event_is_not_refusal_evidence() -> None:
     events = [refusal, {"type": "turn.completed"}]
     checks = vc.evaluate_v2(state, codex_mod.classify_events(events), events, 0, "", "CANARY")
     assert _names(checks, False) == set()
+
+
+class TestDeclaredTools:
+    def test_code_mode_request_declares_its_tools(self) -> None:
+        raw = json.dumps({"input": [*fake_cli.CODE_MODE_FIRST_INPUT]})
+        assert vc.declared_tools(raw) == ["exec", "sleep"]
+
+    def test_both_wires_and_nameless_tools(self) -> None:
+        raw = json.dumps({"tools": [{"type": "function", "function": {"name": "shell"}}, {"type": "local_shell"}, {"type": "function", "name": "f"}]})
+        assert vc.declared_tools(raw) == ["shell", "local_shell", "f"]
+
+    def test_no_tools(self) -> None:
+        assert vc.declared_tools(json.dumps({"input": [{"type": "message"}], "tools": []})) == []
+
+    def test_unreadable_request_is_not_no_tools(self) -> None:
+        assert vc.declared_tools("not json") is None
+        assert vc.declared_tools("[]") is None
+
+    def test_v2_3_needs_the_nonce_request(self) -> None:
+        def v2_3(requests: list[str]) -> vc.Check:
+            state = vc.MockState(nonce="n1", planner=lambda raw: ([], []))
+            state.requests = requests
+            return next(c for c in vc.evaluate_v2(state, EventFindings(), [], 0, "", "canary") if c.name == "V-2/3_no_tools_declared")
+
+        missing = v2_3([json.dumps({"input": []})])
+        assert not missing.ok and missing.detail == "no readable request carried the nonce"
+        assert v2_3([json.dumps({"input": [{"type": "message", "content": "n1"}]})]).ok
 
 
 def test_evaluate_v2_without_calls_cannot_pass() -> None:

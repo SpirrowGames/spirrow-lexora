@@ -63,6 +63,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import tomllib
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -98,11 +99,106 @@ LOCALE_ENV_ALLOWLIST: tuple[str, ...] = ("LANG", "LC_ALL", "LC_CTYPE", "LANGUAGE
 
 SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin"
 
-#: ``-c`` override keys that disable the CLI's tools. EMPTY until measured
-#: after login (msg-294 go/no-go: the tool-disabling CLI setting exists). The
-#: V-2'-control run drops exactly these keys; while the set is empty the
-#: control equals production, so verification cannot pass -- by design.
-TOOL_DISABLE_OVERRIDE_KEYS: frozenset[str] = frozenset()
+#: The ``-c`` override naming the model catalog file (a path; the CLI reads
+#: it in place of its bundled catalog). Its file's sha256 is part of the
+#: config hash (``model_catalog_digest``), because the path alone says
+#: nothing about what the catalog asks for.
+MODEL_CATALOG_OVERRIDE_KEY = "model_catalog_json"
+
+#: Feature / tool flags that, together with ``CATALOG_KEYS_REMOVED`` /
+#: ``CATALOG_KEYS_SET`` applied to the pinned model's catalog entry, leave the
+#: model NO tool at all. Measured 2026-10-13 on codex-cli 0.160.0 with
+#: gpt-6.1-sol by reading the CLI's first request to a loopback mock, with
+#: both an empty ``CODEX_HOME`` and the logged-in production one:
+#:
+#: * ``features.shell_tool=false`` -- ``exec_command`` and ``write_stdin``.
+#: * ``features.view_image=false`` -- ``view_image``.
+#: * ``features.goals=false`` -- ``get_goal`` / ``create_goal`` / ``update_goal``.
+#: * ``features.multi_agent=false`` -- ``tool_search``.
+#: * ``tools.experimental_request_user_input.enabled=false`` --
+#:   ``request_user_input``.
+#: * ``features.apps=false`` -- with a ChatGPT login only: the connectors MCP
+#:   server (``chatgpt.com/backend-api/ps/mcp``), which adds
+#:   ``list_mcp_resources`` / ``list_mcp_resource_templates`` /
+#:   ``read_mcp_resource`` / ``tool_search``. It would also reach the
+#:   account's connected apps, which the naysayer must not.
+#: * ``features.plugins=false`` -- not needed in the measured state. Set
+#:   anyway: a plugin can add an MCP server to ``CODEX_HOME`` after
+#:   verification, and the config hash does not cover ``CODEX_HOME``.
+#:
+#: Each of the others was dropped in turn and its tools came back, so none
+#: is redundant. ``features.unified_exec`` and ``features.sleep_tool`` were
+#: measured redundant and are not set.
+TOOL_DISABLE_FEATURE_OVERRIDES: tuple[str, ...] = (
+    "features.shell_tool=false",
+    "features.view_image=false",
+    "features.goals=false",
+    "features.multi_agent=false",
+    "tools.experimental_request_user_input.enabled=false",
+    "features.apps=false",
+    "features.plugins=false",
+)
+
+#: Catalog-entry keys whose tools no flag removes (same measurement):
+#: ``tool_mode`` (``code_mode_only``: the custom ``exec`` tool and ``wait``)
+#: and ``multi_agent_version`` (the ``collaboration.*`` tools, among them
+#: ``spawn_agent``). ``lexora.tools.codex_catalog`` deletes them.
+CATALOG_KEYS_REMOVED: tuple[str, ...] = ("tool_mode", "multi_agent_version")
+
+#: Catalog-entry values ``lexora.tools.codex_catalog`` overwrites:
+#: ``apply_patch_tool_type`` (``apply_patch``, which has no feature flag) and
+#: ``experimental_supported_tools`` (``clock.*``, ``send_user_message_async``).
+CATALOG_KEYS_SET: Mapping[str, Any] = {"apply_patch_tool_type": None, "experimental_supported_tools": []}
+
+#: ``-c`` override keys that disable the CLI's tools: the catalog override
+#: plus every flag above. The V-2'-control run drops exactly these keys, so
+#: the control runs the CLI's defaults (code mode, ``exec_command``) and must
+#: execute a tool; the production run must declare none (msg-294 go/no-go).
+TOOL_DISABLE_OVERRIDE_KEYS: frozenset[str] = frozenset(
+    {MODEL_CATALOG_OVERRIDE_KEY, *(o.split("=", 1)[0] for o in TOOL_DISABLE_FEATURE_OVERRIDES)}
+)
+
+
+def apply_catalog_tool_edits(entry: Mapping[str, Any]) -> dict[str, Any]:
+    """The pinned model's catalog entry with the tool-requesting keys removed
+    or overwritten (``CATALOG_KEYS_REMOVED`` / ``CATALOG_KEYS_SET``)."""
+    edited = {k: copy.deepcopy(v) for k, v in entry.items() if k not in CATALOG_KEYS_REMOVED}
+    edited.update(copy.deepcopy(dict(CATALOG_KEYS_SET)))
+    return edited
+
+
+def override_value(override: str) -> str:
+    """Value part of a ``key=value`` ``-c`` override as the CLI reads it: parsed
+    as TOML when it parses to a string, else the raw text (the CLI's rule)."""
+    raw = override.split("=", 1)[1].strip() if "=" in override else ""
+    try:
+        parsed = tomllib.loads(f"v = {raw}").get("v")
+    except tomllib.TOMLDecodeError:
+        return raw
+    return parsed if isinstance(parsed, str) else raw
+
+
+def model_catalog_path(cli_overrides: Sequence[str]) -> str | None:
+    """The file named by the ``model_catalog_json`` override, if any (last wins,
+    as with repeated ``-c``)."""
+    path = None
+    for override in cli_overrides:
+        if override_key(override) == MODEL_CATALOG_OVERRIDE_KEY:
+            path = override_value(override)
+    return path
+
+
+def model_catalog_digest(cli_overrides: Sequence[str]) -> str | None:
+    """sha256 of the catalog file the overrides name; ``None`` without the
+    override. An unreadable file hashes to a marker, so it can never match a
+    verification recorded against a readable one."""
+    path = model_catalog_path(cli_overrides)
+    if path is None:
+        return None
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
 
 
 def verify_provider_overrides(base_url: str, wire_api: str) -> list[str]:
@@ -241,6 +337,18 @@ class CodexFailed(CodexError):
     """Any failure the classifier could not place in a narrower class."""
 
 
+class CodexFailureHold(CodexError):
+    """Codex is held after an unclassified failure (``failure_hold``,
+    msg-765 L-2a); no subprocess was started.
+
+    Deliberately NOT a ``CodexFailed`` (PR-gate on #85): a ``CodexFailed``
+    is a real run's failure and carries its stderr snippet, which the
+    fallback wrapper logs as ``naysayer_codex_failed_fallback``. A request
+    refused by the hold has no snippet, so it must never be counted, logged
+    or reported as one.
+    """
+
+
 class CodexNotVerifiedError(CodexError):
     """The verification gate is closed; no subprocess was started.
 
@@ -302,8 +410,14 @@ def config_hash(
     Excludes fields that do not reach the command (timeout, concurrency,
     state DB path) and the provider override ``verify_codex`` adds for V-2'
     (msg-288: "provider の上書きは...ハッシュの対象から外す").
+
+    Includes the CONTENT of the model catalog file a ``model_catalog_json``
+    override names (``model_catalog_digest``): editing that file changes
+    what the model is offered without touching the command line, so it
+    must close the gate like a config change. Without the override the
+    payload, and so the hash, is what it was before this field existed.
     """
-    payload = {
+    payload: dict[str, Any] = {
         "template": COMMAND_TEMPLATE_VERSION,
         "codex_bin": codex_bin,
         "codex_home": codex_home,
@@ -315,6 +429,9 @@ def config_hash(
         "env_allowlist": list(LOCALE_ENV_ALLOWLIST),
         "sandbox_path": SANDBOX_PATH,
     }
+    catalog = model_catalog_digest(cli_overrides)
+    if catalog is not None:
+        payload["model_catalog_sha256"] = catalog
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -744,6 +861,12 @@ class ExecProgress:
 #: Hold after a quota failure whose reset time could not be parsed
 #: (``parse_reset_at`` returned ``None``; msg-329 / PR-2).
 QUOTA_HOLD_FALLBACK = timedelta(minutes=15)
+#: Hold after an unclassified ``CodexFailed`` (T-naysayer-codex-backend
+#: msg-765 L-2a): msg-267 scope 2's "short backoff" when nothing tells us
+#: when to retry. Shorter than ``QUOTA_HOLD_FALLBACK`` because a
+#: ``CodexFailed`` may be a one-off; a real but unrecognised window
+#: exhaustion then costs one failed attempt per 5 minutes.
+CODEX_FAILED_HOLD = timedelta(minutes=5)
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
@@ -774,8 +897,8 @@ class CodexAvailability:
     and ``GET /v1/naysayer/status`` both read this, so they cannot disagree
     (Principle 2). ``reason`` is ``None`` when codex may run; otherwise it is
     the ``CodexNotVerifiedError.reason`` of the check that closed (including
-    ``data_controls_unverified``), or ``quota_hold`` / ``slot_hold`` /
-    ``launch_failed``. ``error`` is the exception the
+    ``data_controls_unverified``), or ``quota_hold`` / ``failure_hold`` /
+    ``slot_hold`` / ``launch_failed``. ``error`` is the exception the
     request path raises for that reason. ``quota_hold_until`` is reported
     whatever ``reason`` is, so a DB fault during a hold hides neither.
     ``version`` is the CLI version when open (it goes on the latch row).
@@ -841,6 +964,11 @@ class CodexBackend(Backend):
         # quota failure. A restart forgets it, which costs one codex attempt
         # that fails with quota again and re-sets it.
         self._quota_hold_until: datetime | None = None
+        # msg-765 L-2a: the same kind of in-memory hold, set after an
+        # unclassified ``CodexFailed`` for ``CODEX_FAILED_HOLD``. Kept apart
+        # from the quota hold so status tells a real (recognised) window
+        # exhaustion from an unknown failure (``failure_hold``).
+        self._failure_hold_until: datetime | None = None
         # msg-687 B: set when a request gave up waiting for the slot while
         # another run held it; cleared by that run when it gives the slot
         # back (``_execute``'s ``finally``). (monotonic time it was set, the
@@ -1085,6 +1213,10 @@ class CodexBackend(Backend):
            a quota stop.
         2. An active quota hold -> ``quota_hold``; ``codex --version`` is not
            started.
+        2a. An active failure hold -> ``failure_hold`` (msg-765 L-2a): an
+           unclassified ``CodexFailed`` happened less than
+           ``CODEX_FAILED_HOLD`` ago. After the quota hold, so a recognised
+           window exhaustion is reported as such.
         2b. An active slot hold -> ``slot_hold`` (msg-687 B): a request gave
            up waiting while another run holds the only slot, and that run
            has not given it back yet. Kept apart from ``quota_hold`` so the
@@ -1115,6 +1247,12 @@ class CodexBackend(Backend):
                 f"codex held after a usage-window failure until {hold.isoformat()}", hold
             )
             return CodexAvailability("quota_hold", error, quota_hold_until=hold)
+        failure_hold = self._failure_hold_until
+        if failure_hold is not None and failure_hold > datetime.now(timezone.utc):
+            error = CodexFailureHold(
+                f"codex held after an unclassified failure until {failure_hold.isoformat()}"
+            )
+            return CodexAvailability("failure_hold", error)
         slot = self._slot_hold
         if slot is not None:
             set_at, bound = slot
@@ -1143,6 +1281,17 @@ class CodexBackend(Backend):
         if self._quota_hold_until is None or until > self._quota_hold_until:
             self._quota_hold_until = until
         logger.warning("codex_quota_hold", backend=self.name, until=self._quota_hold_until.isoformat())
+
+    def _hold_for_failure(self, error: CodexFailed) -> None:
+        """Hold codex for ``CODEX_FAILED_HOLD`` after an unclassified failure
+        (msg-765 L-2a). Only ever extends, like ``_hold_for_quota``; the quota
+        hold is a separate field and is never touched here."""
+        until = datetime.now(timezone.utc) + CODEX_FAILED_HOLD
+        if self._failure_hold_until is None or until > self._failure_hold_until:
+            self._failure_hold_until = until
+        logger.warning(
+            "codex_failure_hold", backend=self.name, until=self._failure_hold_until.isoformat(), error=str(error)
+        )
 
     # ---- execution ---------------------------------------------------
 
@@ -1398,11 +1547,15 @@ class CodexBackend(Backend):
             if pending is not None:
                 if isinstance(pending, CodexQuotaError):
                     self._hold_for_quota(pending)
+                elif isinstance(pending, CodexFailed):
+                    self._hold_for_failure(pending)
                 raise pending
             assert run is not None
             text = run.last_message if run.last_message is not None else last_agent_message(run.events)
             if text is None:
-                raise CodexFailed("codex exec exited 0 without a final message")
+                missing = CodexFailed("codex exec exited 0 without a final message")
+                self._hold_for_failure(missing)
+                raise missing
             return text, usage_from_events(run.events)
         finally:
             self._in_flight.discard(run_seq)
