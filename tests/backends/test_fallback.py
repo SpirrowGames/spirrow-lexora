@@ -195,6 +195,7 @@ class TestFallbackDecision:
             pytest.param("tool_use", True, "tool_use_violation", id="latch"),
             pytest.param("exit0_no_terminal", True, "unverifiable_run", id="unverifiable-latch"),
             pytest.param("failed", True, "codex_failed", id="unclassified"),
+            pytest.param("exit0_no_message", True, "codex_failed", id="exit0-no-message"),
         ],
     )
     async def test_falls_back_to_gemini(

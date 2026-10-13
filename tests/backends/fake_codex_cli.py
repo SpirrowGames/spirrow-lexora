@@ -16,6 +16,9 @@ Scenarios for the backend:
                        (D-1c must treat it as an execution, msg-315 #4).
 * ``quota``         -- ASSUMED usage-limit wording on stderr, exit 1.
 * ``auth``          -- ASSUMED not-logged-in wording on stderr, exit 1.
+* ``exit0_no_message`` -- ``turn.completed``, exit 0, but no ``agent_message``
+                       and no ``--output-last-message`` file: the
+                       "exited 0 without a final message" ``CodexFailed``.
 * ``failed``        -- ``turn.failed`` with wording no classifier knows,
                        exit 1: an unclassified ``CodexFailed`` (msg-765 L-2).
 * ``sleep``         -- never finishes (timeout / cancellation path); appends a
@@ -281,6 +284,9 @@ def main() -> int:
     if scenario == "quota":
         sys.stderr.write("ERROR: You've hit your usage limit. Try again in 2 hours 5 minutes.\n")
         return 1
+    if scenario == "exit0_no_message":
+        emit({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}})
+        return 0
     if scenario == "failed":
         emit({"type": "turn.failed", "error": {"message": "something unforeseen went wrong"}})
         sys.stderr.write("ERROR: something unforeseen went wrong\n")

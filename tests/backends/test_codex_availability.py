@@ -353,11 +353,24 @@ class TestFailureHold:
         assert versions[0] == 0  # nor `codex --version`
 
     async def test_exit0_without_a_final_message_holds_too(self, tmp_path: Path) -> None:
-        backend = make_backend(tmp_path)
+        """The ``text is None`` branch of ``_run_gated`` (PR-gate #85): a clean
+        exit 0 with a terminal event but no final message is a ``CodexFailed``
+        that holds codex, driven end to end through a real request."""
+        backend = make_backend(tmp_path, "exit0_no_message")
+        record_pass(backend)
         before = datetime.now(timezone.utc)
-        backend._hold_for_failure(CodexFailed("codex exec exited 0 without a final message"))
+        with pytest.raises(CodexFailed, match="exited 0 without a final message"):
+            await backend.chat_completions(REQUEST)
         hold = backend._failure_hold_until
-        assert hold is not None and hold >= before + CODEX_FAILED_HOLD
+        assert hold is not None
+        assert before + CODEX_FAILED_HOLD <= hold <= datetime.now(timezone.utc) + CODEX_FAILED_HOLD
+        assert backend._quota_hold_until is None
+        assert backend.state_store.violations() == []  # not a latch
+        runs = len(backend.state_store.runs())
+        assert (await backend.codex_availability()).reason == "failure_hold"
+        with pytest.raises(CodexFailed, match="held after an unclassified failure"):
+            await backend.chat_completions(REQUEST)
+        assert len(backend.state_store.runs()) == runs  # codex was not started again
 
     async def test_failure_hold_ends_by_time(self, tmp_path: Path) -> None:
         backend = make_backend(tmp_path, "ok")
