@@ -205,7 +205,7 @@ async def test_shipped_listing_is_the_tiers_plus_the_declared_concrete_names() -
     assert ids == [
         "gemini-3.1-pro-preview",
         # codex: on no tier directly (the naysayer tier reaches it through
-        # the shadow wrapper `naysayer-codex`, which declares no model), but
+        # the fallback wrapper `naysayer-codex`, which declares no model), but
         # declared, so routable by name; the verify gate refuses every
         # request until it is opened.
         "gpt-6.1-sol",

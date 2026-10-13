@@ -51,15 +51,19 @@ routing:
       description: "複雑なタスク (Qwen3.8-27B, reasoning_effort=xhigh)"
     # role ルート: naysayer は別訓練分布 (Gemini) で最大独立性を取る
     # (ADR-2026-05-31-15 D-2「2 協調 1 独立」)。呼び出し側は model: "naysayer"
-    # 2026-10-04 (T-naysayer-codex-backend msg-687 E): fallback wrapper
-    # `naysayer-codex` の mode: shadow に接続。答えるのは今まで通り Gemini で、
-    # 台帳の行 (backend=gemini, answered_by=NULL) も今と同じ — mindwire の
-    # attestation (expected=gemini) はそのまま通る。codex は裏で比較用に走るだけ。
-    # mode: fallback (codex が答える) への切替は費用面の Tier-C (Takahito 判断)。
+    # 2026-10-13 (T-naysayer-codex-backend msg-762 / msg-763 L-1): fallback
+    # wrapper `naysayer-codex` の mode: fallback に接続。codex (ChatGPT Pro
+    # サブスク) が答え、台帳の行は answered_by=codex。codex が閉じている・
+    # 枠切れ・失敗した時だけ Gemini が答える (answered_by=gemini-fallback)。
+    # mindwire の attestation は {codex, gemini-fallback} を受け入れる版
+    # (spirrow-mindwire#463/#464) と同時に着地させる (RUNBOOK §9)。
+    # model の gemini-3.1-pro-preview は fallback 先の解決
+    # (resolve_model("naysayer")) に使うので残す。codex には渡らない。
+    # 切替は Takahito の Tier-C 判断 (msg-762、2026-10-13) で決着済み。
     naysayer:
       backend: "naysayer-codex"
       model: "gemini-3.1-pro-preview"
-      description: "naysayer (Gemini が回答、codex は shadow で比較のみ)"
+      description: "naysayer (codex が回答、閉じている間は Gemini にフォールバック)"
     # Gemini だけに直結する naysayer (msg-687 E)。codex を一切通さない入口。
     naysayer-gemini:
       backend: "gemini"
@@ -181,10 +185,10 @@ routing:
     # Codex CLI (`codex exec` under bwrap, ChatGPT Pro サブスク認証)。
     # T-D8-codex-backend-adr14-15-amendment msg-5940 / msg-5942。
     # tier に直接は付けない。naysayer ティアは下の fallback wrapper
-    # `naysayer-codex` (mode: shadow) を経由してこの backend を使う
-    # (2026-10-04, T-naysayer-codex-backend msg-687 E)。
+    # `naysayer-codex` (mode: fallback) を経由してこの backend を使う
+    # (2026-10-13, T-naysayer-codex-backend msg-763 L-1)。
     # 検証ゲート (verify_codex) が閉じている間は全リクエストを拒否する
-    # (shadow では比較行が not_run になるだけで、回答は Gemini)。
+    # (fallback mode ではそのリクエストを Gemini が答える)。
     # max_concurrency: 1 は必須 — 1 つの auth.json のトークン更新を競合させない。
     # 1 以外は起動時に拒否される (msg-687 A)。
     # health_check: false — ゲートが閉じている間は unhealthy を返し、
@@ -198,14 +202,17 @@ routing:
       models:
         - name: "gpt-6.1-sol"
           capabilities: ["reasoning", "analysis", "general"]
-          description: "OpenAI gpt-6.1-sol via Codex CLI (ChatGPT Pro, 未検証・tier 未接続)"
+          description: "OpenAI gpt-6.1-sol via Codex CLI (ChatGPT Pro, naysayer-codex 経由で naysayer ティアの回答者)"
       codex:
         codex_home: "/srv/lexora/codex-home"
         max_concurrency: 1
 
     # naysayer ティアの実体 (T-naysayer-codex-backend msg-687 E)。
-    # mode: shadow — Gemini が答え、codex は同じリクエストを裏で 1 本だけ走らせて
-    # verdict を比較する (shadow_comparisons)。fallback への切替は Tier-C。
+    # mode: fallback — codex が答え、codex が閉じている・枠切れ・失敗した時だけ
+    # Gemini が答える (msg-763 L-1、Takahito の Tier-C 判断 msg-762 で決着)。
+    # mode: shadow (Gemini が答え、codex は裏で比較だけ) は比較を取り直す時に
+    # だけ使う (RUNBOOK §7)。mode は codex の config hash に入らないので、
+    # 切り替えても verify_codex の pass は stale にならない。
     # 時間の予算 (msg-687 C): slot_wait_s + codex_timeout_s + fallback_floor_s
     # <= caller_budget_s を起動時に検査し、成り立たなければ起動しない。
     # caller_budget_s=900 は ADR-14 の backend 上限 (mindwire lexora/client.py の
@@ -217,7 +224,7 @@ routing:
       fallback:
         primary: "codex"
         fallback: "gemini"
-        mode: "shadow"
+        mode: "fallback"
         caller_budget_s: 900
         slot_wait_s: 30
         codex_timeout_s: 270

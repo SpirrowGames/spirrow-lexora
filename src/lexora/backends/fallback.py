@@ -38,10 +38,16 @@ called.
 
 ``CodexAuthError`` falls back too (msg-498 B-1'): an expired or revoked
 device login is a known, recoverable state, and the "started" notice carries
-``reason=auth`` so the operator learns a re-login is needed. Errors that do
-NOT fall back and reach the caller: ``CodexFailed`` (unclassified -- an
-unknown failure is not hidden behind Gemini) and
-``CodexUnsupportedInputError`` (a caller error).
+``reason=auth`` so the operator learns a re-login is needed.
+``CodexFailed`` (unclassified) falls back too (T-naysayer-codex-backend
+msg-763 / msg-765 L-2): the window-exhaustion stderr wording is ASSUMED, so a
+real but unrecognised exhaustion lands here, and msg-267 says Gemini may
+answer then. It is not hidden: the notice carries ``reason=codex_failed``,
+each one logs ``naysayer_codex_failed_fallback`` at WARNING with the
+exception's 300-character stderr snippet (the material for fixing
+``_QUOTA_RE``), and ``CodexBackend`` holds codex for 5 minutes
+(``failure_hold``). The only error that does NOT fall back and reaches the
+caller is ``CodexUnsupportedInputError`` (a caller error).
 
 **Notifications (B-3), producer declaration.** Intended reader: the human
 operator (Takahito). Surface: a Discord webhook named by the
@@ -121,6 +127,7 @@ from lexora.backends.codex import (
     CodexAvailability,
     CodexBackend,
     CodexError,
+    CodexFailed,
     CodexLaunchError,
     CodexNotVerifiedError,
     CodexQuotaError,
@@ -156,7 +163,8 @@ BACKEND_GEMINI_FALLBACK = ANSWERED_BY_GEMINI_FALLBACK
 #: did not run (B-5'); ``codex_reason`` then holds the gate's reason.
 SHADOW_NOT_RUN = "not_run"
 
-#: The B-1 list plus ``CodexAuthError`` (B-1'): these fall back to Gemini.
+#: The B-1 list plus ``CodexAuthError`` (B-1') and ``CodexFailed``
+#: (msg-765 L-2b): these fall back to Gemini.
 #: ``CodexUnverifiableRun`` is a ``CodexToolUseViolation`` (a latch).
 FALLBACK_ERRORS: tuple[type[CodexError], ...] = (
     CodexNotVerifiedError,
@@ -166,6 +174,7 @@ FALLBACK_ERRORS: tuple[type[CodexError], ...] = (
     CodexTimeout,
     CodexSlotTimeout,
     CodexToolUseViolation,
+    CodexFailed,
 )
 
 
@@ -193,6 +202,8 @@ def fallback_reason(exc: CodexError) -> str:
         return "unverifiable_run"
     if isinstance(exc, CodexToolUseViolation):
         return "tool_use_violation"
+    if isinstance(exc, CodexFailed):
+        return "codex_failed"
     return type(exc).__name__
 
 
@@ -466,7 +477,7 @@ class FallbackBackend(Backend):
                 )
             except FALLBACK_ERRORS as exc:
                 reason = fallback_reason(exc)
-                self._note_quota(exc)
+                self._note_failure(exc)
             else:
                 self._route_codex()
                 self._codex_answered()
@@ -501,7 +512,7 @@ class FallbackBackend(Backend):
                 first = await codex_stream.__anext__()
             except FALLBACK_ERRORS as exc:
                 reason = fallback_reason(exc)
-                self._note_quota(exc)
+                self._note_failure(exc)
             else:
                 self._route_codex()
                 self._codex_answered()
@@ -515,9 +526,14 @@ class FallbackBackend(Backend):
         async for chunk in self._bounded_fallback_stream(request, usage_sink, deadline):
             yield chunk
 
-    def _note_quota(self, exc: CodexError) -> None:
+    def _note_failure(self, exc: CodexError) -> None:
         if isinstance(exc, CodexQuotaError) and exc.reset_at is not None:
             self._last_hold = exc.reset_at
+        elif isinstance(exc, CodexFailed):
+            # msg-763 L-2: the snippet is already in the message (<=300 chars).
+            logger.warning(
+                "naysayer_codex_failed_fallback", backend=self.name, error_class=type(exc).__name__, error=str(exc)
+            )
 
     # ---- notifications (B-3) --------------------------------------------------
 
