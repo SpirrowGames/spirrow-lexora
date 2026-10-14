@@ -218,6 +218,9 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
   - deploy の**前**に書きます。deploy の後で書き直すと、C-2′ で取る `pass` の hash とずれます。
   - 再起動は要りません。カタログの sha256 は `config_hash()` を呼ぶたびにファイルから計算し直しており、起動時にキャッシュしていません（`backends/codex.py` の `model_catalog_digest`）。新しいカタログを読むのは C-2 で起動する新しいサービスです。
   - 今動いている旧サービス（`dbe1170`）には影響しません。旧設定には `cli_overrides` が無く（`model_catalog_json` も無い）、旧コードの config hash はカタログの中身を含まないので、`codex_home` にファイルが 1 つ増えても CLI も hash も変わりません。
+- **H-4″**（下の 10「sandbox の中の DNS」）: このホストの `EnvironmentFile` に `LEXORA_CODEX_RO_BINDS` を書きます。{{HOST_SERVICES}}（[[platform:infra-registry]]）では `LEXORA_CODEX_RO_BINDS=/run/systemd/resolve/stub-resolv.conf` です。
+  - 共有の `config/lexora_config.yaml` にはこのパスを書きません（ホストに依存するため）。
+  - 旧サービス（`dbe1170`）はこの変数を読まないので、deploy の前に書いても影響しません。読むのは C-2 で起動する新しいサービスです。
 - **H-5**（上の 6）: `systemctl cat lexora` で `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` があること、起動ログに `fallback_webhook_unset` が出ていないことを確かめます。書き足したら上の 1 の手順で再起動します。
 - **H-6′**（msg-778。shadow_report による旧 H-6 の置き換え）: deploy の前に、本番の `codex_home` で `CodexBackend.chat_completions` 経由の本物の run を 1 本流し、`tool_use_violation` が記録されないこと、`agent_message` と `turn.completed` が届くこと、usage が読めることを確かめます。shadow_report は使いません（2026-10-13 に operator が実施済み、msg-777）。
 
@@ -226,6 +229,7 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 - **C-1**: Lexora のリリース PR（`naysayer-codex` を `mode: fallback` にし、下の 10 の設定を含むもの）を main に merge します。
 - **C-2**（上の 1）: `codex.inflight_runs == 0` を確かめてから、Lexora の deploy request を出します（前回の deploy と同じ経路）。
 - **C-2′**（msg-778 の条件 2）: deploy の直後、`codex.inflight_runs == 0` を確かめて `python -m lexora.tools.verify_codex` を撃ち、`pass` を取ります。
+  - **サービスと同じ `EnvironmentFile` を読み込んだシェルで撃ちます**（`set -a; . /etc/lexora/environment; set +a`。パスは `systemctl cat lexora` で確かめる）。`LEXORA_CODEX_RO_BINDS` が無いと `ro_binds` が違う hash になり、その `pass` はサービスから見て `verification_stale` です（DNS も引けず control が落ちます）。
   - **deploy から 1 分以内に `pass` が取れなければ、窓を延ばさずに下のロールバックに進みます。**
 - **C-3**: status が `mode: codex`、`codex.codex_disabled_reason: null` になることを確かめます。ならなければ、下のロールバックに進みます。
   - 注: status の `mode` は設定の値ではなく、**次のリクエストの経路**を返します（`fallback.py` の `status_fields`）。設定が `fallback` で codex が開いていれば `codex` になります。`codex` なら成功、`fallback` なら codex が閉じています（`codex_disabled_reason` を見る）。
@@ -278,4 +282,14 @@ python -m lexora.tools.verify_codex             # カタログを書いたら必
 ### sandbox の中の DNS
 
 - このホストの `/etc/resolv.conf` は systemd-resolved の `stub-resolv.conf` への symlink です。bwrap は `/run` を入れないので、そのままでは sandbox の中で名前解決ができず、`codex exec` は `workspace routing discovery failed` で落ちます。
-- そのため `codex.ro_binds` に `stub-resolv.conf` のファイル 1 つだけを入れています（同じディレクトリにある resolved の制御ソケットは入れません）。別のホストに移すときは、そのホストの `/etc/resolv.conf` の実体を確かめてください。
+- そのため `stub-resolv.conf` のファイル 1 つだけを sandbox に読み取り専用で入れます（同じディレクトリにある resolved の制御ソケットは入れません）。
+- **このパスはホストに依存するので、共有の `config/lexora_config.yaml` には書かず、ホストごとの deploy の手順で書きます。** unit の `EnvironmentFile` に次を書きます（`deploy/environment.example` を参照）。
+
+  ```sh
+  LEXORA_CODEX_RO_BINDS=/run/systemd/resolve/stub-resolv.conf   # ":" 区切りで複数書ける
+  ```
+
+  - 値は YAML の `codex.ro_binds` に**足され**、YAML の項目と同じ検査（絶対パス・正規化・sandbox を広げないこと、上の 5）を通り、config hash に入ります。書いた・変えた・消したときは再起動のあと `verify_codex` をやり直します。
+  - 空の要素（先頭・末尾・連続した `:`）や、`codex` の backend が無い構成での設定は、起動を拒否します。
+  - `verify_codex` は同じ `EnvironmentFile` を読み込んだシェルで撃ちます（上の 9 の C-2′）。
+- 別のホストに移すときは、そのホストの `/etc/resolv.conf` の実体を確かめ、そのホストの `EnvironmentFile` に合うパスを書きます（`/etc` は sandbox に読み取り専用で入るので、`/etc/resolv.conf` が実ファイルならこの変数は要りません。`/etc` の外を指す symlink なら、その先の実ファイルのパスを書きます）。
