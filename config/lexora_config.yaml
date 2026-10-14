@@ -206,12 +206,11 @@ routing:
       codex:
         codex_home: "/srv/lexora/codex-home"
         max_concurrency: 1
-        # sandbox の中の DNS (2026-10-13 実測)。このホストの /etc/resolv.conf は
-        # systemd-resolved の stub-resolv.conf への symlink で、bwrap は /run を入れないので
-        # 中では名前解決ができず、codex exec は「workspace routing discovery failed」で落ちる。
-        # ファイル 1 つだけを読み取り専用で入れる (同じディレクトリの resolved の制御ソケットは入れない)。
-        ro_binds:
-          - "/run/systemd/resolve/stub-resolv.conf"
+        # ホストに依存する bind (sandbox の中の DNS など) はここに書かない。
+        # ホストごとに deploy の手順で、unit の EnvironmentFile の
+        # LEXORA_CODEX_RO_BINDS (":" 区切りの絶対パス) に書く。ここの ro_binds に足され、
+        # 同じ検査を通り、config hash に入る (deploy/RUNBOOK.md 10「sandbox の中の DNS」)。
+        ro_binds: []
         # ツールを全部無効にする設定 (2026-10-13 実測、codex-cli 0.160.0)。
         # naysayer はツール無しで動かす (Takahito の方針、mindwire D8 msg-6050:
         # auth.json が同じ sandbox にあるので、ファイルを読めるツールがあると読めてしまう)。
