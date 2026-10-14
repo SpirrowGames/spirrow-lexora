@@ -983,7 +983,8 @@ def _apply_codex_host_ro_binds(routing_settings: RoutingSettings, raw: str) -> N
     environment.
 
     Raises:
-        ValueError: on an empty element, or when no backend is of type
+        ValueError: on an empty element, an element containing whitespace
+            or ``#`` (an inline comment systemd would keep), or when no backend is of type
             ``codex`` (a variable that would be accepted and ignored is a
             config that lies). Only raised when the variable is non-empty.
     """
@@ -993,7 +994,17 @@ def _apply_codex_host_ro_binds(routing_settings: RoutingSettings, raw: str) -> N
             f"{CODEX_HOST_RO_BINDS_ENV}={raw!r} has an empty element; write "
             f"':'-separated absolute paths with no leading, trailing or doubled ':'."
         )
-    entries = [entry.strip() for entry in entries]
+    # PR #91 gate: systemd's EnvironmentFile keeps a trailing "# comment" in
+    # the value, while a shell that sources the same file drops it, so the
+    # service and verify_codex would see different binds. Whitespace and '#'
+    # are refused outright instead of stripped: the value must be exactly the
+    # paths, read the same way by both.
+    if any(ch.isspace() or ch == "#" for entry in entries for ch in entry):
+        raise ValueError(
+            f"{CODEX_HOST_RO_BINDS_ENV}={raw!r} contains whitespace or '#'. systemd "
+            f"EnvironmentFile does not strip a trailing comment, so put comments on "
+            f"their own line and write only ':'-separated absolute paths."
+        )
     codex_backends = [
         (name, backend)
         for name, backend in routing_settings.backends.items()
