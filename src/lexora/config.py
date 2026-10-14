@@ -1017,7 +1017,9 @@ def _apply_codex_host_ro_binds(routing_settings: RoutingSettings, raw: str) -> N
         )
     for _name, backend in codex_backends:
         assert backend.codex is not None
-        merged = [*backend.codex.ro_binds, *(e for e in entries if e not in backend.codex.ro_binds)]
+        # YAML entries first, then env entries; a path is kept once whichever
+        # source (or how many times one source) names it (PR #91 gate advisory).
+        merged = list(dict.fromkeys([*backend.codex.ro_binds, *entries]))
         backend.codex = CodexSettings.model_validate(
             {**backend.codex.model_dump(), "ro_binds": merged}
         )

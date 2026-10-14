@@ -176,3 +176,17 @@ def test_documented_assignment_loads_as_systemd_reads_it(
     for backend in _codex_backends(create_settings(SHIPPED_CONFIG)).values():
         assert backend.codex is not None
         assert backend.codex.ro_binds == [STUB]
+
+
+def test_repeats_within_the_variable_are_kept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #91 gate advisory: dedup must not depend on which source named a path."""
+    monkeypatch.setenv(CODEX_HOST_RO_BINDS_ENV, f"{STUB}:/opt/codex:{STUB}")
+    (backend,) = _codex_backends(create_settings(_write_config(tmp_path, codex=True))).values()
+    assert backend.codex is not None
+    assert backend.codex.ro_binds == ["/opt/codex", STUB]
+    monkeypatch.setenv(CODEX_HOST_RO_BINDS_ENV, f"{STUB}:{STUB}")
+    (backend,) = _codex_backends(create_settings(SHIPPED_CONFIG)).values()
+    assert backend.codex is not None
+    assert backend.codex.ro_binds == [STUB]
