@@ -246,7 +246,9 @@ class CodexSettings(BaseModel):
     ``BaseSettings`` on purpose: ``BaseSettings`` would also read these
     fields from same-named environment variables (``CODEX_HOME`` is one the
     CLI itself uses), so the process environment could silently rewrite the
-    sandbox layout. Only the YAML can set them.
+    sandbox layout. Only the YAML can set them, with one named exception:
+    ``LEXORA_CODEX_RO_BINDS`` appends host-specific ``ro_binds`` (see
+    ``_apply_codex_host_ro_binds``), validated and hashed like YAML entries.
 
     ``extra="forbid"``, and **no field here or on ``BackendSettings`` can
     turn the verification gate off**. The gate (``CodexBackend._ensure_verified``)
@@ -956,6 +958,73 @@ def _apply_frontier_model_override(
     backend.models[0].name = frontier_model
 
 
+#: Named env variable carrying host-specific ``codex.ro_binds`` entries
+#: (T-naysayer-codex-backend, human msg after msg-783: "move the host-specific
+#: path out of the shared config and into the per-host deployment step").
+#: ``:``-separated absolute paths, appended to every codex backend's YAML
+#: ``ro_binds``. Set it in the unit's ``EnvironmentFile``.
+CODEX_HOST_RO_BINDS_ENV = "LEXORA_CODEX_RO_BINDS"
+
+
+def _apply_codex_host_ro_binds(routing_settings: RoutingSettings, raw: str) -> None:
+    """Append ``LEXORA_CODEX_RO_BINDS`` to every codex backend, or refuse to start.
+
+    The shared YAML holds only binds every host needs; a bind that exists
+    because of how *one* host is set up (its ``/etc/resolv.conf`` being a
+    symlink into ``/run``) is that host's deployment step, not the repo's.
+
+    This is the one deliberate env surface for ``CodexSettings``. It is not
+    the silent rewrite ``CodexSettings`` refuses by being a ``BaseModel``:
+    the name is prefixed and explicit, the entries go through the same
+    ``_restrict_sandbox_widening`` validator as YAML entries (each backend's
+    ``CodexSettings`` is rebuilt), and they land in ``ro_binds``, which is
+    hashed — so setting, changing or dropping the variable closes the
+    verification gate until ``verify_codex`` passes under the same
+    environment.
+
+    Raises:
+        ValueError: on an empty element, an element containing whitespace
+            or ``#`` (an inline comment systemd would keep), or when no backend is of type
+            ``codex`` (a variable that would be accepted and ignored is a
+            config that lies). Only raised when the variable is non-empty.
+    """
+    entries = raw.split(":")
+    if any(not entry.strip() for entry in entries):
+        raise ValueError(
+            f"{CODEX_HOST_RO_BINDS_ENV}={raw!r} has an empty element; write "
+            f"':'-separated absolute paths with no leading, trailing or doubled ':'."
+        )
+    # PR #91 gate: systemd's EnvironmentFile keeps a trailing "# comment" in
+    # the value, while a shell that sources the same file drops it, so the
+    # service and verify_codex would see different binds. Whitespace and '#'
+    # are refused outright instead of stripped: the value must be exactly the
+    # paths, read the same way by both.
+    if any(ch.isspace() or ch == "#" for entry in entries for ch in entry):
+        raise ValueError(
+            f"{CODEX_HOST_RO_BINDS_ENV}={raw!r} contains whitespace or '#'. systemd "
+            f"EnvironmentFile does not strip a trailing comment, so put comments on "
+            f"their own line and write only ':'-separated absolute paths."
+        )
+    codex_backends = [
+        (name, backend)
+        for name, backend in routing_settings.backends.items()
+        if backend.type == "codex" and backend.codex is not None
+    ]
+    if not codex_backends:
+        raise ValueError(
+            f"{CODEX_HOST_RO_BINDS_ENV} is set but no routing backend is of type "
+            f"'codex', so the binds would be accepted and ignored. Unset it on this host."
+        )
+    for _name, backend in codex_backends:
+        assert backend.codex is not None
+        # YAML entries first, then env entries; a path is kept once whichever
+        # source (or how many times one source) names it (PR #91 gate advisory).
+        merged = list(dict.fromkeys([*backend.codex.ro_binds, *entries]))
+        backend.codex = CodexSettings.model_validate(
+            {**backend.codex.model_dump(), "ro_binds": merged}
+        )
+
+
 def create_settings(config_path: Path | None = None) -> Settings:
     """Create settings from the YAML config.
 
@@ -963,7 +1032,7 @@ def create_settings(config_path: Path | None = None) -> Settings:
     as init arguments, which take precedence over the environment, so
     nested env variables (``LEXORA_<SECTION>__*``) have no effect here.
     The only env overrides are specifically named variables such as
-    ``LEXORA_FRONTIER_MODEL``. (Bohr msg-390 v4; docstring corrected to
+    ``LEXORA_FRONTIER_MODEL`` and ``LEXORA_CODEX_RO_BINDS``. (Bohr msg-390 v4; docstring corrected to
     the actual behaviour, the loader itself is unchanged.)
 
     Args:
@@ -1042,6 +1111,11 @@ def create_settings(config_path: Path | None = None) -> Settings:
     frontier_model_env = os.environ.get("LEXORA_FRONTIER_MODEL")
     if frontier_model_env:
         _apply_frontier_model_override(routing_settings, frontier_model_env)
+
+    # Host-specific codex sandbox binds (see _apply_codex_host_ro_binds).
+    codex_ro_binds_env = os.environ.get(CODEX_HOST_RO_BINDS_ENV)
+    if codex_ro_binds_env:
+        _apply_codex_host_ro_binds(routing_settings, codex_ro_binds_env)
 
     return Settings(
         vllm=VLLMSettings(**vllm_config),

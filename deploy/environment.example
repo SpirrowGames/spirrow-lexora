@@ -28,3 +28,10 @@ LEXORA_LOGGING__FORMAT=json
 # Discord webhook URL; treat it as a credential. Unset = no notifications
 # (one WARNING at startup). See deploy/RUNBOOK.md section 6.
 # LEXORA_FALLBACK_WEBHOOK_URL=https://discord.com/api/webhooks/...
+
+# Host-specific codex sandbox binds (T-naysayer-codex-backend). ':'-separated
+# absolute paths, appended to codex.ro_binds in config/lexora_config.yaml,
+# validated and hashed like the YAML entries (re-run verify_codex after any
+# change). Needed when /etc/resolv.conf is a symlink into /run, as with
+# systemd-resolved. See deploy/RUNBOOK.md section 10.
+# LEXORA_CODEX_RO_BINDS=/run/systemd/resolve/stub-resolv.conf
