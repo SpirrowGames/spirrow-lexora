@@ -286,10 +286,12 @@ python -m lexora.tools.verify_codex             # カタログを書いたら必
 - **このパスはホストに依存するので、共有の `config/lexora_config.yaml` には書かず、ホストごとの deploy の手順で書きます。** unit の `EnvironmentFile` に次を書きます（`deploy/environment.example` を参照）。
 
   ```sh
-  LEXORA_CODEX_RO_BINDS=/run/systemd/resolve/stub-resolv.conf   # ":" 区切りで複数書ける
+  # 複数書くときは ":" で区切る。説明は必ずこのように別の行に書く
+  LEXORA_CODEX_RO_BINDS=/run/systemd/resolve/stub-resolv.conf
   ```
 
   - 値は YAML の `codex.ro_binds` に**足され**、YAML の項目と同じ検査（絶対パス・正規化・sandbox を広げないこと、上の 5）を通り、config hash に入ります。書いた・変えた・消したときは再起動のあと `verify_codex` をやり直します。
-  - 空の要素（先頭・末尾・連続した `:`）や、`codex` の backend が無い構成での設定は、起動を拒否します。
+  - **代入の行の後ろにコメントを書かないでください。** systemd の `EnvironmentFile` は行の途中の `#` をコメントとして扱わず、値に含めます（シェルで `.` したときは捨てられるので、サービスと `verify_codex` で値が食い違います）。引用符も付けません。
+  - 空の要素（先頭・末尾・連続した `:`）、空白や `#` を含む要素、`codex` の backend が無い構成での設定は、起動を拒否します。
   - `verify_codex` は同じ `EnvironmentFile` を読み込んだシェルで撃ちます（上の 9 の C-2′）。
 - 別のホストに移すときは、そのホストの `/etc/resolv.conf` の実体を確かめ、そのホストの `EnvironmentFile` に合うパスを書きます（`/etc` は sandbox に読み取り専用で入るので、`/etc/resolv.conf` が実ファイルならこの変数は要りません。`/etc` の外を指す symlink なら、その先の実ファイルのパスを書きます）。

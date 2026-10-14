@@ -120,3 +120,59 @@ def test_env_entries_reach_the_config_hash(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setenv(CODEX_HOST_RO_BINDS_ENV, STUB)
     ((_, cfg_host),) = _codex_backends(create_settings(path)).items()
     assert create_backend(name, cfg).config_hash() != create_backend(name, cfg_host).config_hash()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        f'{STUB}   # ":" separated',  # the assignment PR #91's gate flagged
+        f"{STUB} #comment",
+        f"{STUB}#x",
+        f"{STUB} :/opt/codex",
+        f"{STUB}\t",
+    ],
+)
+def test_inline_comment_or_whitespace_refuses_to_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """systemd EnvironmentFile keeps a trailing comment in the value, a sourcing
+    shell drops it; refusing both ways keeps service and verify_codex in step."""
+    monkeypatch.setenv(CODEX_HOST_RO_BINDS_ENV, value)
+    with pytest.raises(ValueError, match="whitespace or '#'"):
+        create_settings(_write_config(tmp_path, codex=True))
+
+
+DOCS = [
+    Path(__file__).resolve().parent.parent / "deploy" / "RUNBOOK.md",
+    Path(__file__).resolve().parent.parent / "deploy" / "environment.example",
+]
+
+
+def _documented_assignments() -> list[tuple[str, str]]:
+    found = []
+    for doc in DOCS:
+        for line in doc.read_text(encoding="utf-8").splitlines():
+            text = line.strip()
+            if text.startswith("#"):
+                text = text.lstrip("#").strip()  # environment.example ships it commented out
+            if text.startswith(f"{CODEX_HOST_RO_BINDS_ENV}="):
+                found.append((doc.name, text))
+    return found
+
+
+def test_docs_document_the_assignment() -> None:
+    names = {name for name, _ in _documented_assignments()}
+    assert names == {"RUNBOOK.md", "environment.example"}
+
+
+@pytest.mark.parametrize("doc,line", _documented_assignments())
+def test_documented_assignment_loads_as_systemd_reads_it(
+    monkeypatch: pytest.MonkeyPatch, doc: str, line: str
+) -> None:
+    """Copy-paste the documented line into an EnvironmentFile: systemd takes
+    everything after '=' to the end of the line as the value."""
+    _, _, value = line.partition("=")
+    monkeypatch.setenv(CODEX_HOST_RO_BINDS_ENV, value)
+    for backend in _codex_backends(create_settings(SHIPPED_CONFIG)).values():
+        assert backend.codex is not None
+        assert backend.codex.ro_binds == [STUB]
