@@ -227,13 +227,7 @@ def _replace_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
 
 
 def _key_line_value(body: str) -> tuple[int, int] | None:
-    """D-1 on a key line: the (start, end) of ``body`` to redact, or None.
-
-    From just after the line's first ``=`` / ``:`` / ``:=`` and the
-    whitespace after it, to the end of the line before trailing whitespace
-    and CR. Redacted when that is ``ASSIGNMENT_MIN_LEN``+ characters, quotes
-    included (msg-840): quotes, escapes and comments are not looked at, so a
-    misjudgement can only redact more."""
+    """D-1 on a key line: the (start, end) of ``body`` to redact, or None."""
     op = _OPERATOR_RE.search(body)
     if op is None:  # pragma: no cover - a key line always has an operator
         return None
@@ -460,13 +454,7 @@ class Redactor:
 
     # -- D-1: assignment ------------------------------------------------
     def _assignment_windows(self, lines: list[_Line], seq: list[int]) -> None:
-        """Mark D-1 runs in one sequence (msg-834 / msg-836 / msg-840).
-
-        A run starts at a key line outside a window: the key line's value
-        (when 8+ characters) plus the next ``ASSIGNMENT_WINDOW`` non-blank
-        lines in full. A key line inside the window is one of those lines --
-        redacted in full -- and restarts the count, extending the same run.
-        Blank lines are left alone and not counted."""
+        """Mark D-1 runs in one sequence (rules: module docstring)."""
         runs: list[list[tuple[int, int | None, int | None]]] = []
         current: list[tuple[int, int | None, int | None]] = []
         remaining = 0
@@ -508,16 +496,8 @@ class Redactor:
                 lines[k].d1 = (label, a, b)
 
     def _apply_assignment(self, line: _Line) -> None:
-        """Render a D-1 line, in place of ``_apply_multiline``.
-
-        In full: the whole core becomes the label, which covers any PEM span
-        on it. Value only: the value becomes the label, and the text left of
-        it keeps every PEM / body-run span the multi-line pass marked there
-        (clipped at the value's start; the part past it is inside the value)
-        before the single-line rules run on it. Rebuilding the left side from
-        the raw body without those spans would put a PEM block that precedes
-        the operator on the same line back into the output (PR-gate on #96).
-        """
+        """Render a D-1 line, in place of ``_apply_multiline``. Left of a
+        value, the multi-line spans must survive (PR-gate on #96)."""
         label, start, end = line.d1  # type: ignore[misc]
         if start is None:
             # In full: the marker, indentation, outer quotes, a trailing
