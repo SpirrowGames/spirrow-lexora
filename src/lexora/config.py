@@ -652,11 +652,36 @@ class VLLMSettings(BaseModel):
 
 
 class TierSettings(BaseModel):
-    """Tier configuration — maps a tier name to a backend and model."""
+    """Tier configuration — maps a tier name to a backend and model.
+
+    ``redact`` and ``unrouted`` are the two ingress settings of
+    ADR-2026-05-31-14 §7.3 (spirrow-mindwire#482; Lexora design:
+    T-naysayer-codex-backend msg-800, revised msg-802). ``redact`` has no
+    default on purpose: a tier that does not say whether its traffic is
+    redacted is refused at load time. The cross-tier checks (S-1..S-4) live
+    on ``RoutingSettings``, where the backends are visible.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     backend: str = Field(description="Backend name this tier routes to")
+    redact: bool = Field(
+        description=(
+            "Redact credentials in this tier's request text at ingress, before "
+            "any backend is chosen (ADR-14 §7.3). Required, no default. Must be "
+            "true for a tier whose backend chain contains codex (S-1)."
+        ),
+    )
+    unrouted: str | None = Field(
+        default=None,
+        description=(
+            "Backend that answers this tier when a request lacks the "
+            "'X-Mindwire-N3-Route: v1' declaration. Required on a tier whose "
+            "backend chain contains codex (S-2), must name a configured "
+            "backend whose own chain has no codex (S-3), and is refused on a "
+            "tier without codex (S-4)."
+        ),
+    )
     model: str | None = Field(
         default=None,
         description="Model name to send to backend (defaults to backend's first model)",
@@ -724,6 +749,65 @@ class RoutingSettings(BaseModel):
                         f"fallback backend '{name}': {role} '{target}' is type '{other.type}', "
                         f"expected '{wanted}'"
                     )
+        return self
+
+    def chain_has_codex(self, backend_name: str) -> bool:
+        """True when ``backend_name`` is a ``codex`` backend or a ``fallback``
+        wrapper whose primary or fallback target's chain contains one
+        (msg-802 §3). An unknown name has no chain, so it answers False."""
+        seen: set[str] = set()
+        pending = [backend_name]
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            backend = self.backends.get(name)
+            if backend is None:
+                continue
+            if backend.type == "codex":
+                return True
+            if backend.type == "fallback" and backend.fallback is not None:
+                pending.extend((backend.fallback.primary, backend.fallback.fallback))
+        return False
+
+    @model_validator(mode="after")
+    def _check_tier_ingress(self) -> "RoutingSettings":
+        """Startup checks S-1..S-4 (T-naysayer-codex-backend msg-802 §3;
+        ADR-14 §7.3 at spirrow-mindwire#482). Keyed on the backend chain,
+        never on the tier's name, so a codex tier added later cannot slip
+        past. Having codex in a chain is not itself a reason to refuse."""
+        for tier_name, tier in self.tiers.items():
+            has_codex = self.chain_has_codex(tier.backend)
+            if has_codex and not tier.redact:
+                raise ValueError(
+                    f"tier '{tier_name}': backend chain of '{tier.backend}' contains codex, "
+                    f"so 'redact' must be true (S-1)"
+                )
+            if has_codex and tier.unrouted is None:
+                raise ValueError(
+                    f"tier '{tier_name}': backend chain of '{tier.backend}' contains codex, "
+                    f"so 'unrouted' must name the backend that answers requests without "
+                    f"the N-3 route declaration (S-2)"
+                )
+            if tier.unrouted is None:
+                continue
+            if not has_codex:
+                raise ValueError(
+                    f"tier '{tier_name}': 'unrouted' is set to '{tier.unrouted}' but the "
+                    f"backend chain of '{tier.backend}' has no codex, so it would never "
+                    f"be used (S-4)"
+                )
+            if tier.unrouted not in self.backends:
+                raise ValueError(
+                    f"tier '{tier_name}': 'unrouted' names '{tier.unrouted}', which is not "
+                    f"a configured backend (S-3)"
+                )
+            if self.chain_has_codex(tier.unrouted):
+                raise ValueError(
+                    f"tier '{tier_name}': 'unrouted' names '{tier.unrouted}', whose backend "
+                    f"chain contains codex (S-3)"
+                )
         return self
 
     @model_validator(mode="after")

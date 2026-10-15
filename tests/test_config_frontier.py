@@ -168,6 +168,7 @@ routing:
   tiers:
     frontier:
       backend: "frontier"
+      redact: false
 """,
             encoding="utf-8",
         )
@@ -398,6 +399,7 @@ _DECOY_BACKEND = """\
 _FRONTIER_TIER_ON_PAID = """\
     frontier:
       backend: "anthropic_paid"
+      redact: false
 """
 
 
@@ -571,7 +573,7 @@ class TestFrontierOverrideRefusesRatherThanApplyingHalf:
 
     UNRESOLVABLE_BACKEND = _routing_config(
         _HEAVY_BACKEND,
-        '    frontier:\n      backend: "no_such_backend"\n',
+        '    frontier:\n      backend: "no_such_backend"\n      redact: false\n',
     )
     EMPTY_MODELS = _routing_config(
         _HEAVY_BACKEND
@@ -583,7 +585,7 @@ class TestFrontierOverrideRefusesRatherThanApplyingHalf:
     )
     NO_FRONTIER_TIER = _routing_config(
         _HEAVY_BACKEND + _DECOY_BACKEND,
-        '    heavy:\n      backend: "heavy"\n',
+        '    heavy:\n      backend: "heavy"\n      redact: false\n',
     )
 
     def test_refuses_when_tier_backend_does_not_exist(
