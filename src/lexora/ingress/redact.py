@@ -129,6 +129,8 @@ _BEARER_RE = re.compile(r"(?i)\bBearer\s+([A-Za-z0-9\-._~+/]{8,}=*)")
 _KEY_LINE_RE = re.compile(
     r"(?i)(?:password|passwd|secret|token|api[_\-]?key)[A-Za-z0-9_.\-]*[\"']?\s*(?::=|=|:)"
 )
+#: The D-1 key names alone, for structured data (a JSON member name).
+_KEY_NAME_RE = re.compile(r"(?i)(?:password|passwd|secret|token|api[_\-]?key)")
 #: The first assignment operator of a key line: D-1 redacts from after it.
 _OPERATOR_RE = re.compile(r":=|=|:")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_\-]{%d,}" % ENTROPY_MIN_LEN)
@@ -200,6 +202,12 @@ def _make_line(marker: str, body: str) -> _Line:
     return _Line(marker + prefix, core, suffix, content, marker=marker, body=body)
 
 
+def is_key_name(name: str) -> bool:
+    """True when ``name`` holds a D-1 key name (``max_tokens``, ``API_KEY``,
+    ``db_password``, ...): the structured-data form of a key line."""
+    return _KEY_NAME_RE.search(name) is not None
+
+
 def _replace_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
     """Replace (start, end, label) spans of ``text``; overlapping spans are
     merged and keep the first label."""
@@ -258,6 +266,11 @@ class Redactor:
             self._numbers[key] = self._per_kind[kind]
         self.counts[kind] += 1
         return f"[REDACTED:{kind}#{self._numbers[key]}]"
+
+    def label_assignment(self, secret: str) -> str:
+        """One ``assignment`` redaction of a whole structured value (a JSON
+        member under a D-1 key name); counted like a D-1 run."""
+        return self._label(KIND_ASSIGNMENT, secret)
 
     # -- entry point ----------------------------------------------------
     def redact(self, text: str) -> str:

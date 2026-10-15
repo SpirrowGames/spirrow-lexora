@@ -19,13 +19,16 @@ as before.
   *permits* codex on a tier that already uses it; on a tier without codex it
   is not read at all.
 * **Redaction.** For a ``redact: true`` tier every text of the request --
-  system, every message, every text block, a completion prompt, an
-  embeddings input -- is redacted in place. If the scanner raises, the
+  system, every message, every content block (``tool_use`` input,
+  ``thinking`` and unknown block types included; binary media excepted),
+  OpenAI ``tool_calls`` / ``function_call`` arguments, a completion prompt,
+  an embeddings input -- is redacted in place. If the scanner raises, the
   request fails and no backend is called (ADR-14 §7.3 失敗したとき).
 """
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -33,7 +36,7 @@ from typing import Any
 
 from lexora.backends.answer_route import AnswerRoute, set_answer_route
 from lexora.ingress.context import set_redactions
-from lexora.ingress.redact import Redactor, format_redactions
+from lexora.ingress.redact import ASSIGNMENT_MIN_LEN, Redactor, format_redactions, is_key_name
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +64,80 @@ class TierIngress:
         return self.redact or self.codex_chain
 
 
+#: Fields that only name or identify things (roles, block types, ids that a
+#: later block must match, signatures); never scanned.
+_STRUCTURAL_KEYS = frozenset(
+    {"type", "role", "id", "tool_use_id", "tool_call_id", "name", "media_type", "signature", "cache_control"}
+)
+#: Binary parts: their payload is base64 media, not text, and redacting it
+#: would only corrupt the media. Passed through.
+_BINARY_PART_TYPES = frozenset({"image", "image_url", "input_audio", "redacted_thinking"})
+
+
+def _redact_json(
+    value: Any, redactor: Redactor, *, sensitive: bool = False, skip: frozenset[str] = frozenset()
+) -> Any:
+    """Redact structured data (an Anthropic ``tool_use`` input, parsed
+    OpenAI tool-call arguments, an unknown block).
+
+    Every string is scanned as text. A JSON member is D-1's key line in
+    another syntax (``"password": ...``), so a member whose name matches the
+    D-1 key names has its value redacted under the same rule -- 8+ characters
+    as serialized, quotes included -- and when that value is an object or a
+    list, every scalar in it is redacted (the window's "redact more when
+    unsure", without a line count to apply). ``skip`` names structural
+    keys left alone at this level only: deeper down they are user data."""
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str) and key in skip and not sensitive:
+                out[key] = item
+                continue
+            key_sensitive = sensitive or (isinstance(key, str) and is_key_name(key))
+            out[key] = _redact_json(item, redactor, sensitive=key_sensitive)
+        return out
+    if isinstance(value, list):
+        return [_redact_json(item, redactor, sensitive=sensitive) for item in value]
+    if sensitive and value is not None and not isinstance(value, bool):
+        serialized = json.dumps(value, ensure_ascii=False)
+        if len(serialized) >= ASSIGNMENT_MIN_LEN:
+            return redactor.label_assignment(serialized)
+    if isinstance(value, str):
+        return redactor.redact(value)
+    return value
+
+
+def _redact_arguments(arguments: Any, redactor: Redactor) -> Any:
+    """OpenAI ``function.arguments``: a JSON string. Valid JSON is redacted
+    structurally and serialized back, so it stays valid JSON; anything else
+    is redacted as text."""
+    if not isinstance(arguments, str):
+        return _redact_json(arguments, redactor)
+    try:
+        parsed = json.loads(arguments)
+    except ValueError:
+        return redactor.redact(arguments)
+    before = sum(redactor.counts.values())
+    redacted = _redact_json(parsed, redactor)
+    if sum(redactor.counts.values()) == before:
+        return arguments  # nothing found: keep the caller's exact bytes
+    return json.dumps(redacted, ensure_ascii=False)
+
+
+def _redact_part(part: dict[str, Any], redactor: Redactor) -> dict[str, Any]:
+    kind = part.get("type")
+    if kind == "text" and isinstance(part.get("text"), str):
+        return {**part, "text": redactor.redact(part["text"])}
+    if kind == "tool_result" and "content" in part:
+        rest = _redact_json({k: v for k, v in part.items() if k != "content"}, redactor, skip=_STRUCTURAL_KEYS)
+        return {**rest, "content": _redact_content(part["content"], redactor)}
+    if kind in _BINARY_PART_TYPES:
+        return part
+    # tool_use (``input``), thinking, document, and any block type this gate
+    # does not know: every string in it is scanned (fail closed).
+    return _redact_json(part, redactor, skip=_STRUCTURAL_KEYS)  # type: ignore[no-any-return]
+
+
 def _redact_content(content: Any, redactor: Redactor) -> Any:
     """Redact an OpenAI/Anthropic message ``content`` (str or part list)."""
     if isinstance(content, str):
@@ -70,28 +147,58 @@ def _redact_content(content: Any, redactor: Redactor) -> Any:
         for part in content:
             if isinstance(part, str):
                 out.append(redactor.redact(part))
-            elif isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                out.append({**part, "text": redactor.redact(part["text"])})
-            elif isinstance(part, dict) and part.get("type") == "tool_result" and "content" in part:
-                out.append({**part, "content": _redact_content(part["content"], redactor)})
+            elif isinstance(part, dict):
+                out.append(_redact_part(part, redactor))
             else:
                 out.append(part)
         return out
     return content
 
 
+def _redact_message(message: dict[str, Any], redactor: Redactor) -> None:
+    """Redact one message in place: ``content``, OpenAI ``tool_calls`` /
+    ``function_call`` arguments, and every other text field (``refusal``,
+    ``reasoning_content``, ...). Structural fields are left alone."""
+    for key, value in list(message.items()):
+        if key in _STRUCTURAL_KEYS:
+            continue
+        if key == "content":
+            message[key] = _redact_content(value, redactor)
+        elif key == "tool_calls" and isinstance(value, list):
+            message[key] = [_redact_tool_call(call, redactor) for call in value]
+        elif key == "function_call" and isinstance(value, dict):
+            message[key] = _redact_tool_call({"function": value}, redactor)["function"]
+        else:
+            message[key] = _redact_json(value, redactor)
+
+
+def _redact_tool_call(call: Any, redactor: Redactor) -> Any:
+    if not isinstance(call, dict):
+        return _redact_json(call, redactor)
+    function = call.get("function")
+    rest = _redact_json({k: v for k, v in call.items() if k != "function"}, redactor, skip=_STRUCTURAL_KEYS)
+    if not isinstance(function, dict):
+        return {**rest, **({"function": _redact_json(function, redactor)} if "function" in call else {})}
+    fn_rest = _redact_json({k: v for k, v in function.items() if k != "arguments"}, redactor, skip=_STRUCTURAL_KEYS)
+    if "arguments" in function:
+        fn_rest["arguments"] = _redact_arguments(function["arguments"], redactor)
+    return {**rest, "function": fn_rest}
+
+
 def redact_request(request: dict[str, Any]) -> Counter[str]:
     """Redact every text of ``request`` in place; return counts by kind.
 
-    Covers ``messages[*].content`` (which carries the system prompt: the
-    ``/v1/messages`` adapter turns ``system`` into the first message),
-    ``system`` if still present, ``prompt`` and ``input``."""
+    Covers every message (which carries the system prompt: the
+    ``/v1/messages`` adapter turns ``system`` into the first message) --
+    its ``content`` blocks of any type but binary media, OpenAI
+    ``tool_calls`` / ``function_call`` arguments and its other text fields
+    -- plus ``system`` if still present, ``prompt`` and ``input``."""
     redactor = Redactor()
     messages = request.get("messages")
     if isinstance(messages, list):
         for message in messages:
-            if isinstance(message, dict) and "content" in message:
-                message["content"] = _redact_content(message["content"], redactor)
+            if isinstance(message, dict):
+                _redact_message(message, redactor)
     for key in ("system", "prompt", "input"):
         if key in request:
             request[key] = _redact_content(request[key], redactor)
