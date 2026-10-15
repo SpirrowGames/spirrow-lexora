@@ -156,9 +156,7 @@ def _redact_content(content: Any, redactor: Redactor) -> Any:
 
 
 def _redact_message(message: dict[str, Any], redactor: Redactor) -> None:
-    """Redact one message in place: ``content``, OpenAI ``tool_calls`` /
-    ``function_call`` arguments, and every other text field (``refusal``,
-    ``reasoning_content``, ...). Structural fields are left alone."""
+    """Redact one message in place (see ``redact_request``)."""
     for key, value in list(message.items()):
         if key in _STRUCTURAL_KEYS:
             continue

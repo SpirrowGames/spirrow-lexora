@@ -1,11 +1,4 @@
-"""``redact_request`` beyond message text: tool calls and non-text blocks.
-
-PR-gate on #96 (T-naysayer-codex-backend): a credential inside an OpenAI
-``tool_calls[*].function.arguments`` string or an Anthropic ``tool_use``
-``input`` reached the backend unredacted, because only ``content`` text was
-scanned. The codex backend refuses both, but a ``redact: true`` tier also
-answers through Gemini (``unrouted``, ``naysayer-gemini``, fallback).
-"""
+"""``redact_request`` on tool calls and non-text blocks (PR-gate on #96)."""
 
 from __future__ import annotations
 
