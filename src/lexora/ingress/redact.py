@@ -200,6 +200,24 @@ def _make_line(marker: str, body: str) -> _Line:
     return _Line(marker + prefix, core, suffix, content, marker=marker, body=body)
 
 
+def _replace_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
+    """Replace (start, end, label) spans of ``text``; overlapping spans are
+    merged and keep the first label."""
+    merged: list[list[object]] = []
+    for start, end, label in sorted(spans):
+        if merged and start <= merged[-1][1]:  # type: ignore[operator]
+            merged[-1][1] = max(merged[-1][1], end)  # type: ignore[call-overload,type-var]
+            continue
+        merged.append([start, end, label])
+    out, last = [], 0
+    for start, end, label in merged:
+        out.append(text[last:start])  # type: ignore[misc]
+        out.append(label)  # type: ignore[arg-type]
+        last = end  # type: ignore[assignment]
+    out.append(text[last:])
+    return "".join(out)  # type: ignore[arg-type]
+
+
 def _key_line_value(body: str) -> tuple[int, int] | None:
     """D-1 on a key line: the (start, end) of ``body`` to redact, or None.
 
@@ -315,10 +333,11 @@ class Redactor:
         for seq in d1_sequences:
             self._assignment_windows(lines, seq)
         for line in lines:
-            self._apply_multiline(line)
             if line.d1 is not None:
-                self._apply_assignment(line)
-            elif line.content:
+                self._apply_assignment(line)  # applies the multi-line spans too
+                continue
+            self._apply_multiline(line)
+            if line.content:
                 line.core = self._single_line(line.core)
 
         return "\n".join(line.prefix + line.core + line.suffix for line in lines)
@@ -423,19 +442,7 @@ class Redactor:
         """Replace the marked spans (merged where two sequences overlap)."""
         if not line.spans:
             return
-        merged: list[list[object]] = []
-        for start, end, label in sorted(line.spans):
-            if merged and start <= merged[-1][1]:  # type: ignore[operator]
-                merged[-1][1] = max(merged[-1][1], end)  # type: ignore[call-overload,type-var]
-                continue
-            merged.append([start, end, label])
-        out, last = [], 0
-        for start, end, label in merged:
-            out.append(line.core[last:start])  # type: ignore[misc]
-            out.append(label)  # type: ignore[arg-type]
-            last = end  # type: ignore[assignment]
-        out.append(line.core[last:])
-        line.core = "".join(out)  # type: ignore[arg-type]
+        line.core = _replace_spans(line.core, line.spans)
         line.spans = []
 
     # -- D-1: assignment ------------------------------------------------
@@ -488,18 +495,36 @@ class Redactor:
                 lines[k].d1 = (label, a, b)
 
     def _apply_assignment(self, line: _Line) -> None:
-        """Render a D-1 line. Runs after ``_apply_multiline``; D-1 replaces
-        whatever a PEM span put on the same line."""
+        """Render a D-1 line, in place of ``_apply_multiline``.
+
+        In full: the whole core becomes the label, which covers any PEM span
+        on it. Value only: the value becomes the label, and the text left of
+        it keeps every PEM / body-run span the multi-line pass marked there
+        (clipped at the value's start; the part past it is inside the value)
+        before the single-line rules run on it. Rebuilding the left side from
+        the raw body without those spans would put a PEM block that precedes
+        the operator on the same line back into the output (PR-gate on #96).
+        """
         label, start, end = line.d1  # type: ignore[misc]
         if start is None:
             # In full: the marker, indentation, outer quotes, a trailing
             # ``,``/``\`` and the CR stay (``_split_core``).
+            line.spans = []
             if line.core:
                 line.core = label
             return
         body = line.body or ""
+        # ``core`` starts at this offset of ``body`` (``prefix`` = marker +
+        # the stripped lead), so a core span maps to body coordinates.
+        offset = len(line.prefix) - len(line.marker)
+        left = [
+            (offset + a, min(offset + b, start), lab)
+            for a, b, lab in line.spans
+            if offset + a < start
+        ]
+        line.spans = []
         line.prefix = line.marker
-        line.core = self._single_line(body[:start]) + label
+        line.core = self._single_line(_replace_spans(body[:start], left)) + label
         line.suffix = body[end:]
 
     # -- single-line ----------------------------------------------------
