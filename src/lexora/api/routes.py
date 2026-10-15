@@ -41,6 +41,7 @@ from lexora.backends.fallback import FallbackBackend
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.gemini import GeminiGovernanceError
 from lexora.backends.vllm import VLLMBackend
+from lexora.ingress.gate import N3_ROUTE_HEADER, RedactionFailed, apply_ingress
 from lexora.services.metrics import STREAM_USAGE_MISSING_TOTAL, MetricsCollector
 from lexora.services.model_registry import ModelRegistry
 from lexora.services.rate_limiter import RateLimiter
@@ -455,6 +456,34 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
     return getattr(request.app.state, "cost_tracker", None)
 
 
+def get_n3_route(request: Request) -> str | None:
+    """The raw ``X-Mindwire-N3-Route`` header, or None (ADR-14 §7.3).
+
+    Read verbatim: ``apply_ingress`` treats anything but ``v1`` as absent."""
+    return request.headers.get(N3_ROUTE_HEADER)
+
+
+def _apply_ingress(
+    backend_router: BackendRouter,
+    requested: str,
+    n3_route: str | None,
+    request_dict: dict[str, Any],
+    backend: Any,
+) -> Any:
+    """``lexora.ingress.gate.apply_ingress`` for a route handler.
+
+    Called by every handler that sends a tier request, after the request it
+    will send is built and before any backend call or stats bookkeeping. A
+    scanner failure answers 500 and calls no backend (ADR-14 §7.3)."""
+    try:
+        return apply_ingress(backend_router, requested, n3_route, request_dict, backend)
+    except RedactionFailed as e:
+        raise HTTPException(
+            status_code=500,
+            detail="request redaction failed; the request was not sent to any backend",
+        ) from e
+
+
 def get_trace_id(request: Request) -> str | None:
     """Validated ``X-Mindwire-Trace`` of this request (T-cost-row-trace-id).
 
@@ -524,6 +553,7 @@ async def chat_completions(
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
     trace_id: str | None = Depends(get_trace_id),
+    n3_route: str | None = Depends(get_n3_route),
 ) -> dict[str, Any] | StreamingResponse:
     """Proxy chat completion request to vLLM.
 
@@ -552,6 +582,7 @@ async def chat_completions(
     # Convert to dict, excluding None values
     request_dict = request.model_dump(exclude_none=True)
     request_dict["model"] = resolved_model
+    backend = _apply_ingress(backend_router, request.model, n3_route, request_dict, backend)
 
     # Handle streaming request
     if request.stream:
@@ -1038,6 +1069,7 @@ async def completions(
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
     trace_id: str | None = Depends(get_trace_id),
+    n3_route: str | None = Depends(get_n3_route),
 ) -> dict[str, Any] | StreamingResponse:
     """Proxy completion request to vLLM.
 
@@ -1067,6 +1099,7 @@ async def completions(
     # Convert to dict, excluding None values
     request_dict = request.model_dump(exclude_none=True)
     request_dict["model"] = resolved_model
+    backend = _apply_ingress(backend_router, request.model, n3_route, request_dict, backend)
 
     # Handle streaming request
     if request.stream:
@@ -1473,6 +1506,7 @@ async def embeddings(
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
     trace_id: str | None = Depends(get_trace_id),
+    n3_route: str | None = Depends(get_n3_route),
 ) -> dict[str, Any]:
     """Proxy embeddings request to vLLM.
 
@@ -1497,6 +1531,8 @@ async def embeddings(
     # Get backend for the requested model
     backend = backend_router.get_backend_for_model(request.model)
     resolved_model = backend_router.resolve_model(request.model)
+    request_dict = request.model_dump(exclude_none=True)
+    backend = _apply_ingress(backend_router, request.model, n3_route, request_dict, backend)
 
     stats = stats_collector.start_request(
         endpoint=endpoint,
@@ -1510,7 +1546,6 @@ async def embeddings(
         metrics_collector.record_request_start(endpoint)
 
     try:
-        request_dict = request.model_dump(exclude_none=True)
         response = await backend.embeddings(request_dict)
 
         # Extract token counts from response if available
@@ -1920,6 +1955,7 @@ async def generate(
     model_registry: ModelRegistry | None = Depends(get_model_registry),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
     trace_id: str | None = Depends(get_trace_id),
+    n3_route: str | None = Depends(get_n3_route),
 ) -> GenerateResponse:
     """Simple text generation endpoint.
 
@@ -1988,6 +2024,7 @@ async def generate(
         exclude={"prompt", "max_tokens", "temperature", "model", "user"}
     )
     completion_request.update(extra_fields)
+    backend = _apply_ingress(backend_router, model, n3_route, completion_request, backend)
 
     stats = stats_collector.start_request(
         endpoint=endpoint,
@@ -2118,6 +2155,7 @@ async def chat(
     model_registry: ModelRegistry | None = Depends(get_model_registry),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
     trace_id: str | None = Depends(get_trace_id),
+    n3_route: str | None = Depends(get_n3_route),
 ) -> ChatResponse:
     """Simple chat endpoint.
 
@@ -2176,6 +2214,7 @@ async def chat(
         exclude={"messages", "max_tokens", "temperature", "model", "user"}
     )
     chat_request.update(extra_fields)
+    backend = _apply_ingress(backend_router, model, n3_route, chat_request, backend)
 
     stats = stats_collector.start_request(
         endpoint=endpoint,
@@ -2301,6 +2340,7 @@ async def messages(
     metrics_collector: MetricsCollector | None = Depends(get_metrics_collector),
     cost_tracker: CostTracker | None = Depends(get_cost_tracker),
     trace_id: str | None = Depends(get_trace_id),
+    n3_route: str | None = Depends(get_n3_route),
 ) -> dict[str, Any] | JSONResponse | StreamingResponse:
     """Anthropic Messages API-compatible endpoint.
 
@@ -2352,6 +2392,7 @@ async def messages(
 
     openai_request = anthropic_to_openai_request(req_dict)
     openai_request["model"] = resolved_model
+    backend = _apply_ingress(backend_router, request.model, n3_route, openai_request, backend)
 
     passthrough = getattr(backend, "error_passthrough", False)
 

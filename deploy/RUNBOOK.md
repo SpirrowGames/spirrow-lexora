@@ -221,6 +221,10 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 - **H-4″**（下の 10「sandbox の中の DNS」）: このホストの `EnvironmentFile` に `LEXORA_CODEX_RO_BINDS` を書きます。{{HOST_SERVICES}}（[[platform:infra-registry]]）では `LEXORA_CODEX_RO_BINDS=/run/systemd/resolve/stub-resolv.conf` です。
   - 共有の `config/lexora_config.yaml` にはこのパスを書きません（ホストに依存するため）。
   - 旧サービス（`dbe1170`）はこの変数を読まないので、deploy の前に書いても影響しません。読むのは C-2 で起動する新しいサービスです。
+- **H-4‴**（ADR-14 §7.3、spirrow-mindwire#482。T-naysayer-codex-backend msg-800 §1 / msg-802）: サービスが共有の `config/lexora_config.yaml` ではなくホストの設定ファイル（例 `/etc/lexora/config.yaml`）を読んでいる場合は、**どの deploy よりも先に**、その中のすべてのティアに `redact:` を書きます。`redact` には既定値が無く、書いていないティアがあると新しいサービスは起動しません。
+  - 値は共有の YAML と同じにします: `naysayer` と `naysayer-gemini` は `true`、ほかは `false`。
+  - 連鎖に codex を含むティア（`naysayer`）には `unrouted: "gemini"` も書きます。書かないと起動しません（S-2）。codex を含まないティアに `unrouted` を書いても起動しません（S-4）。
+  - 旧サービス（`dbe1170`）はこの 2 つのキーを知らず、`extra="forbid"` で起動を拒否します。したがって、ホストの設定ファイルを書き換えるのは C-2 の直前です。共有の YAML を使っている場合は、リリースのコードに入っているので作業はありません。
 - **H-5**（上の 6）: `systemctl cat lexora` で `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` があること、起動ログに `fallback_webhook_unset` が出ていないことを確かめます。書き足したら上の 1 の手順で再起動します。
 - **H-6′**（msg-778。shadow_report による旧 H-6 の置き換え）: deploy の前に、本番の `codex_home` で `CodexBackend.chat_completions` 経由の本物の run を 1 本流し、`tool_use_violation` が記録されないこと、`agent_message` と `turn.completed` が届くこと、usage が読めることを確かめます。shadow_report は使いません（2026-10-13 に operator が実施済み、msg-777）。
 
@@ -245,6 +249,13 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
   ```
 
   - C-4 の前に `failure_hold` の繰り返しが見えたら、#463/#464 は merge しません。
+  - **N-3 の経路の宣言と伏せ字**（ADR-14 §7.3）: `X-Mindwire-N3-Route: v1` の無い naysayer の要求は codex を試さず、`unrouted`（Gemini）が答えます。その行は `backend='gemini'`・`answered_by='gemini'` で、ジャーナルに `n3_route_unrouted`（`n3_route=absent`）が出ます。ヘッダを付ける mindwire（#463）が deploy されるまでは、すべての naysayer の要求がこの形になります。C-5 で `answered_by='codex'` の行が出ない場合は、まずこれを疑います。
+  - 伏せ字をした行は `redactions` に `kind:count,…`（数だけ）が入ります。
+
+  ```sh
+  sqlite3 data/costs.db "SELECT id, backend, answered_by, redactions FROM request_costs ORDER BY id DESC LIMIT 5;"
+  journalctl -u lexora --since '-15 min' | grep -E 'n3_route_unrouted|ingress_redaction_failed'
+  ```
 
 ### ロールバック
 

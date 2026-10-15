@@ -449,8 +449,8 @@ class TestBackendRouterTierRouting:
         """Test that tier names route to the configured backend."""
         router = self._make_router(
             tiers={
-                "light": TierSettings(backend="backend1"),
-                "heavy": TierSettings(backend="backend2"),
+                "light": TierSettings(redact=False, backend="backend1"),
+                "heavy": TierSettings(redact=False, backend="backend2"),
             }
         )
 
@@ -481,7 +481,7 @@ class TestBackendRouterTierRouting:
                     ),
                 },
                 tiers={
-                    "model-a": TierSettings(backend="backend2"),
+                    "model-a": TierSettings(redact=False, backend="backend2"),
                 },
             )
 
@@ -490,7 +490,7 @@ class TestBackendRouterTierRouting:
         are refused, not silently routed to ``default_backend``."""
         router = self._make_router(
             tiers={
-                "light": TierSettings(backend="backend1"),
+                "light": TierSettings(redact=False, backend="backend1"),
             }
         )
 
@@ -505,8 +505,8 @@ class TestBackendRouterTierRouting:
         silently routed to ``default_backend``."""
         router = self._make_router(
             tiers={
-                "broken": TierSettings(backend="nonexistent"),
-                "valid": TierSettings(backend="backend2"),
+                "broken": TierSettings(redact=False, backend="nonexistent"),
+                "valid": TierSettings(redact=False, backend="backend2"),
             }
         )
 
@@ -521,7 +521,7 @@ class TestBackendRouterTierRouting:
         """Test that get_backend_name_for_model also resolves tiers."""
         router = self._make_router(
             tiers={
-                "light": TierSettings(backend="backend2"),
+                "light": TierSettings(redact=False, backend="backend2"),
             }
         )
 
@@ -629,7 +629,7 @@ class TestBackendRouterIsTier:
                     "b2": BackendSettings(url="http://localhost:2", models=["m2"]),
                 },
                 tiers={
-                    "frontier": TierSettings(backend="b2", model="m2"),
+                    "frontier": TierSettings(redact=False, backend="b2", model="m2"),
                 },
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),
@@ -658,7 +658,7 @@ class TestBackendRouterListModelsTierEntries:
                     "b1": BackendSettings(url="http://localhost:1", models=["real-model"]),
                 },
                 tiers={
-                    "frontier": TierSettings(backend="b1", model="real-model"),
+                    "frontier": TierSettings(redact=False, backend="b1", model="real-model"),
                 },
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),

@@ -31,7 +31,7 @@ def _routing(tmp_path: Path, **fallback: Any) -> RoutingSettings:
         enabled=True,
         default_backend="gemini",
         backends=_backends(tmp_path, **fallback),
-        tiers={"naysayer": {"backend": "naysayer-fb", "model": "gemini-3.1-pro-preview"}},
+        tiers={"naysayer": {"backend": "naysayer-fb", "model": "gemini-3.1-pro-preview", "redact": True, "unrouted": "gemini"}},
     )
 
 
