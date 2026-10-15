@@ -42,12 +42,15 @@ routing:
   tiers:
     light:
       backend: "light"
+      redact: false
       description: "軽量タスク (no thinking)"
     medium:
       backend: "heavy"
+      redact: false
       description: "標準タスク (with thinking)"
     heavy:
       backend: "deep"
+      redact: false
       description: "複雑なタスク (Qwen3.8-27B, reasoning_effort=xhigh)"
     # role ルート: naysayer は別訓練分布 (Gemini) で最大独立性を取る
     # (ADR-2026-05-31-15 D-2「2 協調 1 独立」)。呼び出し側は model: "naysayer"
@@ -60,14 +63,23 @@ routing:
     # model の gemini-3.1-pro-preview は fallback 先の解決
     # (resolve_model("naysayer")) に使うので残す。codex には渡らない。
     # 切替は Takahito の Tier-C 判断 (msg-762、2026-10-13) で決着済み。
+    # redact / unrouted (ADR-14 §7.3, spirrow-mindwire#482; msg-800/802):
+    # 連鎖に codex を含むので redact: true が必須 (S-1)。
+    # X-Mindwire-N3-Route: v1 の無い要求は codex を試さず unrouted (Gemini) が
+    # 答え、n3_route=absent をログに残す (S-2/S-3)。
     naysayer:
       backend: "naysayer-codex"
       model: "gemini-3.1-pro-preview"
+      redact: true
+      unrouted: "gemini"
       description: "naysayer (codex が回答、閉じている間は Gemini にフォールバック)"
     # Gemini だけに直結する naysayer (msg-687 E)。codex を一切通さない入口。
+    # redact: true は Takahito の「伏せ字」がベンダーを問わず naysayer の
+    # 通信に対するものだから (ADR-14 §7.3)。codex は無いので unrouted は置かない (S-4)。
     naysayer-gemini:
       backend: "gemini"
       model: "gemini-3.1-pro-preview"
+      redact: true
       description: "naysayer (Gemini 直結、codex を通さない)"
     # frontier: heavy とは別に「一番賢い有料モデル」の入口を独立させる
     # (T-frontier-tier, 2026-08-31)。heavy はローカル vLLM (限界費用ゼロ)、
@@ -85,6 +97,7 @@ routing:
     # 「指名したモデルの名前で別のモデルに課金される」ため (B-19)。
     frontier:
       backend: "frontier"
+      redact: false
       description: "最上位モデル (Anthropic Claude Fable 5 既定、env で差し替え可)"
 
   # タスク分類設定

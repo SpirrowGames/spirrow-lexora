@@ -341,7 +341,7 @@ class TestTierBackendCollision:
                     ),
                 },
                 tiers={
-                    "frontier": TierSettings(backend="b1", model="frontier"),
+                    "frontier": TierSettings(redact=False, backend="b1", model="frontier"),
                 },
             )
         # The message must name both sides so the operator can fix it.
@@ -360,7 +360,7 @@ class TestTierBackendCollision:
                 ),
             },
             tiers={
-                "light": TierSettings(backend="b1", model="real-model"),
+                "light": TierSettings(redact=False, backend="b1", model="real-model"),
             },
         )
         assert "light" in settings.tiers
@@ -473,9 +473,9 @@ def _shared_model_router() -> BackendRouter:
                 ),
             },
             tiers={
-                "light": TierSettings(backend="b1", model="dup-model"),
-                "medium": TierSettings(backend="b2", model="dup-model"),
-                "heavy": TierSettings(backend="b3", model="dup-model"),
+                "light": TierSettings(redact=False, backend="b1", model="dup-model"),
+                "medium": TierSettings(redact=False, backend="b2", model="dup-model"),
+                "heavy": TierSettings(redact=False, backend="b3", model="dup-model"),
             },
         ),
         vllm_settings=VLLMSettings(url="http://localhost:8000"),
@@ -602,7 +602,7 @@ class TestUnknownModelRefused:
                         models=[{"name": "model-a"}],
                     ),
                 },
-                tiers={"light": TierSettings(backend="b1", model="model-a")},
+                tiers={"light": TierSettings(redact=False, backend="b1", model="model-a")},
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),
         )
@@ -724,7 +724,7 @@ class TestRefusalMessageOffersOnlyRealRemedies:
                         url="http://localhost:3", models=[{"name": "unrelated"}]
                     ),
                 },
-                tiers={"elsewhere": TierSettings(backend="b3")},
+                tiers={"elsewhere": TierSettings(redact=False, backend="b3")},
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),
         )
@@ -792,7 +792,7 @@ class TestRemedyTiersResolveToTheRequestedModel:
         )
 
     def test_tier_resolving_to_a_different_model_is_not_offered(self) -> None:
-        router = self._router({"vision": TierSettings(backend="b1", model="other")})
+        router = self._router({"vision": TierSettings(redact=False, backend="b1", model="other")})
         # The tier is a live route -- to the wrong model. That is what
         # makes offering it worse than offering nothing.
         assert router.resolve_model("vision") == "other"
@@ -809,8 +809,8 @@ class TestRemedyTiersResolveToTheRequestedModel:
         """The pin against over-narrowing: "offer nothing" is not the fix."""
         router = self._router(
             {
-                "vision": TierSettings(backend="b1", model="other"),
-                "big": TierSettings(backend="b2", model="shared"),
+                "vision": TierSettings(redact=False, backend="b1", model="other"),
+                "big": TierSettings(redact=False, backend="b2", model="shared"),
             }
         )
         assert router.resolve_model("big") == "shared"
@@ -834,7 +834,7 @@ class TestRemedyTiersResolveToTheRequestedModel:
         *does* reach a colliding backend, so any message denying that is
         untrue even though the remedy list is now right.
         """
-        router = self._router({"vision": TierSettings(backend="b1", model="other")})
+        router = self._router({"vision": TierSettings(redact=False, backend="b1", model="other")})
         # Stated through the public lookup so the precondition is not a
         # restatement of the implementation: 'vision' routes to 'b1',
         # and 'b1' is one of the backends the message itself names.
@@ -987,7 +987,7 @@ class TestListModelsMatchesRoutableSet:
                         url="http://localhost:1", models=[{"name": "current-name"}]
                     ),
                 },
-                tiers={"light": TierSettings(backend="b1")},
+                tiers={"light": TierSettings(redact=False, backend="b1")},
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),
         )
@@ -1120,7 +1120,7 @@ class TestListModelsAdvertisesEveryRoutableName:
                         url="http://localhost:2", models=[{"name": "somewhere-else"}]
                     ),
                 },
-                tiers={"light": TierSettings(backend="b1")},
+                tiers={"light": TierSettings(redact=False, backend="b1")},
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),
         )
@@ -1324,8 +1324,8 @@ class TestListingAttributionMatchesDeclaration:
                     ),
                 },
                 tiers={
-                    "fast": TierSettings(backend="alpha"),
-                    "slow": TierSettings(backend="beta"),
+                    "fast": TierSettings(redact=False, backend="alpha"),
+                    "slow": TierSettings(redact=False, backend="beta"),
                 },
             ),
             vllm_settings=VLLMSettings(url="http://localhost:8000"),
@@ -1425,7 +1425,7 @@ def app_with_shared_model_router(monkeypatch: pytest.MonkeyPatch):
                         url="http://localhost:2", models=[{"name": "dup-model"}]
                     ),
                 },
-                tiers={"light": TierSettings(backend="b1", model="dup-model")},
+                tiers={"light": TierSettings(redact=False, backend="b1", model="dup-model")},
             ),
             # Keep the decision log in memory so this test does not
             # write ``data/decisions.db`` as an incidental side effect
@@ -1537,7 +1537,7 @@ def app_with_shared_model_router_app(monkeypatch: pytest.MonkeyPatch):
                         url="http://localhost:2", models=[{"name": "dup-model"}]
                     ),
                 },
-                tiers={"light": TierSettings(backend="b1", model="dup-model")},
+                tiers={"light": TierSettings(redact=False, backend="b1", model="dup-model")},
             ),
             # Same log-path override as the sibling fixture above:
             # tests do not need to persist rows across a process

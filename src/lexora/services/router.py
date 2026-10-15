@@ -8,6 +8,7 @@ from lexora.backends.factory import create_backend, create_fallback_backend
 from lexora.backends.fallback import FallbackBackend
 from lexora.backends.vllm import VLLMBackend
 from lexora.config import RoutingSettings, VLLMSettings
+from lexora.ingress.gate import TierIngress
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -51,6 +52,9 @@ class BackendRouter:
 
         self._tier_to_backend: dict[str, str] = {}
         self._tier_to_model: dict[str, str] = {}
+        #: Per-tier ingress settings (ADR-14 §7.3; msg-802 §5): computed once
+        #: here so the ingress gate never walks backend settings per request.
+        self._tier_ingress: dict[str, TierIngress] = {}
 
         if self._routing_enabled and routing_settings.backends:
             # Multi-backend mode using factory.
@@ -132,6 +136,11 @@ class BackendRouter:
             for tier_name, tier_settings in routing_settings.tiers.items():
                 if tier_settings.backend in self._backends:
                     self._tier_to_backend[tier_name] = tier_settings.backend
+                    self._tier_ingress[tier_name] = TierIngress(
+                        redact=tier_settings.redact,
+                        codex_chain=routing_settings.chain_has_codex(tier_settings.backend),
+                        unrouted=tier_settings.unrouted,
+                    )
                     # Resolve model name: explicit > backend's first model
                     backend_settings = routing_settings.backends[tier_settings.backend]
                     model_name = tier_settings.model
@@ -433,6 +442,10 @@ class BackendRouter:
             True iff ``name`` is a registered tier.
         """
         return name in self._tier_to_backend
+
+    def tier_ingress(self, name: str) -> TierIngress | None:
+        """The ingress settings of tier ``name``; None when it is not a tier."""
+        return self._tier_ingress.get(name)
 
     def get_backend_by_name(self, name: str) -> Backend | None:
         """Get a backend by its name.

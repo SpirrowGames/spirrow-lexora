@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from lexora.backends.answer_route import SUBSCRIPTION_ANSWERS, current_answer_route
+from lexora.ingress.context import current_redactions
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -261,6 +262,12 @@ class CostTracker:
             # invalid one, and for every row written before this migration.
             if "trace_id" not in cols:
                 conn.execute("ALTER TABLE request_costs ADD COLUMN trace_id TEXT")
+            # ADR-14 §7.3 記録 (T-naysayer-codex-backend msg-800 §6): what the
+            # ingress redacted, as ``kind:count,...`` sorted by kind -- counts
+            # only, never the text. NULL when nothing was redacted, when the
+            # tier has ``redact: false``, and for every older row. Add-only.
+            if "redactions" not in cols:
+                conn.execute("ALTER TABLE request_costs ADD COLUMN redactions TEXT")
             conn.execute(
                 """CREATE INDEX IF NOT EXISTS idx_costs_trace_id
                    ON request_costs(trace_id)"""
@@ -459,8 +466,8 @@ class CostTracker:
                         tokens_input, tokens_output, cost_usd,
                         duration_seconds, success, tier, pricing_known,
                         tokens_thinking, tokens_cached_input, answered_by,
-                        trace_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        trace_id, redactions)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         timestamp,
                         model,
@@ -478,6 +485,7 @@ class CostTracker:
                         tokens_cached_input,
                         answered_by,
                         trace_id,
+                        current_redactions(),
                     ),
                 )
         except Exception:

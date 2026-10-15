@@ -186,9 +186,9 @@ def _router() -> BackendRouter:
                 "solo": BackendSettings(url="http://localhost:4", models=[{"name": SOLO}]),
             },
             tiers={
-                "light": TierSettings(backend="b1", model=SHARED),
-                "medium": TierSettings(backend="b2", model=SHARED),
-                "heavy": TierSettings(backend="b3", model=SHARED),
+                "light": TierSettings(redact=False, backend="b1", model=SHARED),
+                "medium": TierSettings(redact=False, backend="b2", model=SHARED),
+                "heavy": TierSettings(redact=False, backend="b3", model=SHARED),
             },
         ),
         vllm_settings=VLLMSettings(),

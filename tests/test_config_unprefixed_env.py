@@ -122,6 +122,8 @@ UNPREFIXED_ENV: dict[str, str] = {
     # TierSettings / ClassifierSettings
     "BACKEND": "envbackend",
     "MODEL": "envmodel",
+    "REDACT": "true",
+    "UNROUTED": "envbackend",
     # RoutingSettings / ClassifierSettings / RateLimitSettings
     "ENABLED": "true",
     "DEFAULT_BACKEND": "envbackend",
@@ -194,6 +196,7 @@ routing:
   tiers:
     t:
       backend: b
+      redact: false
   classifier:
     backend: b
 decision:
