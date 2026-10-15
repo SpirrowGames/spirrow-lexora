@@ -406,6 +406,33 @@ class TestD1Assignment:
         assert out.split("\n")[1] == "  [REDACTED:assignment#1]"
         assert counts[KIND_ASSIGNMENT] == 1
 
+    @pytest.mark.parametrize("rows", [ROWS[:2], ROWS], ids=["operator-after-pem", "pad-equals-inside-pem"])
+    def test_one_line_pem_before_the_operator_stays_redacted(self, rows: list[str]) -> None:
+        """PR-gate on #96: a one-line (escaped ``\\n``) PEM block left of a
+        key line's first operator must keep its PEM redaction. With all
+        ROWS, the base64 pad ``=`` inside the block is the first operator."""
+        one = '"' + BEGIN + "\\n" + "\\n".join(rows) + "\\n" + END + '" token=abcdefghij'
+        assert "\n" not in one
+        out, counts = redact(one)
+        _assert_redacted(one, out)
+        assert out.startswith('"[REDACTED:pem#1]')
+        assert out.endswith("[REDACTED:assignment#1]")
+        assert counts[KIND_PEM] == 1 and counts[KIND_ASSIGNMENT] == 1
+
+    def test_gate_example_pem_value_then_key(self) -> None:
+        one = '{"private_key": "' + BEGIN + "\\n" + "\\n".join(ROWS) + "\\n" + END + '", "api_key": "sk-12345"}'
+        out, _ = redact(one)
+        _assert_redacted(one, out)
+        assert "sk-12345" not in out
+
+    def test_multi_line_pem_ending_on_a_key_line(self) -> None:
+        lines = ["+" + BEGIN, *("+" + r for r in ROWS), "+" + END + " token=abcdefghij"]
+        text = _hunk(lines, 0, len(lines))
+        out, counts = redact(text)
+        _assert_redacted(text, out)
+        assert "abcdefghij" not in out
+        assert counts[KIND_PEM] == 1
+
     def test_left_of_the_operator_still_gets_single_line_rules(self) -> None:
         out, _ = redact("sk-proj-abcdefghij1234567890KLMNOP token: abcdefghij")
         assert out == "[REDACTED:key#1] token: [REDACTED:assignment#1]"
