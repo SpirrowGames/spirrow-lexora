@@ -20,7 +20,13 @@ What the scanner guarantees
   sequences per hunk -- *before* (context + ``-`` lines) and *after*
   (context + ``+`` lines) -- so a partially changed secret is matched as one
   piece. A line inside a match in either sequence is redacted whatever its
-  marker. Text outside hunks is one plain sequence.
+  marker. Text outside hunks is one plain sequence, matched whole line:
+  no character is dropped from a line that has no diff marker.
+* **Diff metadata (mindwire#483 §7.3, T-naysayer-codex-backend msg-856 /
+  msg-858).** Extended headers are skipped only in an unbroken run right
+  after ``diff --git`` (M-2); the first other line ends that state. Inside a
+  hunk only the exact ``\\ No newline at end of file`` line is skipped
+  (M-3). Neither counts toward, nor stops, a D-1 window (M-4).
 * **When the end (or the start) cannot be seen, redact more.** A PEM begin
   with no end in its sequence is redacted to the sequence's last line; an
   end with no begin from the sequence's first line; a run of PEM body lines
@@ -99,7 +105,32 @@ ASSIGNMENT_MIN_LEN = 8
 ASSIGNMENT_WINDOW = 6
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
-_FILE_HEADER_PREFIXES = ("diff --git", "--- ", "+++ ", "index ")
+#: File-header lines outside a hunk: diff structure, never matched. The
+#: extended headers (``index`` and the rest) are *not* here: they are skipped
+#: only inside the header state that ``diff --git`` opens (M-2).
+_FILE_HEADER_PREFIXES = ("diff --git ", "--- ", "+++ ")
+_DIFF_GIT = "diff --git "
+#: Extended headers with a fixed git shape. mindwire#483 §7.3 names the
+#: prefixes; anchoring the whole line to git's shape is Lexora's (Einstein's
+#: design advisory), so ``index = "sk-..."`` after ``diff --git`` is matched.
+_EXT_HEADER_FIXED_RE = re.compile(
+    r"^(?:index [0-9a-f]+(?:,[0-9a-f]+)*\.\.[0-9a-f]+(?: [0-7]{6})?"
+    r"|(?:old mode|new mode|deleted file mode|new file mode) [0-7]{6}"
+    r"|(?:similarity|dissimilarity) index \d{1,3}%)\r?$"
+)
+#: Extended headers that carry a path (any text): the prefix is left alone,
+#: the path still goes through the single-line rules (it is not a key line,
+#: a PEM line or a window line). An ordinary path comes out unchanged.
+_EXT_HEADER_PATH_PREFIXES = (
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+    "Binary files ",
+)
+#: Inside a hunk only this exact line (trailing whitespace ignored) is
+#: structure; any other line starting with a backslash is matched (M-3).
+_NO_NEWLINE = r"\ No newline at end of file"
 _PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
 _PEM_END_RE = re.compile(r"-----END [A-Z0-9 ]+-----")
 _BASE64_LINE_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
@@ -202,6 +233,10 @@ def _make_line(marker: str, body: str) -> _Line:
     return _Line(marker + prefix, core, suffix, content, marker=marker, body=body)
 
 
+def _is_no_newline(line: str) -> bool:
+    return line.rstrip(" \t\r") == _NO_NEWLINE
+
+
 def is_key_name(name: str) -> bool:
     """True when ``name`` holds a D-1 key name (``max_tokens``, ``API_KEY``,
     ``db_password``, ...): the structured-data form of a key line."""
@@ -281,10 +316,25 @@ class Redactor:
         segment: list[int] = []
 
         i = 0
+        #: M-2 header state: opened by ``diff --git``, kept only by an
+        #: unbroken run of extended headers, closed by the first other line.
+        #: It can only end too early (that line is then matched: over-
+        #: redaction), never run on into prose.
+        in_header = False
         while i < len(raw):
             m = _HUNK_RE.match(raw[i])
+            if in_header and m is None and not raw[i].startswith(_DIFF_GIT):
+                ext = self._ext_header(raw[i])
+                if ext is not None:
+                    # In no sequence, and neither counted by nor stopping a
+                    # D-1 window: ``body`` stays None (M-4).
+                    lines.append(ext)
+                    i += 1
+                    continue
+            in_header = False
             if m is None:
                 if raw[i].startswith(_FILE_HEADER_PREFIXES):
+                    in_header = raw[i].startswith(_DIFF_GIT)
                     lines.append(_Line(raw[i], "", "", content=False))
                     d1_sequences.append(segment)
                     segment = []
@@ -308,7 +358,7 @@ class Redactor:
                 # An empty line (or a bare CR) inside a hunk is a context
                 # line whose trailing space was stripped by some tool.
                 marker = "" if line in ("", "\r") else line[:1]
-                if line.startswith("\\"):  # "\ No newline at end of file"
+                if _is_no_newline(line):
                     lines.append(_Line(line, "", "", content=False))
                 elif marker in (" ", "") and old_left > 0 and new_left > 0:
                     lines.append(_make_line(marker, line[len(marker):]))
@@ -325,7 +375,14 @@ class Redactor:
                     after.append(i)
                     new_left -= 1
                 else:
-                    break  # truncated hunk: the line is not part of it
+                    # Truncated hunk, or a backslash line that is not the
+                    # marker: not part of the hunk, matched in full.
+                    break
+                i += 1
+            # The no-newline marker follows the hunk's last line, after its
+            # counts are used up: it still belongs to the hunk.
+            while i < len(raw) and _is_no_newline(raw[i]):
+                lines.append(_Line(raw[i], "", "", content=False))
                 i += 1
             sequences.extend((before, after))
             d1_sequences.extend((before, after))
@@ -348,6 +405,18 @@ class Redactor:
                 line.core = self._single_line(line.core)
 
         return "\n".join(line.prefix + line.core + line.suffix for line in lines)
+
+    @staticmethod
+    def _ext_header(line: str) -> _Line | None:
+        """An extended header in header state (M-2), or None when the line
+        is not one -- which closes the header state."""
+        if _EXT_HEADER_FIXED_RE.match(line):
+            return _Line(line, "", "", content=False)
+        for prefix in _EXT_HEADER_PATH_PREFIXES:
+            if line.startswith(prefix):
+                lead, core, suffix = _split_core(line[len(prefix) :])
+                return _Line(prefix + lead, core, suffix, content=bool(core))
+        return None
 
     # -- multi-line: PEM ------------------------------------------------
     def _pem_blocks(self, lines: list[_Line], seq: list[int]) -> None:

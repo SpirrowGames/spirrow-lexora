@@ -474,3 +474,147 @@ class TestD2Entropy:
     )
     def test_hash_shapes_are_excluded(self, text: str) -> None:
         assert redact(text) == (text, {})
+
+
+# -- diff metadata (mindwire#483 §7.3; T-naysayer-codex-backend msg-856/858) --
+
+AKIA = "AKIAABCDEFGHIJKLMNOP"
+GHP = "ghp_" + "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"
+
+
+class TestDiffMetadata:
+    def test_full_header_block_is_unchanged(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/old.py b/new.py",
+                "similarity index 87%",
+                "rename from old.py",
+                "rename to new.py",
+                "index 3f2a9c4..9d8c7b6 100644",
+                "--- a/old.py",
+                "+++ b/new.py",
+                "@@ -1,2 +1,2 @@",
+                " keep",
+                "-a",
+                "\\ No newline at end of file",
+                "+b",
+                "\\ No newline at end of file",
+                "diff --git a/m.sh b/m.sh",
+                "old mode 100644",
+                "new mode 100755",
+                "diff --git a/n.txt b/n.txt",
+                "new file mode 100644",
+                "index 0000000..e69de29",
+                "diff --git a/c.txt b/d.txt",
+                "dissimilarity index 12%",
+                "copy from c.txt",
+                "copy to d.txt",
+                "diff --git a/gone.txt b/gone.txt",
+                "deleted file mode 100644",
+                "index e69de29..0000000",
+                "diff --git a/img.png b/img.png",
+                "index 1234567..89abcde",
+                "Binary files a/img.png and b/img.png differ",
+                "diff --git a/combo b/combo",
+                "index 1234567,89abcde..fedcba9",
+            ]
+        )
+        assert redact(text) == (text, {})
+        crlf = text.replace("\n", "\r\n")
+        assert redact(crlf) == (crlf, {})
+
+    @pytest.mark.parametrize(
+        "text",
+        [f"PR body\nindex {AKIA}", f"index {GHP}", f"thread says:\n\nindex {AKIA} here"],
+        ids=["pr-body", "first-line", "thread-body"],
+    )
+    def test_index_outside_the_header_state_is_matched(self, text: str) -> None:
+        out, counts = redact(text)
+        assert AKIA not in out and GHP not in out
+        assert counts[KIND_KEY] == 1
+
+    def test_index_after_a_hunk_started_is_matched(self) -> None:
+        text = f"diff --git a/x b/x\nindex 1234567..89abcde 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\nindex {AKIA}"
+        out, counts = redact(text)
+        assert out.split("\n")[1] == "index 1234567..89abcde 100644"
+        assert out.split("\n")[-1] == "index [REDACTED:key#1]"
+        assert counts == {KIND_KEY: 1}
+
+    def test_mode_only_diff_then_prose(self) -> None:
+        """Einstein msg-857: a header state with no ---/+++/@@ must end."""
+        head = "diff --git a/m.sh b/m.sh\nold mode 100644\nnew mode 100755"
+        out, counts = redact(f"{head}\n\nindex {AKIA}")
+        assert out == f"{head}\n\nindex [REDACTED:key#1]"
+        assert counts == {KIND_KEY: 1}
+
+    def test_truncated_diff_rename_line_is_matched(self) -> None:
+        out, counts = redact(f"diff --git a/x b/x\nrename to {GHP}")
+        assert out == "diff --git a/x b/x\nrename to [REDACTED:key#1]"
+        assert counts == {KIND_KEY: 1}
+
+    def test_header_run_broken_by_a_blank_line(self) -> None:
+        text = f"diff --git a/x b/x\nindex 1234567..89abcde\n\nindex {AKIA}"
+        out, _ = redact(text)
+        assert out.split("\n")[1] == "index 1234567..89abcde"
+        assert out.split("\n")[3] == "index [REDACTED:key#1]"
+
+    def test_header_run_broken_by_prose(self) -> None:
+        text = f"diff --git a/x b/x\nsome prose\nsimilarity index {AKIA}"
+        out, counts = redact(text)
+        assert out.split("\n")[2] == "similarity index [REDACTED:key#1]"
+        assert counts == {KIND_KEY: 1}
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'index = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"',
+            "index sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            "old mode sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+            "similarity index sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+        ],
+        ids=["index-assignment", "index-token", "mode-token", "similarity-token"],
+    )
+    def test_fixed_shape_headers_are_anchored(self, line: str) -> None:
+        """Einstein's advisory on msg-858: a prefix alone does not skip."""
+        out, counts = redact(f"diff --git a/x b/x\n{line}")
+        assert "sk-ant-api03" not in out
+        assert counts[KIND_KEY] == 1
+
+    def test_path_header_path_is_still_matched(self) -> None:
+        out, counts = redact(f"diff --git a/x b/x\nrename from a/x\nrename to {GHP}\n--- a/x\n+++ b/y")
+        assert out.split("\n")[2] == "rename to [REDACTED:key#1]"
+        assert out.split("\n")[1] == "rename from a/x"
+        assert counts == {KIND_KEY: 1}
+
+    def test_other_backslash_line_in_a_hunk_is_matched(self) -> None:
+        text = f"@@ -1,2 +1,2 @@\n x\n\\ {AKIA}\n-a\n+b"
+        out, counts = redact(text)
+        assert out.split("\n")[2] == "\\ [REDACTED:key#1]"
+        assert counts[KIND_KEY] == 1
+
+    def test_no_newline_marker_with_trailing_whitespace_is_skipped(self) -> None:
+        text = "@@ -1 +1 @@\n-a\n\\ No newline at end of file \r\n+b"
+        assert redact(text) == (text, {})
+
+    @pytest.mark.parametrize("where", ["prose", "hunk-unknown-line"])
+    def test_unmarked_line_keeps_its_first_character(self, where: str) -> None:
+        """Regression for the dropped first character (msg-855 §3)."""
+        text = AKIA if where == "prose" else f"@@ -1 +1 @@\n-a\n+b\n{AKIA}"
+        out, counts = redact(text)
+        assert out.split("\n")[-1] == "[REDACTED:key#1]"
+        assert counts == {KIND_KEY: 1}
+
+    def test_no_newline_marker_does_not_use_up_the_window(self) -> None:
+        body = [f"+line{n}" for n in range(6)]
+        text = "@@ -0,0 +1,7 @@\n+api_key = abcdefghij\n\\ No newline at end of file\n" + "\n".join(body)
+        out, counts = redact(text)
+        rows = out.split("\n")
+        assert rows[2] == "\\ No newline at end of file"
+        assert rows[3:] == ["+[REDACTED:assignment#1]"] * 6
+        assert counts == {KIND_ASSIGNMENT: 1}
+
+    def test_header_lines_do_not_use_up_the_window(self) -> None:
+        """M-4: a key line, a skipped header run, then 6 lines -- but the
+        ``diff --git`` line itself is file structure and still ends it."""
+        text = "token = None\ndiff --git a/x b/x\nindex 1234567..89abcde\nfoo"
+        assert redact(text) == (text, {})
