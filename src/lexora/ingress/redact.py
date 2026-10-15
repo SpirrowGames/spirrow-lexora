@@ -26,12 +26,45 @@ What the scanner guarantees
   end with no begin from the sequence's first line; a run of PEM body lines
   with neither is recognised by shape (see ``_body_runs``).
 
-What gets redacted (kinds): ``pem`` (PEM blocks and PEM body runs), ``key``
-(known key prefixes), ``assignment`` (a credential-named key assigned a value
-of 8+ characters), ``bearer`` (Bearer tokens) and ``entropy`` (strings of
-Shannon entropy >= 4.0, hash shapes excluded). Each replaced span becomes
+What gets redacted (kinds, final): ``pem`` (PEM blocks and PEM body runs),
+``key`` (known key prefixes), ``assignment`` (rule D-1 below), ``bearer``
+(Bearer tokens) and ``entropy`` (rule D-2 below). Each replaced span becomes
 ``[REDACTED:<kind>#<n>]``; ``n`` numbers distinct secrets per kind within one
 request, so the same secret seen twice keeps one number.
+
+D-1, ``assignment`` (T-naysayer-codex-backend msg-834 / msg-836 / msg-840)
+--------------------------------------------------------------------------
+Purely structural: no decision here reads brackets, quotes, escapes,
+comments, continuation characters or YAML.
+
+* **Key line:** ``password|passwd|secret|token|api[_-]?key`` (any case,
+  anywhere in an identifier) followed by ``=`` / ``:`` / ``:=``. No
+  exclusions.
+* **On the key line,** everything from just after the line's *first*
+  ``=`` / ``:`` (and the whitespace after it) to the end of the line is
+  redacted when it is 8+ characters long, counted with any quotes, after
+  trimming surrounding whitespace.
+* **Lookahead window:** the next 6 non-blank lines after a key line are
+  redacted in full, whatever the key line's own value was (``password =
+  None`` still opens a window). A key line inside the window is itself
+  redacted in full and restarts the window from that line. The window ends
+  early only at diff structure: the end of a hunk, or a hunk / file header
+  outside a hunk. Inside a hunk the *before* and *after* sequences are
+  followed separately. One window (with its restarts) is one ``assignment``.
+
+D-2, ``entropy``: a token of 32+ characters with Shannon entropy >= 4.0 bits
+per character. Hex strings (so commit SHAs), UUIDs and ``sha<N>:<hex>``
+digests are excluded.
+
+Accepted limits (msg-834; reported to D8 with the "stricter than D8" list)
+------------------------------------------------------------------------
+* **(a)** a value that continues more than 6 non-blank lines below its key
+  line is not caught;
+* **(b)** a secret assembled through names that do not look sensitive
+  (``a = "correct"; API_KEY = a + b``) is not caught.
+
+Known prefixes, PEM blocks, Bearer and D-2 still apply to every line D-1
+does not cover.
 
 The counts (never the text) are what the ledger records
 (``redactions=<kind:count,...>``, see ``format_redactions``).
@@ -57,10 +90,13 @@ ENTROPY_THRESHOLD = 4.0
 #: these bounds (PEM wraps at 64, MIME base64 at 76; ADR-14 §7.3).
 BODY_LINE_MIN = 40
 BODY_LINE_MAX = 80
-#: Shortest token the entropy rule looks at.
-ENTROPY_MIN_LEN = 20
-#: Shortest value the assignment rule redacts (ADR-14 §7.3: 8 文字以上).
+#: Shortest token the entropy rule (D-2) looks at (msg-836 §2).
+ENTROPY_MIN_LEN = 32
+#: Shortest key-line right-hand side the assignment rule redacts, quotes
+#: included (ADR-14 §7.3: 8 文字以上; msg-840).
 ASSIGNMENT_MIN_LEN = 8
+#: Non-blank lines after a key line that D-1 always redacts (msg-834).
+ASSIGNMENT_WINDOW = 6
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 _FILE_HEADER_PREFIXES = ("diff --git", "--- ", "+++ ", "index ")
@@ -88,22 +124,20 @@ _KEY_RES = [
     )
 ]
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+([A-Za-z0-9\-._~+/]{8,}=*)")
-#: A credential-named key assigned a value. The value is redacted when it is
-#: quoted, or unquoted and mixes letters and digits (so ``token = token_value``
-#: in code is left alone, ``API_KEY=abc123def456`` is not). ``${...}`` and
-#: other references are not values.
-_ASSIGN_RE = re.compile(
-    r"(?i)([A-Za-z0-9_.\-]*(?:password|passwd|pwd|secret|token|api[_\-]?key|apikey|"
-    r"access[_\-]?key|private[_\-]?key|credential|auth)[A-Za-z0-9_.\-]*)"
-    r"[\"']?\s*(?::=|=|:)\s*"
-    # The closing quote may already sit in the line's suffix (core stripping
-    # removes a quote at the end of the core), hence ``\2|$``.
-    r"(?:(\"|')([^\"'\s]{%d,})(?:\2|$)|([^\s\"',;()\[\]{}$]{%d,})(?![(\w]))"
-    % (ASSIGNMENT_MIN_LEN, ASSIGNMENT_MIN_LEN)
+#: D-1 key line: a credential-named key followed by an assignment operator
+#: (msg-836 §1). Nothing about the value is looked at here.
+_KEY_LINE_RE = re.compile(
+    r"(?i)(?:password|passwd|secret|token|api[_\-]?key)[A-Za-z0-9_.\-]*[\"']?\s*(?::=|=|:)"
 )
+#: The first assignment operator of a key line: D-1 redacts from after it.
+_OPERATOR_RE = re.compile(r":=|=|:")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_\-]{%d,}" % ENTROPY_MIN_LEN)
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+#: ``sha256:<hex>`` (container / content digests). The token pattern does not
+#: span ``:``, so the hex half is already a hex token; the check is explicit
+#: so that widening ``_TOKEN_RE`` can never start redacting digests.
+_DIGEST_RE = re.compile(r"(?i)^sha(?:1|224|256|384|512):[0-9a-f]+$")
 
 
 def shannon_entropy(text: str) -> float:
@@ -129,6 +163,13 @@ class _Line:
     content: bool = True
     #: (start, end, label) spans of ``core`` to replace.
     spans: list[tuple[int, int, str]] = field(default_factory=list)
+    #: The diff marker and the line body after it; ``body`` is None for diff
+    #: structure (headers, ``\ No newline``), which D-1 never looks at.
+    marker: str = ""
+    body: str | None = None
+    #: D-1 decision: (label, start, end) of ``body`` to replace, or
+    #: (label, None, None) for a line redacted in full.
+    d1: tuple[str, int | None, int | None] | None = None
 
 
 def _split_core(body: str) -> tuple[str, str, str]:
@@ -156,7 +197,29 @@ def _split_core(body: str) -> tuple[str, str, str]:
 def _make_line(marker: str, body: str) -> _Line:
     prefix, core, suffix = _split_core(body)
     content = bool(core) and not _YAML_BLOCK_OPENER_RE.match(core)
-    return _Line(marker + prefix, core, suffix, content)
+    return _Line(marker + prefix, core, suffix, content, marker=marker, body=body)
+
+
+def _key_line_value(body: str) -> tuple[int, int] | None:
+    """D-1 on a key line: the (start, end) of ``body`` to redact, or None.
+
+    From just after the line's first ``=`` / ``:`` / ``:=`` and the
+    whitespace after it, to the end of the line before trailing whitespace
+    and CR. Redacted when that is ``ASSIGNMENT_MIN_LEN``+ characters, quotes
+    included (msg-840): quotes, escapes and comments are not looked at, so a
+    misjudgement can only redact more."""
+    op = _OPERATOR_RE.search(body)
+    if op is None:  # pragma: no cover - a key line always has an operator
+        return None
+    start = op.end()
+    while start < len(body) and body[start] in " \t":
+        start += 1
+    end = len(body)
+    while end > start and body[end - 1] in " \t\r":
+        end -= 1
+    if end - start < ASSIGNMENT_MIN_LEN:
+        return None
+    return start, end
 
 
 class Redactor:
@@ -187,6 +250,10 @@ class Redactor:
         lines: list[_Line] = []
         sequences: list[list[int]] = []
         plain: list[int] = []
+        #: D-1 follows the hunk sequences and the plain text cut at every
+        #: hunk or file header: the window never crosses diff structure.
+        d1_sequences: list[list[int]] = []
+        segment: list[int] = []
 
         i = 0
         while i < len(raw):
@@ -194,11 +261,16 @@ class Redactor:
             if m is None:
                 if raw[i].startswith(_FILE_HEADER_PREFIXES):
                     lines.append(_Line(raw[i], "", "", content=False))
+                    d1_sequences.append(segment)
+                    segment = []
                 else:
                     lines.append(_make_line("", raw[i]))
                     plain.append(i)
+                    segment.append(i)
                 i += 1
                 continue
+            d1_sequences.append(segment)
+            segment = []
             # Hunk header: not content. Consume lines by the header's counts.
             lines.append(_Line(raw[i], "", "", content=False))
             old_left = int(m.group(1)) if m.group(1) is not None else 1
@@ -231,15 +303,22 @@ class Redactor:
                     break  # truncated hunk: the line is not part of it
                 i += 1
             sequences.extend((before, after))
+            d1_sequences.extend((before, after))
         sequences.append(plain)
+        d1_sequences.append(segment)
 
-        # Multi-line patterns over each sequence, then single-line patterns.
+        # Multi-line patterns over each sequence, then D-1, then single-line
+        # patterns on what D-1 did not cover.
         for seq in sequences:
             self._pem_blocks(lines, seq)
             self._body_runs(lines, seq)
+        for seq in d1_sequences:
+            self._assignment_windows(lines, seq)
         for line in lines:
             self._apply_multiline(line)
-            if line.content:
+            if line.d1 is not None:
+                self._apply_assignment(line)
+            elif line.content:
                 line.core = self._single_line(line.core)
 
         return "\n".join(line.prefix + line.core + line.suffix for line in lines)
@@ -359,6 +438,70 @@ class Redactor:
         line.core = "".join(out)  # type: ignore[arg-type]
         line.spans = []
 
+    # -- D-1: assignment ------------------------------------------------
+    def _assignment_windows(self, lines: list[_Line], seq: list[int]) -> None:
+        """Mark D-1 runs in one sequence (msg-834 / msg-836 / msg-840).
+
+        A run starts at a key line outside a window: the key line's value
+        (when 8+ characters) plus the next ``ASSIGNMENT_WINDOW`` non-blank
+        lines in full. A key line inside the window is one of those lines --
+        redacted in full -- and restarts the count, extending the same run.
+        Blank lines are left alone and not counted."""
+        runs: list[list[tuple[int, int | None, int | None]]] = []
+        current: list[tuple[int, int | None, int | None]] = []
+        remaining = 0
+        for k in seq:
+            body = lines[k].body
+            if body is None or not body.strip(" \t\r"):
+                continue
+            is_key = _KEY_LINE_RE.search(body) is not None
+            if remaining > 0:
+                current.append((k, None, None))
+                remaining = ASSIGNMENT_WINDOW if is_key else remaining - 1
+            elif is_key:
+                if current:
+                    runs.append(current)
+                current = []
+                value = _key_line_value(body)
+                if value is not None:
+                    current.append((k, *value))
+                remaining = ASSIGNMENT_WINDOW
+        if current:
+            runs.append(current)
+
+        for run in runs:
+            # A context line belongs to both sequences of its hunk: a line the
+            # other sequence already marked is not counted again, but a
+            # value-only mark is widened to the full line.
+            fresh = [
+                (k, a, b)
+                for k, a, b in run
+                if lines[k].d1 is None or (a is None and lines[k].d1[1] is not None)  # type: ignore[index]
+            ]
+            if not fresh:
+                continue
+            secret = "\n".join(
+                (lines[k].body or "")[a:b] if a is not None else (lines[k].body or "") for k, a, b in run
+            )
+            label = self._label(KIND_ASSIGNMENT, secret)
+            for k, a, b in fresh:
+                lines[k].d1 = (label, a, b)
+
+    def _apply_assignment(self, line: _Line) -> None:
+        """Render a D-1 line. Runs after ``_apply_multiline``; D-1 replaces
+        whatever a PEM span put on the same line."""
+        label, start, end = line.d1  # type: ignore[misc]
+        if start is None:
+            # In full: the marker, indentation, outer quotes, a trailing
+            # ``,``/``\`` and the CR stay (``_split_core``).
+            if line.core:
+                line.core = label
+            return
+        body = line.body or ""
+        line.prefix = line.marker
+        line.core = self._single_line(body[:start]) + label
+        line.suffix = body[end:]
+
     # -- single-line ----------------------------------------------------
     def _single_line(self, core: str) -> str:
         for rx in _KEY_RES:
@@ -367,28 +510,20 @@ class Redactor:
             lambda m: m.group(0)[: m.start(1) - m.start(0)] + self._label(KIND_BEARER, m.group(1)),
             core,
         )
-        core = _ASSIGN_RE.sub(self._assignment, core)
-        core = _TOKEN_RE.sub(self._entropy, core)
-        return core
+        text = core
+        return _TOKEN_RE.sub(lambda m: self._entropy(m, text), core)
 
-    def _assignment(self, m: re.Match[str]) -> str:
-        quoted, bare = m.group(3), m.group(4)
-        value = quoted if quoted is not None else bare
-        if quoted is None and not (re.search(r"[A-Za-z]", value) and re.search(r"\d", value)):
-            return m.group(0)
-        if value.startswith("[REDACTED:"):
-            return m.group(0)
-        start = m.start(3) if quoted is not None else m.start(4)
-        head = m.group(0)[: start - m.start(0)]
-        tail = m.group(0)[start - m.start(0) + len(value):]
-        return head + self._label(KIND_ASSIGNMENT, value) + tail
-
-    def _entropy(self, m: re.Match[str]) -> str:
+    def _entropy(self, m: re.Match[str], text: str) -> str:
+        """D-2 (msg-836 §2): 32+ characters and entropy >= 4.0, unless a hash
+        shape. There is no letters-and-digits requirement."""
         token = m.group(0)
         if _HEX_RE.match(token) or _UUID_RE.match(token):
-            return token  # hash shapes are excluded (ADR-14 §7.3)
-        if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token)):
-            return token
+            return token  # hex (so commit SHAs) and UUIDs are excluded
+        start = m.start()
+        while start > 0 and not text[start - 1].isspace() and text[start - 1] not in "\"'=,":
+            start -= 1
+        if _DIGEST_RE.match(text[start : m.end()]):
+            return token  # ``sha256:<digest>``
         if shannon_entropy(token) < ENTROPY_THRESHOLD:
             return token
         return self._label(KIND_ENTROPY, token)
