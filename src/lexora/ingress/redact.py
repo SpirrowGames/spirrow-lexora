@@ -26,7 +26,9 @@ What the scanner guarantees
   msg-858).** Extended headers are skipped only in an unbroken run right
   after ``diff --git`` (M-2); the first other line ends that state. Inside a
   hunk only the exact ``\\ No newline at end of file`` line is skipped
-  (M-3). Neither counts toward, nor stops, a D-1 window (M-4).
+  (M-3). Neither counts toward, nor stops, a D-1 window (M-4). A backslash
+  line never ends a hunk (H-1, msg-861); the context text after a hunk
+  header's closing ``@@`` opens both sides of the hunk (H-2, msg-863).
 * **When the end (or the start) cannot be seen, redact more.** A PEM begin
   with no end in its sequence is redacted to the sequence's last line; an
   end with no begin from the sequence's first line; a run of PEM body lines
@@ -346,20 +348,26 @@ class Redactor:
                 continue
             d1_sequences.append(segment)
             segment = []
-            # Hunk header: not content. Consume lines by the header's counts.
-            lines.append(_Line(raw[i], "", "", content=False))
+            # Hunk header. The ``@@ ... @@`` range is structure; the context
+            # text git puts after it (the nearest "function" line above the
+            # hunk: ``API_KEY = (``, a PEM ``BEGIN`` line, a body row) is
+            # content and the first line of *both* sides (H-2, msg-863): it
+            # gets the single-line rules and D-1's value rule, a key line
+            # there opens a D-1 window into each side (H-2a), and a ``BEGIN``
+            # there opens a PEM block into each side (H-2b).
+            lines.append(_make_line(raw[i][: m.end()], raw[i][m.end() :]))
             old_left = int(m.group(1)) if m.group(1) is not None else 1
             new_left = int(m.group(2)) if m.group(2) is not None else 1
-            before: list[int] = []
-            after: list[int] = []
+            before: list[int] = [i]
+            after: list[int] = [i]
             i += 1
             while i < len(raw) and (old_left > 0 or new_left > 0):
                 line = raw[i]
                 # An empty line (or a bare CR) inside a hunk is a context
                 # line whose trailing space was stripped by some tool.
                 marker = "" if line in ("", "\r") else line[:1]
-                if _is_no_newline(line):
-                    lines.append(_Line(line, "", "", content=False))
+                if line.startswith("\\"):
+                    self._backslash_line(lines, line, i, before, after)
                 elif marker in (" ", "") and old_left > 0 and new_left > 0:
                     lines.append(_make_line(marker, line[len(marker):]))
                     before.append(i)
@@ -375,14 +383,12 @@ class Redactor:
                     after.append(i)
                     new_left -= 1
                 else:
-                    # Truncated hunk, or a backslash line that is not the
-                    # marker: not part of the hunk, matched in full.
-                    break
+                    break  # truncated hunk: the line is not part of it
                 i += 1
             # The no-newline marker follows the hunk's last line, after its
             # counts are used up: it still belongs to the hunk.
-            while i < len(raw) and _is_no_newline(raw[i]):
-                lines.append(_Line(raw[i], "", "", content=False))
+            while i < len(raw) and raw[i].startswith("\\"):
+                self._backslash_line(lines, raw[i], i, before, after)
                 i += 1
             sequences.extend((before, after))
             d1_sequences.extend((before, after))
@@ -405,6 +411,20 @@ class Redactor:
                 line.core = self._single_line(line.core)
 
         return "\n".join(line.prefix + line.core + line.suffix for line in lines)
+
+    @staticmethod
+    def _backslash_line(lines: list[_Line], line: str, k: int, before: list[int], after: list[int]) -> None:
+        """A line starting with a backslash inside a hunk never ends it and
+        uses up neither count (H-1, msg-861): git translates the no-newline
+        marker in some locales. The exact English marker is structure (M-3,
+        M-4); any other one is content of both sides, matched in full (the
+        backslash included) and counted by a D-1 window like any line."""
+        if _is_no_newline(line):
+            lines.append(_Line(line, "", "", content=False))
+            return
+        lines.append(_make_line("", line))
+        before.append(k)
+        after.append(k)
 
     @staticmethod
     def _ext_header(line: str) -> _Line | None:
@@ -508,10 +528,18 @@ class Redactor:
                 self._mark(lines, [(k, 0, len(lines[k].core)) for k in run], joined)
 
     def _mark(self, lines: list[_Line], span: list[tuple[int, int, int]], secret: str) -> None:
+        marks = [(k, start, end) for k, start, end in span if end > start]
+        number = self._numbers.get((KIND_PEM, secret))
+        if number is not None:
+            # The other side of the same hunk already marked exactly this
+            # (context lines, or a hunk header's context text, belong to both
+            # sides): one block, one count.
+            label = f"[REDACTED:{KIND_PEM}#{number}]"
+            if all((start, end, label) in lines[k].spans for k, start, end in marks):
+                return
         label = self._label(KIND_PEM, secret)
-        for k, start, end in span:
-            if end > start:
-                lines[k].spans.append((start, end, label))
+        for k, start, end in marks:
+            lines[k].spans.append((start, end, label))
 
     @staticmethod
     def _apply_multiline(line: _Line) -> None:
