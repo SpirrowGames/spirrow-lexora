@@ -801,6 +801,9 @@ class TestTheDeclarationIsNotAnExistingFlagInDisguise:
     #: The three that assign to the sink, measured at `bdfc185`:
     #: `anthropic.py:528/575`, `gemini.py:619/623`, `claude_code.py:485-488`.
     WRITERS = (AnthropicBackend, ClaudeCodeBackend, GeminiBackend)
+    #: Non-*declarers*. Since T-streaming-ledger-row PR-C `vllm`'s chat stream
+    #: does assign to the sink, but its completions stream does not and the
+    #: flag is per class, so it stays undeclared on purpose (`vllm.py`).
     NON_WRITERS = (OpenAICompatibleBackend, VLLMBackend)
 
     def test_the_declaration_matches_which_backends_write_the_sink(self) -> None:

@@ -405,7 +405,12 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
         gemini              yes              `usageMetadata` on the events it
                                              already decodes
         openai_compatible   no               relays bytes verbatim, and the
-        vllm                no               number is not in those bytes
+                                             number is not in those bytes
+        vllm                chat stream:     chat stream: row when the upstream
+                            yes; completions sends the usage event (always
+                            stream: no       requested); completions stream:
+                                             no row; not counted by
+                                             `fills_usage_sink`
 
     That second column is now carried by a value as well as by this prose:
     ``Backend.fills_usage_sink``, True on the three and False on the two.
@@ -413,16 +418,28 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
     backend whose stream completed normally and still left the sink empty
     -- from the legitimate silences below, and count it
     (``lexora_stream_usage_missing_total``). The two must be changed
-    together; nothing yet checks that they agree.
+    together; nothing yet checks that they agree. `vllm` is the one split
+    row: its chat stream fills the sink but the class stays False, because
+    the flag is per class and its completions stream does not fill, so
+    declaring would count every streamed `/v1/completions` as the defect.
+    The counter therefore does not watch vLLM chat; tests pin it instead.
 
-    Two cases therefore still open no row: a stream through either relay
-    backend, and a stream the client cuts before the upstream's final frame
-    (usage arrives in that frame). Both mean "no count was observed", never
-    "the request was free" -- nothing here estimates. The only route to a
-    number for the relay backends is `stream_options.include_usage` upstream,
-    which appears nowhere in this tree; asking for it changes what a
-    third-party upstream is sent and, the relay being verbatim, what our own
-    clients receive, so it is a decision of its own and is not taken here.
+    Cases that still open no row: a stream through `openai_compatible`, a
+    `/v1/completions` stream routed to `vllm`, and a stream the client cuts
+    before the upstream's final frame (usage arrives in that frame). All mean
+    "no count was observed", never "the request was free" -- nothing here
+    estimates. The first two are **selectable by the caller**: choosing that
+    backend or endpoint leaves no row. That is known and stated, not
+    accidental. They stay open because nobody has measured how those
+    upstreams treat `stream_options`, and a guess could break the path.
+
+    Decided 2026-10-21 (T-streaming-ledger-row msg-879/msg-880, after the
+    msg-874 probe and the msg-760 log survey): `vllm`'s chat stream always
+    sends `stream_options.include_usage: true` upstream, whatever the caller
+    asked, and the verbatim relay therefore hands every caller one extra
+    final event, `"choices": []` plus `usage`. The backend reads the count
+    from a side copy of the bytes it has already yielded, so the relay never
+    depends on that parser. Details: `backends/vllm.py`.
 
     Until 2026-09-06 the four middle non-streaming cells read "no row" too.
     Those handlers computed `tokens_input` / `tokens_output` for the stats
