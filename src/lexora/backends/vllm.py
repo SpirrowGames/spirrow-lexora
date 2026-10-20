@@ -20,11 +20,19 @@ from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-#: Any SSE event delimiter. The SSE spec allows CRLF, LF or CR as a line end,
-#: so a blank line is one of these three pairs. One alternation, searched
-#: leftmost, so ``\r\n\r\n`` is taken whole.
-_SSE_EVENT_DELIMITER = re.compile(rb"\r\n\r\n|\n\n|\r\r")
-_SSE_LINE_END = re.compile(rb"\r\n|\n|\r")
+#: An SSE event boundary: two consecutive line ends, each ``\r\n``, ``\r`` or
+#: ``\n`` in any mix (msg-889/msg-890). A ``\r`` counts as a line end on its
+#: own only when no ``\n`` follows it (``\r(?!\n)``). Without that lookahead
+#: the regex backtracks ``\r\n`` into ``\r`` + ``\n`` and every single CRLF
+#: line end becomes a "boundary", cutting multi-line events apart.
+_SSE_EVENT_DELIMITER = re.compile(rb"(?:\r\n|\r(?!\n)|\n){2}")
+_SSE_LINE_END = re.compile(rb"\r\n|\r|\n")
+
+#: The longest delimiter is 4 bytes, so a match not found by one scan can
+#: start no earlier than 3 bytes before where that scan stopped. (1 and 2
+#: also pass the tests, because the last byte of any line end is itself a
+#: line end; 0 fails them. 3 is the bound that does not lean on that.)
+_DELIMITER_RESCAN = 3
 
 #: Cap on the usage reader's side buffer (T-streaming-ledger-row msg-877 §3).
 #: The usage event measured on vLLM 0.17.1 is about 150 bytes, so only bytes
@@ -50,18 +58,32 @@ def _with_usage_requested(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _is_count(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    # `type(...) is int`, not `isinstance`: bool is a subclass of int, and
+    # `"prompt_tokens": true` must not bill as 1 (msg-889/msg-890).
+    return type(value) is int and value >= 0
 
 
 class _StreamUsageReader:
     """Reads the final usage event out of a *side copy* of the relayed bytes.
 
-    The relay never waits on this: ``chat_completions_stream`` yields each
-    upstream chunk first and only then passes the same bytes to ``feed``.
-    ``feed`` catches every exception raised while parsing, and after one the
-    reader stops for the rest of the request. **There is no path from this
-    class to the client stream**: the worst it can do is leave the sink at
-    zero, which opens no row, exactly as before this reader existed.
+    ``chat_completions_stream`` passes each upstream chunk to ``feed`` and
+    then yields that same chunk unchanged (msg-890). Feeding first is what
+    keeps the count when the client hangs up as soon as it has the last
+    chunk: a cancellation lands at the ``yield``, and a chunk fed only after
+    the ``yield`` would never be read. Feeding first still gives the parser
+    **no path to the client stream**, because three things hold:
+
+    * ``feed`` is synchronous and contains no ``await``, so no cancellation
+      can land inside it and it finishes before control returns to the
+      network;
+    * ``feed`` catches every ``Exception`` (not ``BaseException``), and after
+      one the reader stops for the rest of the request;
+    * the work per chunk is bounded: the buffer is capped at
+      ``USAGE_PARSE_BUFFER_CAP``, and each scan resumes a few bytes before
+      the end of the previous one instead of rescanning the whole tail.
+
+    The worst it can do is leave the sink at zero, which opens no row,
+    exactly as before this reader existed.
 
     The usage event is a ``data`` payload that is not ``[DONE]``, parses as a
     JSON object, and has ``choices == []`` and a ``usage`` object whose
@@ -75,6 +97,7 @@ class _StreamUsageReader:
     def __init__(self, sink: UsageSink | None) -> None:
         self._sink = sink
         self._buffer = b""
+        self._scan_from = 0
         self._stopped = sink is None
 
     def feed(self, chunk: bytes) -> None:
@@ -92,9 +115,17 @@ class _StreamUsageReader:
 
     def _feed(self, chunk: bytes) -> None:
         self._buffer += chunk
-        while (match := _SSE_EVENT_DELIMITER.search(self._buffer)) is not None:
+        while True:
+            # A chunk cut inside `\r\n\r\n` can leave `...\r\n\r` here; that
+            # matches as `\r\n` + `\r`, and the next event starts with a stray
+            # `\n`, which `_read_event` reads as an empty line (msg-890).
+            match = _SSE_EVENT_DELIMITER.search(self._buffer, self._scan_from)
+            if match is None:
+                self._scan_from = max(0, len(self._buffer) - _DELIMITER_RESCAN)
+                break
             event = self._buffer[: match.start()]
             self._buffer = self._buffer[match.end() :]
+            self._scan_from = 0
             self._read_event(event)
         if len(self._buffer) > USAGE_PARSE_BUFFER_CAP:
             self._stop(
@@ -325,11 +356,13 @@ class VLLMBackend(Backend):
           no client streams from a vLLM tier, and both known readers skip
           empty-``choices`` events).
         * **The relay does not depend on the parser.** Each upstream chunk is
-          yielded byte-for-byte *before* a side copy goes to
-          ``_StreamUsageReader``; that reader catches its own exceptions and
-          caps its buffer at ``USAGE_PARSE_BUFFER_CAP``. No parse failure,
-          delimiter style or oversize event can delay, change or end what the
-          client receives -- the worst case is a zero sink and no row.
+          handed to ``_StreamUsageReader.feed`` and then yielded unchanged.
+          Feed first, so a client that hangs up as soon as it has the usage
+          chunk still leaves the count in the sink (msg-889/msg-890). ``feed``
+          is synchronous, catches its own exceptions and does bounded work per
+          chunk (see its class docstring), so no parse failure, delimiter
+          style or oversize event can change or end what the client receives
+          -- the worst case is a zero sink and no row.
         * Billed as ``prompt_tokens`` / ``completion_tokens`` as reported;
           measured to sum to ``total_tokens`` (msg-874 (iv)). vLLM counts
           reasoning tokens inside ``completion_tokens`` and reports no split,
@@ -357,9 +390,10 @@ class VLLMBackend(Backend):
         reader = _StreamUsageReader(usage_sink)
         upstream_request = self._apply_thinking_controls(_with_usage_requested(request))
         async for chunk in self._post_stream("/v1/chat/completions", upstream_request):
-            # Yield first, read after: the relay never waits on the reader.
-            yield chunk
+            # Feed first: a disconnect cancels at the `yield`, and a chunk not
+            # yet fed by then would lose the count. `feed` never awaits/raises.
             reader.feed(chunk)
+            yield chunk
 
     async def completions_stream(
         self, request: dict[str, Any], usage_sink: UsageSink | None = None

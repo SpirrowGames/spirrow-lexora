@@ -438,8 +438,10 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
     sends `stream_options.include_usage: true` upstream, whatever the caller
     asked, and the verbatim relay therefore hands every caller one extra
     final event, `"choices": []` plus `usage`. The backend reads the count
-    from a side copy of the bytes it has already yielded, so the relay never
-    depends on that parser. Details: `backends/vllm.py`.
+    from a side copy of each chunk just before yielding it unchanged, so a
+    client that hangs up on the last chunk still leaves the count behind; the
+    reader is synchronous and catches its own errors, so the relay never
+    depends on it (msg-890). Details: `backends/vllm.py`.
 
     Until 2026-09-06 the four middle non-streaming cells read "no row" too.
     Those handlers computed `tokens_input` / `tokens_output` for the stats

@@ -57,6 +57,19 @@ USAGE_EVENT = ("data: " + _EVENTS[-2] + "\n\n").encode()
 #: Synthetic, not measured: the same events with CRLF delimiters.
 CRLF_BODY = "".join(f"data: {e}\r\n\r\n" for e in _EVENTS).encode()
 
+#: Synthetic, not measured: every event boundary a different mix of two line
+#: ends (each `\r\n`, `\r` or `\n`), cycling through the asymmetric pairs.
+_MIXED = ["\r\n\n", "\n\r\n", "\r\r\n", "\r\n\r", "\n\r", "\r\n\r\n", "\n\n", "\r\r"]
+MIXED_BODY = "".join(
+    f"data: {e}{_MIXED[i % len(_MIXED)]}" for i, e in enumerate(_EVENTS)
+).encode()
+
+#: Synthetic, not measured: CRLF, with the usage event's JSON spread over two
+#: `data:` lines of the same event (joined with `\n`, still valid JSON).
+CRLF_MULTILINE_BODY = CRLF_BODY.replace(
+    b'"choices":[],"usage"', b'"choices":[],\r\ndata: "usage"'
+)
+
 
 def test_fixture_is_the_measured_probe_body() -> None:
     assert len(PROBE_BODY) == 2285
@@ -139,7 +152,27 @@ class TestSinkIsFilled:
         assert (sink.prompt_tokens, sink.completion_tokens) == (59, 8)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("body", [PROBE_BODY, CRLF_BODY], ids=["lf", "crlf"])
+    async def test_mixed_line_endings_fill_the_same(self) -> None:
+        """Synthetic fixture (msg-889 advisory): mixed-ending boundaries."""
+        relayed, sink, _ = await _relay([MIXED_BODY])
+        assert relayed == MIXED_BODY
+        assert (sink.prompt_tokens, sink.completion_tokens) == (59, 8)
+
+    @pytest.mark.asyncio
+    async def test_one_crlf_line_end_is_not_an_event_boundary(self) -> None:
+        """Synthetic: the usage JSON spread over two `data:` lines of one
+        CRLF event. A delimiter that reads a lone `\\r\\n` as `\\r` + `\\n`
+        cuts the event in two and neither half parses."""
+        relayed, sink, _ = await _relay([CRLF_MULTILINE_BODY])
+        assert relayed == CRLF_MULTILINE_BODY
+        assert (sink.prompt_tokens, sink.completion_tokens) == (59, 8)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [PROBE_BODY, CRLF_BODY, MIXED_BODY, CRLF_MULTILINE_BODY],
+        ids=["lf", "crlf", "mixed", "crlf-multiline"],
+    )
     async def test_every_split_offset_gives_the_same_sink(self, body: bytes) -> None:
         # One backend for every offset: building an httpx client per offset
         # costs about a minute here.
@@ -185,11 +218,11 @@ class TestRelayIsUntouched:
         assert b"".join(received) == PROBE_BODY
 
     @pytest.mark.asyncio
-    async def test_usage_chunk_reaches_the_client_before_the_sink_is_filled(
+    async def test_sink_already_reflects_the_chunk_the_client_receives(
         self,
     ) -> None:
-        """Yield first, read after: the consumer holds the usage chunk while
-        the sink is still empty."""
+        """Feed first, then yield (msg-890): when the consumer holds the usage
+        chunk, the sink already carries its count."""
         events = [f"data: {e}\n\n".encode() for e in _EVENTS]
         sink = UsageSink()
         seen_at_usage_chunk: tuple[int, int] | None = None
@@ -198,8 +231,36 @@ class TestRelayIsUntouched:
         ):
             if chunk == USAGE_EVENT:
                 seen_at_usage_chunk = (sink.prompt_tokens, sink.completion_tokens)
-        assert seen_at_usage_chunk == (0, 0)
+        assert seen_at_usage_chunk == (59, 8)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_right_after_the_usage_chunk_keeps_the_count(
+        self,
+    ) -> None:
+        """msg-889: the client takes the usage chunk and hangs up. The
+        generator is closed at that `yield` without being asked for another
+        item; the count must already be in the sink."""
+        events = [f"data: {e}\n\n".encode() for e in _EVENTS]
+        sink = UsageSink()
+        stream = _backend(FakeUpstream(events)).chat_completions_stream(
+            {"model": "m", "messages": []}, sink
+        )
+        while (await stream.__anext__()) != USAGE_EVENT:
+            pass
+        await stream.aclose()
         assert (sink.prompt_tokens, sink.completion_tokens) == (59, 8)
+
+    @pytest.mark.asyncio
+    async def test_bool_usage_values_are_not_counts(self) -> None:
+        """msg-889: bool is a subclass of int; `true` must not bill as 1."""
+        body = PROBE_BODY.replace(
+            b'"usage":{"prompt_tokens":59,"total_tokens":67,"completion_tokens":8}',
+            b'"usage":{"prompt_tokens":true,"total_tokens":1,"completion_tokens":false}',
+        )
+        assert body != PROBE_BODY
+        relayed, sink, _ = await _relay([body])
+        assert relayed == body
+        assert (sink.prompt_tokens, sink.completion_tokens) == (0, 0)
 
     @pytest.mark.asyncio
     async def test_a_raising_reader_cannot_reach_the_client(
@@ -239,6 +300,29 @@ class TestRelayIsUntouched:
         relayed, sink, _ = await _relay([oversize, b"\n\n" + PROBE_BODY])
         assert relayed == body
         assert (sink.prompt_tokens, sink.completion_tokens) == (0, 0)
+
+    def test_scan_work_per_chunk_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`feed` runs before the `yield`, so its cost is relay latency. A
+        delimiter-less stream in one-byte chunks up to the cap must not
+        rescan the whole tail each time: measured on win32 / CPython 3.12,
+        that is 28.6 s of synchronous CPU against 0.07 s with the resumed
+        scan. Counted in bytes scanned, not timed, so it cannot flake."""
+        real = vllm_module._SSE_EVENT_DELIMITER
+        scanned = 0
+
+        class Counting:
+            def search(self, buf: bytes, pos: int = 0, endpos: int | None = None) -> Any:
+                nonlocal scanned
+                scanned += (len(buf) if endpos is None else endpos) - pos
+                return real.search(buf, pos, len(buf) if endpos is None else endpos)
+
+        monkeypatch.setattr(vllm_module, "_SSE_EVENT_DELIMITER", Counting())
+        reader = vllm_module._StreamUsageReader(UsageSink())
+        for _ in range(USAGE_PARSE_BUFFER_CAP):
+            reader.feed(b"x")
+        assert scanned <= 8 * USAGE_PARSE_BUFFER_CAP
 
     @pytest.mark.asyncio
     async def test_no_sink_still_relays(self) -> None:
