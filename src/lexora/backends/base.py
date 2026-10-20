@@ -198,9 +198,13 @@ class Backend(ABC):
     #: therefore holds no parsed count -- needs no special case, exactly as
     #: with the sink itself. Set True on ``anthropic``, ``claude_code`` and
     #: ``gemini``, the three that write the sink; left False on
-    #: ``openai_compatible`` and ``vllm``, whose ``*_stream`` docstrings say
-    #: "accepted and never filled" and point at this attribute so the prose
-    #: and the value sit together.
+    #: ``openai_compatible``, whose ``*_stream`` docstrings say "accepted and
+    #: never filled" and point at this attribute so the prose and the value
+    #: sit together. Also left False on ``vllm``, which is split: its
+    #: ``chat_completions_stream`` fills the sink and its
+    #: ``completions_stream`` does not, and since this bit is per class,
+    #: True would count every streamed ``/v1/completions`` there as the
+    #: defect. Its docstrings state the split.
     #:
     #: NOT ``error_passthrough``, and the two must never be confused: that
     #: one is an error-shape flag and it is set on ``anthropic``

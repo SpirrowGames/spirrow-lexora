@@ -198,12 +198,15 @@ class OpenAICompatibleBackend(Backend):
         Args:
             request: OpenAI-compatible chat completion request.
             usage_sink: Accepted and never filled. ``_post_stream`` relays
-                the upstream bytes verbatim and those bytes carry no usage
-                chunk, because this tree never asks for one --
-                ``stream_options`` / ``include_usage`` have zero occurrences
-                in it, measured. The sink stays at zero and no row is opened:
-                "we cannot say", not "this request was free". See the coverage
-                table on ``api/routes.py``'s ``get_cost_tracker``.
+                the upstream bytes verbatim and reads none of them, and this
+                backend adds no ``stream_options.include_usage`` of its own,
+                so unless the caller asked for one the bytes carry no usage
+                chunk either. (``vllm``'s chat stream does add it since
+                T-streaming-ledger-row PR-C; this backend's third-party
+                upstreams were never measured, so it was deliberately left
+                out.) The sink stays at zero and no row is opened: "we cannot
+                say", not "this request was free". See the coverage table on
+                ``api/routes.py``'s ``get_cost_tracker``.
 
                 That fact is now a value as well as prose:
                 ``Backend.fills_usage_sink`` stays ``False`` on this class,
