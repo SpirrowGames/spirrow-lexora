@@ -29,10 +29,17 @@ What the scanner guarantees
   (M-3). Neither counts toward, nor stops, a D-1 window (M-4). A backslash
   line never ends a hunk (H-1, msg-861); the context text after a hunk
   header's closing ``@@`` opens both sides of the hunk (H-2, msg-863).
-* **When the end (or the start) cannot be seen, redact more.** A PEM begin
-  with no end in its sequence is redacted to the sequence's last line; an
-  end with no begin from the sequence's first line; a run of PEM body lines
-  with neither is recognised by shape (see ``_body_runs``).
+* **When the end (or the start) cannot be seen, redact more -- within a
+  bound outside hunks (T-naysayer-codex-backend msg-898 PR-1).** On a hunk
+  side (P-3), a PEM begin with no end is redacted to the side's last line
+  and an end with no begin from the side's first line: a side is already
+  bounded. In the plain sequence (everything outside a hunk's sides), an
+  unclosed begin is redacted from the marker to the end of its line and
+  then down only while each next line has the shape of a PEM body line
+  (P-1, P-2, ``_pem_body_shape``); an orphan end the same way upward. Prose
+  ends the run on its first line, so a marker quoted in a message no longer
+  wipes the rest of the prompt. A run of PEM body lines with neither marker
+  is recognised by shape (see ``_body_runs``).
 
 What gets redacted (kinds, final): ``pem`` (PEM blocks and PEM body runs),
 ``key`` (known key prefixes), ``assignment`` (rule D-1 below), ``bearer``
@@ -75,7 +82,10 @@ Known prefixes, PEM blocks, Bearer and D-2 still apply to every line D-1
 does not cover.
 
 The counts (never the text) are what the ledger records
-(``redactions=<kind:count,...>``, see ``format_redactions``).
+(``redactions=<kind:count,...>``, see ``format_redactions``), and next to
+them the sizes of what was replaced (``redaction_extent=<kind:lines/chars,
+...>`` plus ``pem_unclosed:<n>``, see ``format_redaction_extent``; msg-898
+P-4). Both hold numbers only.
 """
 
 from __future__ import annotations
@@ -83,6 +93,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 KIND_PEM = "pem"
@@ -136,6 +147,19 @@ _NO_NEWLINE = r"\ No newline at end of file"
 _PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]+-----")
 _PEM_END_RE = re.compile(r"-----END [A-Z0-9 ]+-----")
 _BASE64_LINE_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+#: P-2 (msg-898): what is stripped around a plain line before its shape is
+#: judged. Leading quote and diff prefixes; trailing whitespace, ``"``, ``,``
+#: and a literal two-character ``\n``.
+_PEM_BODY_LEAD = " \t\r\f\v>+-#/\"'"
+_PEM_BODY_TRAIL = " \t\r\f\v\","
+#: P-2: base64 characters only, ``=`` padding allowed, 1-80 characters.
+_PEM_BODY_CORE_RE = re.compile(r"^[A-Za-z0-9+/]*={0,2}$")
+PEM_BODY_SHAPE_MAX = 80
+#: P-2: RFC 1421 header lines of an encrypted PEM.
+_PEM_HEADER_RE = re.compile(r"^(?:Proc-Type|DEK-Info):")
+_SHAPE_BODY = "body"
+_SHAPE_HEADER = "header"
+_SHAPE_BLANK = "blank"
 #: ``key: |`` / ``key: >-`` (also ``- key: |``): the YAML block opener is not
 #: content; the indented lines under it are (ADR-14 §7.3).
 _YAML_BLOCK_OPENER_RE = re.compile(r"^(?:-\s+)?[\w.\-\"']+\s*:\s*[|>][+-]?\d*\s*$")
@@ -235,6 +259,35 @@ def _make_line(marker: str, body: str) -> _Line:
     return _Line(marker + prefix, core, suffix, content, marker=marker, body=body)
 
 
+def _pem_body_shape(body: str | None) -> str | None:
+    """P-2 (msg-898): the shape of a plain line next to an unclosed PEM
+    marker -- ``"body"``, ``"header"``, ``"blank"``, or None for anything else
+    (which ends the run). This only decides the shape; a line that passes is
+    redacted whole."""
+    if body is None:
+        return None
+    s = body.lstrip(_PEM_BODY_LEAD)
+    while True:
+        t = s.rstrip(_PEM_BODY_TRAIL)
+        if t.endswith("\\n"):
+            t = t[:-2]
+        if t == s:
+            break
+        s = t
+    if not s:
+        return _SHAPE_BLANK
+    if _PEM_HEADER_RE.match(s):
+        return _SHAPE_HEADER
+    if len(s) <= PEM_BODY_SHAPE_MAX and _PEM_BODY_CORE_RE.match(s):
+        return _SHAPE_BODY
+    return None
+
+
+def _kind_of(label: str) -> str:
+    """``[REDACTED:<kind>#<n>]`` -> ``<kind>``."""
+    return label[len("[REDACTED:") : label.index("#")]
+
+
 def _is_no_newline(line: str) -> bool:
     return line.rstrip(" \t\r") == _NO_NEWLINE
 
@@ -245,9 +298,14 @@ def is_key_name(name: str) -> bool:
     return _KEY_NAME_RE.search(name) is not None
 
 
-def _replace_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
+def _replace_spans(
+    text: str,
+    spans: list[tuple[int, int, str]],
+    note: Callable[[str, int], None] | None = None,
+) -> str:
     """Replace (start, end, label) spans of ``text``; overlapping spans are
-    merged and keep the first label."""
+    merged and keep the first label. ``note(label, chars)`` is told the size
+    of each merged span that is replaced."""
     merged: list[list[object]] = []
     for start, end, label in sorted(spans):
         if merged and start <= merged[-1][1]:  # type: ignore[operator]
@@ -256,6 +314,8 @@ def _replace_spans(text: str, spans: list[tuple[int, int, str]]) -> str:
         merged.append([start, end, label])
     out, last = [], 0
     for start, end, label in merged:
+        if note is not None:
+            note(label, end - start)  # type: ignore[arg-type,operator]
         out.append(text[last:start])  # type: ignore[misc]
         out.append(label)  # type: ignore[arg-type]
         last = end  # type: ignore[assignment]
@@ -287,6 +347,25 @@ class Redactor:
         self.counts: Counter[str] = Counter()
         self._numbers: dict[tuple[str, str], int] = {}
         self._per_kind: Counter[str] = Counter()
+        #: P-4 (msg-898): lines touched and characters replaced, per kind,
+        #: and the number of unclosed PEM blocks. Sizes only, never text.
+        self.extent_lines: Counter[str] = Counter()
+        self.extent_chars: Counter[str] = Counter()
+        self.pem_unclosed = 0
+        self._line_kinds: set[str] = set()
+
+    # -- extent ---------------------------------------------------------
+    def _note(self, label: str, chars: int) -> None:
+        """``chars`` characters of the current line were replaced by
+        ``label``."""
+        kind = _kind_of(label)
+        self.extent_chars[kind] += chars
+        self._line_kinds.add(kind)
+
+    def _end_line(self) -> None:
+        for kind in self._line_kinds:
+            self.extent_lines[kind] += 1
+        self._line_kinds = set()
 
     # -- labels ---------------------------------------------------------
     def _label(self, kind: str, secret: str) -> str:
@@ -301,7 +380,10 @@ class Redactor:
     def label_assignment(self, secret: str) -> str:
         """One ``assignment`` redaction of a whole structured value (a JSON
         member under a D-1 key name); counted like a D-1 run."""
-        return self._label(KIND_ASSIGNMENT, secret)
+        label = self._label(KIND_ASSIGNMENT, secret)
+        self._note(label, len(secret))
+        self._end_line()
+        return label
 
     # -- entry point ----------------------------------------------------
     def redact(self, text: str) -> str:
@@ -398,17 +480,20 @@ class Redactor:
         # Multi-line patterns over each sequence, then D-1, then single-line
         # patterns on what D-1 did not cover.
         for seq in sequences:
-            self._pem_blocks(lines, seq)
+            # P-1 bounds unclosed blocks in the plain sequence only; a hunk
+            # side keeps running to its end (P-3).
+            self._pem_blocks(lines, seq, bounded=seq is plain)
             self._body_runs(lines, seq)
         for seq in d1_sequences:
             self._assignment_windows(lines, seq)
         for line in lines:
             if line.d1 is not None:
                 self._apply_assignment(line)  # applies the multi-line spans too
-                continue
-            self._apply_multiline(line)
-            if line.content:
-                line.core = self._single_line(line.core)
+            else:
+                self._apply_multiline(line)
+                if line.content:
+                    line.core = self._single_line(line.core)
+            self._end_line()
 
         return "\n".join(line.prefix + line.core + line.suffix for line in lines)
 
@@ -439,11 +524,20 @@ class Redactor:
         return None
 
     # -- multi-line: PEM ------------------------------------------------
-    def _pem_blocks(self, lines: list[_Line], seq: list[int]) -> None:
-        """Mark PEM blocks in one sequence. Begin..end; a begin without an
-        end runs to the sequence's last line; an end without a begin runs
-        from the sequence's first line (ADR-14 §7.3)."""
+    def _pem_blocks(self, lines: list[_Line], seq: list[int], *, bounded: bool = False) -> None:
+        """Mark PEM blocks in one sequence. Begin..end. Unclosed blocks
+        (ADR-14 §7.3, bounded by msg-898 PR-1):
+
+        * ``bounded=False`` (a hunk side, P-3): a begin without an end runs
+          to the sequence's last line; an end without a begin runs from the
+          sequence's first line.
+        * ``bounded=True`` (the plain sequence, P-1): a begin without an end
+          is redacted from the marker to the end of its line, then down
+          while each next line has a PEM body shape (``_pem_body_shape``);
+          an end without a begin from the start of its line, then up the
+          same way, never into the previous block."""
         idx = [k for k in seq if lines[k].content]
+        where = {k: n for n, k in enumerate(seq)}
         pos = 0
         #: First position an orphan end may reach back to: the line after
         #: the previous block, never into it.
@@ -473,19 +567,75 @@ class Redactor:
                         span.append((kk, 0, e.end()))
                         break
                     span.append((kk, 0, len(lines[kk].core)))
-                self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span))
+                if closing is None and bounded:
+                    span = [(k, begin.start(), len(core))]
+                    span += [(kk, 0, len(lines[kk].core)) for kk in self._run_down(lines, seq, where[k] + 1)]
+                    last = where[span[-1][0]]
+                    nxt = next((n for n in range(pos + 1, len(idx)) if where[idx[n]] > last), len(idx))
+                    if self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span)):
+                        self.pem_unclosed += 1
+                    pos = floor = nxt
+                    continue
+                if self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span)) and closing is None:
+                    self.pem_unclosed += 1
                 pos = (closing if closing is not None else len(idx) - 1) + 1
                 floor = pos
                 continue
             if end is not None:
-                # An end with no begin before it: from the sequence's first
-                # content line -- or the line after the previous block, whose
-                # lines are already redacted -- up to this end.
-                span = [(kk, 0, len(lines[kk].core)) for kk in idx[floor:pos]]
+                if bounded:
+                    # Up from this end while the lines have a body shape,
+                    # never into the previous block.
+                    low = where[idx[floor - 1]] + 1 if floor > 0 else 0
+                    above = self._run_up(lines, seq, where[k] - 1, low)
+                    span = [(kk, 0, len(lines[kk].core)) for kk in above]
+                else:
+                    # An end with no begin before it: from the sequence's
+                    # first content line -- or the line after the previous
+                    # block, whose lines are already redacted -- up to this end.
+                    span = [(kk, 0, len(lines[kk].core)) for kk in idx[floor:pos]]
                 span.append((k, 0, end.end()))
-                self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span))
+                if self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span)):
+                    self.pem_unclosed += 1
                 floor = pos + 1
             pos += 1
+
+    @staticmethod
+    def _run_down(lines: list[_Line], seq: list[int], start: int) -> list[int]:
+        """P-1/P-2: the lines of ``seq`` from position ``start`` down that
+        have a PEM body shape. One blank line is allowed right after an
+        RFC 1421 header; any other blank line, and any other shape, ends the
+        run."""
+        run: list[int] = []
+        after_header = False
+        for q in range(start, len(seq)):
+            k = seq[q]
+            shape = _pem_body_shape(lines[k].body)
+            if shape in (_SHAPE_BODY, _SHAPE_HEADER):
+                after_header = shape == _SHAPE_HEADER
+            elif shape == _SHAPE_BLANK and after_header:
+                after_header = False
+            else:
+                break
+            run.append(k)
+        return run
+
+    @staticmethod
+    def _run_up(lines: list[_Line], seq: list[int], start: int, low: int) -> list[int]:
+        """``_run_down`` read upward from position ``start`` to ``low``: a
+        blank line is taken only when the line above it is a header."""
+        run: list[int] = []
+        q = start
+        while q >= low:
+            shape = _pem_body_shape(lines[seq[q]].body)
+            if shape == _SHAPE_BLANK:
+                if q - 1 < low or _pem_body_shape(lines[seq[q - 1]].body) != _SHAPE_HEADER:
+                    break
+            elif shape not in (_SHAPE_BODY, _SHAPE_HEADER):
+                break
+            run.append(seq[q])
+            q -= 1
+        run.reverse()
+        return run
 
     # -- multi-line: PEM body run ----------------------------------------
     def _body_runs(self, lines: list[_Line], seq: list[int]) -> None:
@@ -527,7 +677,8 @@ class Redactor:
             if shannon_entropy(joined) >= ENTROPY_THRESHOLD:
                 self._mark(lines, [(k, 0, len(lines[k].core)) for k in run], joined)
 
-    def _mark(self, lines: list[_Line], span: list[tuple[int, int, int]], secret: str) -> None:
+    def _mark(self, lines: list[_Line], span: list[tuple[int, int, int]], secret: str) -> bool:
+        """Mark one ``pem`` block; False when it was already marked."""
         marks = [(k, start, end) for k, start, end in span if end > start]
         number = self._numbers.get((KIND_PEM, secret))
         if number is not None:
@@ -536,17 +687,17 @@ class Redactor:
             # sides): one block, one count.
             label = f"[REDACTED:{KIND_PEM}#{number}]"
             if all((start, end, label) in lines[k].spans for k, start, end in marks):
-                return
+                return False
         label = self._label(KIND_PEM, secret)
         for k, start, end in marks:
             lines[k].spans.append((start, end, label))
+        return True
 
-    @staticmethod
-    def _apply_multiline(line: _Line) -> None:
+    def _apply_multiline(self, line: _Line) -> None:
         """Replace the marked spans (merged where two sequences overlap)."""
         if not line.spans:
             return
-        line.core = _replace_spans(line.core, line.spans)
+        line.core = _replace_spans(line.core, line.spans, self._note)
         line.spans = []
 
     # -- D-1: assignment ------------------------------------------------
@@ -601,6 +752,7 @@ class Redactor:
             # ``,``/``\`` and the CR stay (``_split_core``).
             line.spans = []
             if line.core:
+                self._note(label, len(line.core))
                 line.core = label
             return
         body = line.body or ""
@@ -614,15 +766,16 @@ class Redactor:
         ]
         line.spans = []
         line.prefix = line.marker
-        line.core = self._single_line(_replace_spans(body[:start], left)) + label
+        self._note(label, end - start)
+        line.core = self._single_line(_replace_spans(body[:start], left, self._note)) + label
         line.suffix = body[end:]
 
     # -- single-line ----------------------------------------------------
     def _single_line(self, core: str) -> str:
         for rx in _KEY_RES:
-            core = rx.sub(lambda m: self._label(KIND_KEY, m.group(0)), core)
+            core = rx.sub(lambda m: self._replaced(KIND_KEY, m.group(0)), core)
         core = _BEARER_RE.sub(
-            lambda m: m.group(0)[: m.start(1) - m.start(0)] + self._label(KIND_BEARER, m.group(1)),
+            lambda m: m.group(0)[: m.start(1) - m.start(0)] + self._replaced(KIND_BEARER, m.group(1)),
             core,
         )
         text = core
@@ -641,13 +794,38 @@ class Redactor:
             return token  # ``sha256:<digest>``
         if shannon_entropy(token) < ENTROPY_THRESHOLD:
             return token
-        return self._label(KIND_ENTROPY, token)
+        return self._replaced(KIND_ENTROPY, token)
+
+    def _replaced(self, kind: str, secret: str) -> str:
+        """A single-line match replaced in the current line."""
+        label = self._label(kind, secret)
+        self._note(label, len(secret))
+        return label
 
 
 def redact(text: str) -> tuple[str, Counter[str]]:
     """Redact one text. Convenience wrapper: ``(text, counts by kind)``."""
     r = Redactor()
     return r.redact(text), r.counts
+
+
+def format_redaction_extent(redactor: Redactor) -> str | None:
+    """The ledger value ``redaction_extent`` (msg-898 P-4): ``kind:lines/chars``
+    per kind -- lines touched and characters replaced -- plus
+    ``pem_unclosed:<n>`` whenever a ``pem`` was replaced, sorted by name;
+    None when nothing was replaced.
+
+    Sizes only -- never the redacted text (ADR-14 §7.3 記録)."""
+    items = [
+        (k, f"{redactor.extent_lines[k]}/{redactor.extent_chars[k]}")
+        for k in redactor.extent_lines
+        if redactor.extent_lines[k] > 0
+    ]
+    if not items:
+        return None
+    if redactor.extent_lines[KIND_PEM] > 0 or redactor.pem_unclosed:
+        items.append(("pem_unclosed", str(redactor.pem_unclosed)))
+    return ",".join(f"{k}:{v}" for k, v in sorted(items))
 
 
 def format_redactions(counts: Counter[str]) -> str | None:

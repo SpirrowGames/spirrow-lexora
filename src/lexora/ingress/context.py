@@ -14,6 +14,9 @@ from __future__ import annotations
 from contextvars import ContextVar
 
 _CURRENT: ContextVar[str | None] = ContextVar("lexora_redactions", default=None)
+#: ``redaction_extent=<kind:lines/chars,...>`` (T-naysayer-codex-backend
+#: msg-898 P-4): set and read the same way, and NULL in the same cases.
+_EXTENT: ContextVar[str | None] = ContextVar("lexora_redaction_extent", default=None)
 
 
 def set_redactions(value: str | None) -> None:
@@ -22,3 +25,11 @@ def set_redactions(value: str | None) -> None:
 
 def current_redactions() -> str | None:
     return _CURRENT.get()
+
+
+def set_redaction_extent(value: str | None) -> None:
+    _EXTENT.set(value)
+
+
+def current_redaction_extent() -> str | None:
+    return _EXTENT.get()
