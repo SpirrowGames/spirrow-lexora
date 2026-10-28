@@ -35,8 +35,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from lexora.backends.answer_route import AnswerRoute, set_answer_route
-from lexora.ingress.context import set_redactions
-from lexora.ingress.redact import ASSIGNMENT_MIN_LEN, Redactor, format_redactions, is_key_name
+from lexora.ingress.context import set_redaction_extent, set_redactions
+from lexora.ingress.redact import (
+    ASSIGNMENT_MIN_LEN,
+    Redactor,
+    format_redaction_extent,
+    format_redactions,
+    is_key_name,
+)
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -184,7 +190,14 @@ def _redact_tool_call(call: Any, redactor: Redactor) -> Any:
 
 
 def redact_request(request: dict[str, Any]) -> Counter[str]:
-    """Redact every text of ``request`` in place; return counts by kind.
+    """Redact every text of ``request`` in place; return counts by kind
+    (``redact_request_full`` also gives the extent)."""
+    return redact_request_full(request).counts
+
+
+def redact_request_full(request: dict[str, Any]) -> Redactor:
+    """Redact every text of ``request`` in place; return the ``Redactor``,
+    which holds the counts and the extent (msg-898 P-4).
 
     Covers every message (which carries the system prompt: the
     ``/v1/messages`` adapter turns ``system`` into the first message) --
@@ -200,7 +213,7 @@ def redact_request(request: dict[str, Any]) -> Counter[str]:
     for key in ("system", "prompt", "input"):
         if key in request:
             request[key] = _redact_content(request[key], redactor)
-    return redactor.counts
+    return redactor
 
 
 class IngressBackend:
@@ -211,10 +224,18 @@ class IngressBackend:
     the handler's ``cost_tracker.record`` -- which runs in that context --
     sees them. Everything else is delegated to the wrapped backend."""
 
-    def __init__(self, inner: Any, *, route: AnswerRoute | None, redactions: str | None) -> None:
+    def __init__(
+        self,
+        inner: Any,
+        *,
+        route: AnswerRoute | None,
+        redactions: str | None,
+        redaction_extent: str | None = None,
+    ) -> None:
         self._inner = inner
         self._route = route
         self._redactions = redactions
+        self._redaction_extent = redaction_extent
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
@@ -227,6 +248,7 @@ class IngressBackend:
         if self._route is not None:
             set_answer_route(self._route)
         set_redactions(self._redactions)
+        set_redaction_extent(self._redaction_extent)
 
     async def chat_completions(self, request: dict[str, Any]) -> dict[str, Any]:
         self._stamp()
@@ -288,14 +310,21 @@ def apply_ingress(
         backend = target
 
     redactions: str | None = None
+    redaction_extent: str | None = None
     if ingress.redact:
         try:
-            counts = redact_request(request)
+            redactor = redact_request_full(request)
         except Exception as exc:  # noqa: BLE001 - any scanner failure blocks the request
             logger.error("ingress_redaction_failed", tier=requested, error_type=type(exc).__name__)
             raise RedactionFailed(f"redaction failed for tier '{requested}'") from exc
-        redactions = format_redactions(counts)
+        redactions = format_redactions(redactor.counts)
+        redaction_extent = format_redaction_extent(redactor)
         if redactions:
-            logger.info("ingress_redacted", tier=requested, redactions=redactions)
+            logger.info(
+                "ingress_redacted",
+                tier=requested,
+                redactions=redactions,
+                redaction_extent=redaction_extent,
+            )
 
-    return IngressBackend(backend, route=route, redactions=redactions)
+    return IngressBackend(backend, route=route, redactions=redactions, redaction_extent=redaction_extent)

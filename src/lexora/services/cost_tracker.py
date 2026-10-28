@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from lexora.backends.answer_route import SUBSCRIPTION_ANSWERS, current_answer_route
-from lexora.ingress.context import current_redactions
+from lexora.ingress.context import current_redaction_extent, current_redactions
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -268,6 +268,11 @@ class CostTracker:
             # tier has ``redact: false``, and for every older row. Add-only.
             if "redactions" not in cols:
                 conn.execute("ALTER TABLE request_costs ADD COLUMN redactions TEXT")
+            # msg-898 P-4: how much the ingress replaced, as
+            # ``kind:lines/chars,...`` plus ``pem_unclosed:<n>`` -- sizes only,
+            # never the text. NULL exactly where ``redactions`` is. Add-only.
+            if "redaction_extent" not in cols:
+                conn.execute("ALTER TABLE request_costs ADD COLUMN redaction_extent TEXT")
             conn.execute(
                 """CREATE INDEX IF NOT EXISTS idx_costs_trace_id
                    ON request_costs(trace_id)"""
@@ -466,8 +471,8 @@ class CostTracker:
                         tokens_input, tokens_output, cost_usd,
                         duration_seconds, success, tier, pricing_known,
                         tokens_thinking, tokens_cached_input, answered_by,
-                        trace_id, redactions)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        trace_id, redactions, redaction_extent)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         timestamp,
                         model,
@@ -486,6 +491,7 @@ class CostTracker:
                         answered_by,
                         trace_id,
                         current_redactions(),
+                        current_redaction_extent(),
                     ),
                 )
         except Exception:
