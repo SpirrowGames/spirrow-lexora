@@ -1,5 +1,7 @@
 """vLLM backend implementation using httpx."""
 
+import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -17,6 +19,148 @@ from lexora.backends.base import (
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+#: An SSE event boundary: two consecutive line ends, each ``\r\n``, ``\r`` or
+#: ``\n`` in any mix (msg-889/msg-890). A ``\r`` counts as a line end on its
+#: own only when no ``\n`` follows it (``\r(?!\n)``). Without that lookahead
+#: the regex backtracks ``\r\n`` into ``\r`` + ``\n`` and every single CRLF
+#: line end becomes a "boundary", cutting multi-line events apart.
+_SSE_EVENT_DELIMITER = re.compile(rb"(?:\r\n|\r(?!\n)|\n){2}")
+_SSE_LINE_END = re.compile(rb"\r\n|\r|\n")
+
+#: The longest delimiter is 4 bytes, so a match not found by one scan can
+#: start no earlier than 3 bytes before where that scan stopped. (1 and 2
+#: also pass the tests, because the last byte of any line end is itself a
+#: line end; 0 fails them. 3 is the bound that does not lean on that.)
+_DELIMITER_RESCAN = 3
+
+#: Cap on the usage reader's side buffer (T-streaming-ledger-row msg-877 §3).
+#: The usage event measured on vLLM 0.17.1 is about 150 bytes, so only bytes
+#: that are not the measured shape can reach this; past it the reader gives up
+#: for the rest of the request and the sink stays at zero.
+USAGE_PARSE_BUFFER_CAP = 64 * 1024
+
+
+def _with_usage_requested(request: dict[str, Any]) -> dict[str, Any]:
+    """A copy of ``request`` whose ``stream_options.include_usage`` is True.
+
+    **Unconditional, whatever the caller sent** (T-streaming-ledger-row
+    msg-879): honouring a caller's ``include_usage: false`` would let it take
+    a full generation and leave no ledger row, and the ledger is a
+    measurement, not a client preference. Every other ``stream_options`` key
+    the caller sent is kept. Neither the caller's dict nor its
+    ``stream_options`` dict is mutated: both are copied before the key is set.
+    """
+    existing = request.get("stream_options")
+    options = dict(existing) if isinstance(existing, dict) else {}
+    options["include_usage"] = True
+    return {**request, "stream_options": options}
+
+
+def _is_count(value: object) -> bool:
+    # `type(...) is int`, not `isinstance`: bool is a subclass of int, and
+    # `"prompt_tokens": true` must not bill as 1 (msg-889/msg-890).
+    return type(value) is int and value >= 0
+
+
+class _StreamUsageReader:
+    """Reads the final usage event out of a *side copy* of the relayed bytes.
+
+    ``chat_completions_stream`` passes each upstream chunk to ``feed`` and
+    then yields that same chunk unchanged (msg-890). Feeding first is what
+    keeps the count when the client hangs up as soon as it has the last
+    chunk: a cancellation lands at the ``yield``, and a chunk fed only after
+    the ``yield`` would never be read. Feeding first still gives the parser
+    **no path to the client stream**, because three things hold:
+
+    * ``feed`` is synchronous and contains no ``await``, so no cancellation
+      can land inside it and it finishes before control returns to the
+      network;
+    * ``feed`` catches every ``Exception`` (not ``BaseException``), and after
+      one the reader stops for the rest of the request;
+    * the work per chunk is bounded: the buffer is capped at
+      ``USAGE_PARSE_BUFFER_CAP``, and each scan resumes a few bytes before
+      the end of the previous one instead of rescanning the whole tail.
+
+    The worst it can do is leave the sink at zero, which opens no row,
+    exactly as before this reader existed.
+
+    The usage event is a ``data`` payload that is not ``[DONE]``, parses as a
+    JSON object, and has ``choices == []`` and a ``usage`` object whose
+    ``prompt_tokens`` / ``completion_tokens`` are non-negative ints. That is
+    the shape measured on vLLM 0.17.1 (msg-874): once, immediately before
+    ``data: [DONE]``, with no ``usage`` key on any earlier event. If more than
+    one event matches, the last wins. An incomplete event at end of stream is
+    discarded, as the SSE spec says.
+    """
+
+    def __init__(self, sink: UsageSink | None) -> None:
+        self._sink = sink
+        self._buffer = b""
+        self._scan_from = 0
+        self._stopped = sink is None
+
+    def feed(self, chunk: bytes) -> None:
+        if self._stopped:
+            return
+        try:
+            self._feed(chunk)
+        except Exception as exc:  # fail open, by design: see the class doc
+            self._stop("vllm_stream_usage_reader_error", error=repr(exc))
+
+    def _stop(self, event: str, **fields: Any) -> None:
+        self._stopped = True
+        self._buffer = b""
+        logger.debug(event, **fields)
+
+    def _feed(self, chunk: bytes) -> None:
+        self._buffer += chunk
+        while True:
+            # A chunk cut inside `\r\n\r\n` can leave `...\r\n\r` here; that
+            # matches as `\r\n` + `\r`, and the next event starts with a stray
+            # `\n`, which `_read_event` reads as an empty line (msg-890).
+            match = _SSE_EVENT_DELIMITER.search(self._buffer, self._scan_from)
+            if match is None:
+                self._scan_from = max(0, len(self._buffer) - _DELIMITER_RESCAN)
+                break
+            event = self._buffer[: match.start()]
+            self._buffer = self._buffer[match.end() :]
+            self._scan_from = 0
+            self._read_event(event)
+        if len(self._buffer) > USAGE_PARSE_BUFFER_CAP:
+            self._stop(
+                "vllm_stream_usage_buffer_cap",
+                cap=USAGE_PARSE_BUFFER_CAP,
+                buffered=len(self._buffer),
+            )
+
+    def _read_event(self, event: bytes) -> None:
+        data_lines = []
+        for line in _SSE_LINE_END.split(event):
+            if line.startswith(b"data:"):
+                value = line[5:]
+                data_lines.append(value[1:] if value.startswith(b" ") else value)
+        if not data_lines:
+            return
+        payload = b"\n".join(data_lines)
+        if payload == b"[DONE]":
+            return
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            return
+        if not isinstance(obj, dict) or obj.get("choices") != []:
+            return
+        usage = obj.get("usage")
+        if not isinstance(usage, dict):
+            return
+        prompt = usage.get("prompt_tokens")
+        completion = usage.get("completion_tokens")
+        if not (_is_count(prompt) and _is_count(completion)):
+            return
+        if self._sink is not None:
+            self._sink.prompt_tokens = prompt
+            self._sink.completion_tokens = completion
 
 
 class VLLMBackend(Backend):
@@ -196,26 +340,59 @@ class VLLMBackend(Backend):
     ) -> AsyncIterator[bytes]:
         """Send streaming chat completion request to vLLM.
 
+        Fills ``usage_sink`` (T-streaming-ledger-row PR-C, msg-879/msg-880):
+
+        * **The upstream is always asked for usage.** ``stream_options.
+          include_usage: true`` is written into a copy of the request whatever
+          the caller sent -- including an explicit ``false``, which would
+          otherwise buy a full generation with no ledger row. Other
+          ``stream_options`` keys survive; the caller's dict is not mutated.
+        * **Client-visible effect, deliberate:** the relay is verbatim, so a
+          caller who did not ask now also receives vLLM's final usage event,
+          ``"choices": []`` plus ``usage``, immediately before
+          ``data: [DONE]``. Evidence that this is safe: msg-874 (one probe
+          against vLLM 0.17.1 measured that exact event, and that no earlier
+          event carries ``usage``) and msg-760 (31 days of production logs:
+          no client streams from a vLLM tier, and both known readers skip
+          empty-``choices`` events).
+        * **The relay does not depend on the parser.** Each upstream chunk is
+          handed to ``_StreamUsageReader.feed`` and then yielded unchanged.
+          Feed first, so a client that hangs up as soon as it has the usage
+          chunk still leaves the count in the sink (msg-889/msg-890). ``feed``
+          is synchronous, catches its own exceptions and does bounded work per
+          chunk (see its class docstring), so no parse failure, delimiter
+          style or oversize event can change or end what the client receives
+          -- the worst case is a zero sink and no row.
+        * Billed as ``prompt_tokens`` / ``completion_tokens`` as reported;
+          measured to sum to ``total_tokens`` (msg-874 (iv)). vLLM counts
+          reasoning tokens inside ``completion_tokens`` and reports no split,
+          so ``thinking_tokens`` stays ``None`` -- nothing is inferred.
+        * A client that disconnects before the final event bills zero, as on
+          every backend: the count is in the last event.
+
+        ``Backend.fills_usage_sink`` nevertheless stays ``False`` on this
+        class: the flag is per class and ``completions_stream`` below does not
+        fill the sink, so declaring would count every streamed
+        ``/v1/completions`` as the defect. The cost is that
+        ``lexora_stream_usage_missing_total`` does not watch this path;
+        ``tests/backends/test_vllm_stream_usage.py`` pins it instead.
+
         Args:
             request: OpenAI-compatible chat completion request.
-            usage_sink: Accepted and never filled, for the same reason as
-                ``openai_compatible.chat_completions_stream``: a verbatim byte
-                relay, and this tree never sends
-                ``stream_options.include_usage``, so the number is not in the
-                bytes. Zero means no row -- "we cannot say", not "free".
-
-                Carried as a value too: ``Backend.fills_usage_sink`` stays
-                ``False`` on this class, so an empty sink here is one of the
-                legitimate silences and not the counted defect. Prose and
-                attribute change together.
+            usage_sink: Per-request carrier, filled from the usage event.
 
         Yields:
-            SSE data chunks.
+            SSE data chunks, exactly as vLLM sent them.
 
         Raises:
             BackendError: If the request fails.
         """
-        async for chunk in self._post_stream("/v1/chat/completions", self._apply_thinking_controls(request)):
+        reader = _StreamUsageReader(usage_sink)
+        upstream_request = self._apply_thinking_controls(_with_usage_requested(request))
+        async for chunk in self._post_stream("/v1/chat/completions", upstream_request):
+            # Feed first: a disconnect cancels at the `yield`, and a chunk not
+            # yet fed by then would lose the count. `feed` never awaits/raises.
+            reader.feed(chunk)
             yield chunk
 
     async def completions_stream(
@@ -225,8 +402,15 @@ class VLLMBackend(Backend):
 
         Args:
             request: OpenAI-compatible completion request.
-            usage_sink: Accepted and never filled; see
-                ``chat_completions_stream``.
+            usage_sink: Accepted and never filled. Unlike
+                ``chat_completions_stream`` this path sends no
+                ``stream_options``: only ``/v1/chat/completions`` was probed
+                (msg-874), and an upstream that rejected the field here would
+                break the path, so it stays unasked and unfilled. Zero means
+                no row -- "we cannot say", not "free". A caller can therefore
+                pick this endpoint to leave no row; that gap is known and
+                stated (coverage table on ``api/routes.py``'s
+                ``get_cost_tracker``), not accidental.
 
         Yields:
             SSE data chunks.

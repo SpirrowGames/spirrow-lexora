@@ -180,6 +180,21 @@ class TestRedaction:
             client.post("/v1/chat/completions", json=body)
         assert [r[2] for r in _rows(tmp_path / "c.db")] == ["key:1", None]
 
+    def test_row_records_the_extent_next_to_the_counts(self, tmp_path: Path) -> None:
+        """msg-898 P-4: ``redaction_extent`` sits beside ``redactions`` (which
+        keeps its format), holds sizes only, and is NULL where it is."""
+        primary = _backend()
+        app = _app(primary, CostTracker(tmp_path / "c.db"))
+        _wire(app, REDACT_ONLY)
+        body = {"model": "naysayer-gemini", "messages": [{"role": "user", "content": f"a {SECRET}\nb {SECRET}"}]}
+        with TestClient(app) as client:
+            client.post("/v1/chat/completions", json=body)
+            _wire(app, PLAIN)
+            client.post("/v1/chat/completions", json=body)
+        with sqlite3.connect(tmp_path / "c.db") as conn:
+            rows = conn.execute("SELECT redactions, redaction_extent FROM request_costs ORDER BY id").fetchall()
+        assert rows == [("key:2", f"key:2/{2 * len(SECRET)}"), (None, None)]
+
 
 class TestShadowRow:
     def test_shadow_row_carries_the_redactions(self, tmp_path: Path) -> None:
@@ -205,8 +220,11 @@ class TestShadowRow:
             if w._shadow_task is not None:
                 client.portal.call(_await, w._shadow_task)
         with sqlite3.connect(tmp_path / "c.db") as conn:
-            rows = conn.execute("SELECT endpoint, redactions FROM request_costs ORDER BY endpoint").fetchall()
-        assert sorted(rows) == [("/v1/chat/completions", "key:1"), ("shadow", "key:1")]
+            rows = conn.execute(
+                "SELECT endpoint, redactions, redaction_extent FROM request_costs ORDER BY endpoint"
+            ).fetchall()
+        extent = f"key:1/{len(SECRET)}"
+        assert sorted(rows) == [("/v1/chat/completions", "key:1", extent), ("shadow", "key:1", extent)]
 
 
 async def _await(task: Any) -> None:
