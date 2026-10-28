@@ -351,8 +351,15 @@ class Redactor:
         #: and the number of unclosed PEM blocks. Sizes only, never text.
         self.extent_lines: Counter[str] = Counter()
         self.extent_chars: Counter[str] = Counter()
+        #: Unclosed PEM blocks whose label reached the output. A block whose
+        #: every span was superseded (a D-1 line redacted in full, or an
+        #: overlapping block's label) replaced nothing, so it is not counted
+        #: (PR-gate advisory on #101).
         self.pem_unclosed = 0
         self._line_kinds: set[str] = set()
+        self._line_labels: set[str] = set()
+        #: This ``redact`` call's unclosed blocks: (label, line indexes).
+        self._unclosed: list[tuple[str, list[int]]] = []
 
     # -- extent ---------------------------------------------------------
     def _note(self, label: str, chars: int) -> None:
@@ -361,11 +368,22 @@ class Redactor:
         kind = _kind_of(label)
         self.extent_chars[kind] += chars
         self._line_kinds.add(kind)
+        self._line_labels.add(label)
 
-    def _end_line(self) -> None:
+    def _end_line(self) -> set[str]:
+        """Close the current line; return the labels it was given."""
         for kind in self._line_kinds:
             self.extent_lines[kind] += 1
+        labels = self._line_labels
         self._line_kinds = set()
+        self._line_labels = set()
+        return labels
+
+    def _mark_unclosed(self, lines: list[_Line], span: list[tuple[int, int, int]], secret: str) -> None:
+        """``_mark`` an unclosed block and remember it for ``pem_unclosed``."""
+        if self._mark(lines, span, secret):
+            label = f"[REDACTED:{KIND_PEM}#{self._numbers[(KIND_PEM, secret)]}]"
+            self._unclosed.append((label, [k for k, _, _ in span]))
 
     # -- labels ---------------------------------------------------------
     def _label(self, kind: str, secret: str) -> str:
@@ -486,6 +504,7 @@ class Redactor:
             self._body_runs(lines, seq)
         for seq in d1_sequences:
             self._assignment_windows(lines, seq)
+        given: list[set[str]] = []
         for line in lines:
             if line.d1 is not None:
                 self._apply_assignment(line)  # applies the multi-line spans too
@@ -493,7 +512,9 @@ class Redactor:
                 self._apply_multiline(line)
                 if line.content:
                     line.core = self._single_line(line.core)
-            self._end_line()
+            given.append(self._end_line())
+        self.pem_unclosed += sum(1 for label, ks in self._unclosed if any(label in given[k] for k in ks))
+        self._unclosed = []
 
         return "\n".join(line.prefix + line.core + line.suffix for line in lines)
 
@@ -572,12 +593,13 @@ class Redactor:
                     span += [(kk, 0, len(lines[kk].core)) for kk in self._run_down(lines, seq, where[k] + 1)]
                     last = where[span[-1][0]]
                     nxt = next((n for n in range(pos + 1, len(idx)) if where[idx[n]] > last), len(idx))
-                    if self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span)):
-                        self.pem_unclosed += 1
+                    self._mark_unclosed(lines, span, "\n".join(lines[a].core for a, _, _ in span))
                     pos = floor = nxt
                     continue
-                if self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span)) and closing is None:
-                    self.pem_unclosed += 1
+                if closing is None:
+                    self._mark_unclosed(lines, span, "\n".join(lines[a].core for a, _, _ in span))
+                else:
+                    self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span))
                 pos = (closing if closing is not None else len(idx) - 1) + 1
                 floor = pos
                 continue
@@ -594,8 +616,7 @@ class Redactor:
                     # block, whose lines are already redacted -- up to this end.
                     span = [(kk, 0, len(lines[kk].core)) for kk in idx[floor:pos]]
                 span.append((k, 0, end.end()))
-                if self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span)):
-                    self.pem_unclosed += 1
+                self._mark_unclosed(lines, span, "\n".join(lines[a].core for a, _, _ in span))
                 floor = pos + 1
             pos += 1
 

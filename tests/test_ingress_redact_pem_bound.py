@@ -221,7 +221,29 @@ def test_8_msg_863_body_plus_a_trailing_block_keeps_the_trailing_block() -> None
     text = MSG_863 + "\n" + "\n".join(tail)
     out, r = _run(text)
     assert out[-100:] == tail
-    assert r.pem_unclosed == 2
+    # Both quoted begins are found, but each marker line is also inside a D-1
+    # window opened by the ``API_KEY = (`` msg-863 quotes, which redacts the
+    # line in full: no ``pem`` label reaches the output, so none is counted.
+    assert r.counts[KIND_PEM] == 2
+    assert r.pem_unclosed == 0 and r.extent_lines[KIND_PEM] == 0
+
+
+def test_7e_unclosed_block_superseded_by_d1_is_not_counted() -> None:
+    """PR-gate advisory on #101: ``pem_unclosed`` counts blocks whose label
+    reached the output, so it never appears without a ``pem`` extent."""
+    text = "\n".join([f"api_key = {BEGIN}", *PROSE])
+    out, r = _run(text)
+    assert out[0] == "api_key = [REDACTED:assignment#1]"
+    assert r.pem_unclosed == 0
+    value = format_redaction_extent(r)
+    assert value is not None and "pem" not in value
+
+
+def test_7f_unclosed_count_is_per_request_across_blocks() -> None:
+    r = Redactor()
+    r.redact(f"see {BEGIN}\nprose here")
+    r.redact(f"see {BEGIN}\nmore prose here")
+    assert r.pem_unclosed == 2 and r.counts[KIND_PEM] == 2
 
 
 # -- P-2 shape ------------------------------------------------------------------
