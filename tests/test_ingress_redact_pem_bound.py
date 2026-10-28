@@ -269,3 +269,42 @@ def test_7f_unclosed_count_is_per_request_across_blocks() -> None:
 )
 def test_pem_body_shape(line: str, shape: str | None) -> None:
     assert _pem_body_shape(line) == shape
+
+
+# -- PR-gate REQUEST_CHANGES on #101 @ 7fb05a3 -----------------------------------
+@pytest.mark.parametrize(
+    ("line", "first", "extent"),
+    [
+        # A key prefix left of a D-1 value: noted by ``_single_line``.
+        (
+            "x sk-proj-abcdefghij1234567890KLMNOP api_key = hunter2hunter2",
+            "x [REDACTED:key#1] api_key = [REDACTED:assignment#1]",
+            "assignment:1/14,key:1/34",
+        ),
+        # A PEM span left of a D-1 value (PR-gate on #96): the ``left`` spans
+        # handed to ``_replace_spans`` carry only ``_mark``'s pem labels.
+        (
+            f"{BEGIN} api_key = hunter2hunter2hunter2",
+            "[REDACTED:pem#1][REDACTED:assignment#1]",
+            f"assignment:1/21,pem:1/{len(BEGIN + ' api_key = ')},pem_unclosed:1",
+        ),
+        (
+            f"see {BEGIN} then token: abcdefghijklmnop",
+            "see [REDACTED:pem#1][REDACTED:assignment#1]",
+            None,
+        ),
+    ],
+)
+def test_assignment_value_with_spans_on_its_left_is_noted_without_error(
+    line: str, first: str, extent: str | None
+) -> None:
+    """``_apply_assignment`` passes ``self._note`` to ``_replace_spans`` for
+    the text left of a D-1 value. Every span there comes from ``_mark``, so
+    every label is a ``[REDACTED:<kind>#<n>]`` label and ``_kind_of`` cannot
+    raise; the scanner does not fail the request."""
+    r = Redactor()
+    assert r.redact(line) == first
+    value = format_redaction_extent(r)
+    assert value is not None
+    if extent is not None:
+        assert value == extent
