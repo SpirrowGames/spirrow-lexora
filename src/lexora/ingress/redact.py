@@ -53,8 +53,11 @@ Purely structural: no decision here reads brackets, quotes, escapes,
 comments, continuation characters or YAML.
 
 * **Key line:** ``password|passwd|secret|token|api[_-]?key`` (any case,
-  anywhere in an identifier) followed by ``=`` / ``:`` / ``:=``. No
-  exclusions.
+  anywhere in an identifier) followed by ``=`` / ``:`` / ``:=``, unless the
+  name is excluded (T-redactor-over-redacts-identifiers-and-paths msg-904 /
+  msg-921, plus the camelCase item approved on 2026-10-31; see
+  ``_is_key_line``). A line with several candidates is a key line as soon as
+  one of them is not excluded.
 * **On the key line,** everything from just after the line's *first*
   ``=`` / ``:`` (and the whitespace after it) to the end of the line is
   redacted when it is 8+ characters long, counted with any quotes, after
@@ -69,7 +72,10 @@ comments, continuation characters or YAML.
 
 D-2, ``entropy``: a token of 32+ characters with Shannon entropy >= 4.0 bits
 per character. Hex strings (so commit SHAs), UUIDs and ``sha<N>:<hex>``
-digests are excluded.
+digests are excluded, and so are identifier- and path-shaped tokens (msg-921
+A / B / C plus the digit-only segments approved on 2026-10-31; see
+``_is_word_or_path_shaped``). What this gives up is accepted by Takahito
+(msg-909) and measured in ``tests/test_ingress_redact_exclusions.py``.
 
 Accepted limits (msg-834; reported to D8 with the "stricter than D8" list)
 ------------------------------------------------------------------------
@@ -183,15 +189,28 @@ _KEY_RES = [
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+([A-Za-z0-9\-._~+/]{8,}=*)")
 #: D-1 key line: a credential-named key followed by an assignment operator
 #: (msg-836 §1). Nothing about the value is looked at here.
-_KEY_LINE_RE = re.compile(
-    r"(?i)(?:password|passwd|secret|token|api[_\-]?key)[A-Za-z0-9_.\-]*[\"']?\s*(?::=|=|:)"
+_KEY_WORD_RE = re.compile(r"(?i)password|passwd|secret|token|api[_\-]?key")
+#: What must follow a key word on a key line. Group 1 is the rest of the name.
+_KEY_TAIL_RE = re.compile(r"([A-Za-z0-9_.\-]*)[\"']?\s*(?::=|=|:)")
+#: Words that name a credential's shape, count or location rather than hold it
+#: (msg-904 (ii)). Matched as the whole rest of the name: "the word ends here".
+_KEY_NOT_SECRET_WORDS = (
+    "re|regex|pattern|rx|count|len|length|limit|max|min|type|kind|name|names"
+    "|label|ref|path|file|env|var|header|field|id"
 )
+_KEY_SEPARATED_WORD_RE = re.compile(rf"(?i)[_\-.](?:{_KEY_NOT_SECRET_WORDS})")
+_KEY_LOWER_WORD_RE = re.compile(rf"(?:{_KEY_NOT_SECRET_WORDS})")
 #: The D-1 key names alone, for structured data (a JSON member name).
 _KEY_NAME_RE = re.compile(r"(?i)(?:password|passwd|secret|token|api[_\-]?key)")
 #: The first assignment operator of a key line: D-1 redacts from after it.
 _OPERATOR_RE = re.compile(r":=|=|:")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9+/=_\-]{%d,}" % ENTROPY_MIN_LEN)
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+#: D-2 exclusion C: a separator-free run this long is never word- or path-shaped.
+_SHAPE_SPLIT_RE = re.compile(r"[_\-/=]")
+#: D-2 exclusion A. Later segments may also be digits only; a segment that
+#: starts with a digit and holds letters (``3d``, ``2fa``) is not this shape.
+_WORD_SHAPE_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_(?:[A-Za-z][A-Za-z0-9]*|[0-9]+))*")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 #: ``sha256:<hex>`` (container / content digests). The token pattern does not
 #: span ``:``, so the hex half is already a hex token; the check is explicit
@@ -296,6 +315,50 @@ def is_key_name(name: str) -> bool:
     """True when ``name`` holds a D-1 key name (``max_tokens``, ``API_KEY``,
     ``db_password``, ...): the structured-data form of a key line."""
     return _KEY_NAME_RE.search(name) is not None
+
+
+def _key_name_is_excluded(word: str, rest: str) -> bool:
+    """True when a key word followed by ``rest`` (the rest of the name) does
+    not make a key line."""
+    if word.lower() == "token" and rest[:1].isalpha():
+        return True  # tokens, tokenizer; secrets and passwords stay key names
+    if _KEY_SEPARATED_WORD_RE.fullmatch(rest):
+        return True  # token_count, TOKEN_RE, api-key.file
+    # secretName, passwordRegex; not SECRETNAME or secretNameValue.
+    return rest[:1].isupper() and _KEY_LOWER_WORD_RE.fullmatch(rest[0].lower() + rest[1:]) is not None
+
+
+def _is_key_line(body: str) -> bool:
+    """D-1: does ``body`` hold a candidate that is not excluded?
+
+    Every occurrence of a key word is its own candidate, including one inside
+    the name of another (``max_tokens_secret`` has an excluded ``token`` and a
+    ``secret`` that is not), so an exclusion can never hide a later key word.
+    """
+    for m in _KEY_WORD_RE.finditer(body):
+        tail = _KEY_TAIL_RE.match(body, m.end())
+        if tail is not None and not _key_name_is_excluded(m.group(0), tail.group(1)):
+            return True
+    return False
+
+
+def _is_word_or_path_shaped(token: str) -> bool:
+    """D-2 exclusion, on a token ``_TOKEN_RE`` cut out.
+
+    * C wins over A and B: a separator-free run of 32+ characters (base64,
+      PAT) is never excluded.
+    * A: word-shaped segments joined by single ``_``, ignoring ``_`` at both
+      ends; or two such sides joined by one ``=``. An empty side (``=``
+      padding) and an empty segment (``a__b``) are not this shape.
+    * B: holds ``/`` and no ``+`` (``+`` marks standard base64). ``.``, ``:``
+      and a backslash already ended the token when it was cut out.
+    """
+    if any(len(run) >= ENTROPY_MIN_LEN for run in _SHAPE_SPLIT_RE.split(token)):
+        return False
+    if "/" in token:
+        return "+" not in token
+    sides = token.split("=")
+    return len(sides) <= 2 and all(_WORD_SHAPE_RE.fullmatch(side.strip("_")) for side in sides)
 
 
 def _replace_spans(
@@ -731,7 +794,7 @@ class Redactor:
             body = lines[k].body
             if body is None or not body.strip(" \t\r"):
                 continue
-            is_key = _KEY_LINE_RE.search(body) is not None
+            is_key = _is_key_line(body)
             if remaining > 0:
                 current.append((k, None, None))
                 remaining = ASSIGNMENT_WINDOW if is_key else remaining - 1
@@ -813,6 +876,8 @@ class Redactor:
             start -= 1
         if _DIGEST_RE.match(text[start : m.end()]):
             return token  # ``sha256:<digest>``
+        if _is_word_or_path_shaped(token):
+            return token
         if shannon_entropy(token) < ENTROPY_THRESHOLD:
             return token
         return self._replaced(KIND_ENTROPY, token)
