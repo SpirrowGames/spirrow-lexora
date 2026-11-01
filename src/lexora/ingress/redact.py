@@ -200,6 +200,9 @@ _KEY_NOT_SECRET_WORDS = (
 )
 _KEY_SEPARATED_WORD_RE = re.compile(rf"(?i)[_\-.](?:{_KEY_NOT_SECRET_WORDS})")
 _KEY_LOWER_WORD_RE = re.compile(rf"(?:{_KEY_NOT_SECRET_WORDS})")
+#: ``token``'s last letter and what follows: the word carries on in the same
+#: case (tokens, TOKENS), rather than a new camelCase word starting.
+_KEY_TOKEN_DERIVED_RE = re.compile(r"[a-z]{2}|[A-Z]{2}(?![a-z])")
 #: The D-1 key names alone, for structured data (a JSON member name).
 _KEY_NAME_RE = re.compile(r"(?i)(?:password|passwd|secret|token|api[_\-]?key)")
 #: The first assignment operator of a key line: D-1 redacts from after it.
@@ -320,8 +323,10 @@ def is_key_name(name: str) -> bool:
 def _key_name_is_excluded(word: str, rest: str) -> bool:
     """True when a key word followed by ``rest`` (the rest of the name) does
     not make a key line."""
-    if word.lower() == "token" and rest[:1].isalpha():
-        return True  # tokens, tokenizer; secrets and passwords stay key names
+    # tokens, TOKENS, tokenizer; secrets and passwords stay key names. A capital
+    # starting a new camelCase word is not this: tokenValue, TOKENValue.
+    if word.lower() == "token" and _KEY_TOKEN_DERIVED_RE.match(word[-1] + rest):
+        return True
     if _KEY_SEPARATED_WORD_RE.fullmatch(rest):
         return True  # token_count, TOKEN_RE, api-key.file
     # secretName, passwordRegex; not SECRETNAME or secretNameValue.

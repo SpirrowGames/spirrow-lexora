@@ -282,6 +282,10 @@ class TestD1MustStay:
             'passwordRegex = "^.{8,}$"\nnext_line_here',
             "apiKeyFile: /etc/service/credentials\nnext_line_here",
             "tokens: abcdefghijkl\nnext_line_here",
+            "TOKENS: abcdefghijkl\nnext_line_here",
+            "tokensUsed: abcdefghijkl\nnext_line_here",
+            "maxTokens: abcdefghijkl\nnext_line_here",
+            "tokenName: abcdefghijkl\nnext_line_here",
             "client_secret_id: abcdefghijkl\nnext_line_here",
             "api-key.header: abcdefghijkl",
         ],
@@ -304,6 +308,13 @@ class TestD1MustRedact:
             "secretNameValue: abcdefghijkl",
             # The camelCase list is matched with only the first letter lowered.
             "SECRETNAME = abcdefghijkl",
+            # PR-gate on #102: a camelCase word after token is not "tokens";
+            # only the list excludes it.
+            "tokenValue = abcdefghijkl",
+            "tokenAuth = abcdefghijkl",
+            "TokenValue = abcdefghijkl",
+            "TOKENValue = abcdefghijkl",
+            "TOKENs = abcdefghijkl",
             # One candidate left over makes a key line.
             "max_tokens_secret = abcdefghijkl",
             "max_tokens = 1; api_key = abcdefghijkl",
