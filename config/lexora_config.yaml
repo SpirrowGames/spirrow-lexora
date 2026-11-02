@@ -60,7 +60,7 @@ routing:
     # 枠切れ・失敗した時だけ Gemini が答える (answered_by=gemini-fallback)。
     # mindwire の attestation は {codex, gemini-fallback} を受け入れる版
     # (spirrow-mindwire#463/#464) と同時に着地させる (RUNBOOK §9)。
-    # model の gemini-3.1-pro-preview は fallback 先の解決
+    # model の gemini-4-argon は fallback 先の解決
     # (resolve_model("naysayer")) に使うので残す。codex には渡らない。
     # 切替は Takahito の Tier-C 判断 (msg-762、2026-10-13) で決着済み。
     # redact / unrouted (ADR-14 §7.3, spirrow-mindwire#482; msg-800/802):
@@ -69,7 +69,7 @@ routing:
     # 答え、n3_route=absent をログに残す (S-2/S-3)。
     naysayer:
       backend: "naysayer-codex"
-      model: "gemini-3.1-pro-preview"
+      model: "gemini-4-argon"
       redact: true
       unrouted: "gemini"
       description: "naysayer (codex が回答、閉じている間は Gemini にフォールバック)"
@@ -78,7 +78,7 @@ routing:
     # 通信に対するものだから (ADR-14 §7.3)。codex は無いので unrouted は置かない (S-4)。
     naysayer-gemini:
       backend: "gemini"
-      model: "gemini-3.1-pro-preview"
+      model: "gemini-4-argon"
       redact: true
       description: "naysayer (Gemini 直結、codex を通さない)"
     # frontier: heavy とは別に「一番賢い有料モデル」の入口を独立させる
@@ -180,10 +180,10 @@ routing:
       # ゲートウェイ timeout=900s (client は 930s 待機) に合わせる。2026-06-11。
       timeout: 900.0
       connect_timeout: 5.0
-      # max_tokens 未指定リクエスト時の出力上限。reasoning モデル (Gemini 3.1 Pro)
-      # は thinking が output 枠を消費するため、本文確保用に余裕を持たせる。
-      # リクエストが max_tokens を明示した場合はそちらが優先される。
-      default_max_tokens: 16000
+      # max_tokens 未指定リクエスト時の出力上限。Google は Gemini 4 Argon に 32,768 以上を
+      # 推奨している (thinking が output 枠を多く使う。T-naysayer-gemini-fallback-to-argon)。
+      # リクエストが max_tokens を明示した場合はそちらが優先される (mindwire の gate は明示する)。
+      default_max_tokens: 32768
       # health probe を外す (2026-08-11)。この backend の health_check は本物の
       # generateContent を投げる ∴ /health の 1 回ごとに課金対象の推論が 1 回走り、
       # Google 側のレイテンシ (実測 中央値 1.2s) をそのまま /health が被る。
@@ -191,9 +191,9 @@ routing:
       # backend 自体は有効 — naysayer はこれで動いている。
       health_check: false
       models:
-        - name: "gemini-3.1-pro-preview"
+        - name: "gemini-4-argon"
           capabilities: ["code", "reasoning", "analysis", "general"]
-          description: "Google Gemini 3.1 Pro Preview (naysayer, native generateContent)"
+          description: "Google Gemini 4 Argon (naysayer, native generateContent)"
 
     # Codex CLI (`codex exec` under bwrap, ChatGPT Pro サブスク認証)。
     # T-D8-codex-backend-adr14-15-amendment msg-5940 / msg-5942。
@@ -256,8 +256,12 @@ routing:
     # LEXORA_BACKEND_TIMEOUT_SECONDS、Lexora 側は config.LEXORA_BACKEND_TIMEOUT_S)。
     # 930 (= 900 + client 側の余裕 30) ではない。900 を超える値は起動しない。
     # codex_timeout_s=270 は 30 + 270 + 600 = 900 に収めるため (msg-702)。
+    # health_check: false — このラッパーの probe は codex が閉じていると Gemini の
+    # health_check に委譲する (FallbackBackend.health_check) ∴ /health の 1 回ごとに
+    # 課金対象の推論が走る。上の gemini の health_check: false はこの経路を止めない。
     naysayer-codex:
       type: "fallback"
+      health_check: false
       fallback:
         primary: "codex"
         fallback: "gemini"

@@ -203,7 +203,7 @@ async def test_shipped_listing_is_the_tiers_plus_the_declared_concrete_names() -
     listing = await router.list_all_models()
     ids = [m["id"] for m in listing["data"]]
     assert ids == [
-        "gemini-3.1-pro-preview",
+        "gemini-4-argon",
         # codex: on no tier directly (the naysayer tier reaches it through
         # the fallback wrapper `naysayer-codex`, which declares no model), but
         # declared, so routable by name; the verify gate refuses every
@@ -310,3 +310,13 @@ def test_shipped_codex_turns_every_tool_off() -> None:
     catalog = model_catalog_path(codex.cli_overrides)
     assert catalog is not None
     assert PurePosixPath(codex.codex_home) in PurePosixPath(catalog).parents
+
+
+def test_shipped_naysayer_codex_wrapper_is_not_probed() -> None:
+    """Probing this wrapper while codex is closed runs a billed Gemini inference.
+
+    ``FallbackBackend.health_check`` delegates to the Gemini backend's probe, so
+    the ``health_check: false`` on ``gemini`` does not stop this path.
+    """
+    settings = create_settings(SHIPPED_CONFIG)
+    assert settings.routing.backends["naysayer-codex"].health_check is False

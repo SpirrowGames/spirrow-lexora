@@ -55,9 +55,9 @@ class TestNaysayerRouteInvariance:
         assert (wrapper.mode, wrapper.primary, wrapper.fallback) == ("fallback", "codex", "gemini")
         assert settings.routing.tiers["naysayer-gemini"].backend == "gemini"
 
-    def test_shipped_config_naysayer_model_is_gemini_31_pro(self) -> None:
+    def test_shipped_config_naysayer_model_is_gemini_4_argon(self) -> None:
         settings = create_settings(REPO_CONFIG)
-        assert settings.routing.tiers["naysayer"].model == "gemini-3.1-pro-preview"
+        assert settings.routing.tiers["naysayer"].model == "gemini-4-argon"
 
     def test_router_resolves_naysayer_to_gemini_backend_and_model(self) -> None:
         """End-to-end: BackendRouter built from the shipped config with the
@@ -69,9 +69,9 @@ class TestNaysayerRouteInvariance:
         )
         try:
             assert router.get_backend_name_for_model("naysayer") == "naysayer-codex"
-            assert router.resolve_model("naysayer") == "gemini-3.1-pro-preview"
+            assert router.resolve_model("naysayer") == "gemini-4-argon"
             assert router.get_backend_name_for_model("naysayer-gemini") == "gemini"
-            assert router.resolve_model("naysayer-gemini") == "gemini-3.1-pro-preview"
+            assert router.resolve_model("naysayer-gemini") == "gemini-4-argon"
         finally:
             # Backends spin up httpx.AsyncClient / subprocess handles.
             import asyncio
@@ -85,7 +85,7 @@ class TestNaysayerRouteInvariance:
         monkeypatch.setenv("LEXORA_FRONTIER_MODEL", "claude-opus-5-20260601")
         settings = create_settings(REPO_CONFIG)
         assert settings.routing.tiers["naysayer"].backend == "naysayer-codex"
-        assert settings.routing.tiers["naysayer"].model == "gemini-3.1-pro-preview"
+        assert settings.routing.tiers["naysayer"].model == "gemini-4-argon"
 
 
 class TestFrontierTierConfig:

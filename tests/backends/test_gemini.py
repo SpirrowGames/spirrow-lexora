@@ -378,7 +378,7 @@ class TestHealthCheckModel:
 
     def test_default_health_model(self):
         backend = GeminiBackend()
-        assert backend.health_check_model == "gemini-2.5-flash"
+        assert backend.health_check_model == "gemini-4-argon"
 
     def test_configured_health_model(self):
         backend = GeminiBackend(health_check_model="gemini-3.1-pro")
@@ -408,6 +408,31 @@ class TestHealthCheckModel:
         await backend.health_check()
         called_path = backend._client.post.call_args[0][0]
         assert "gemini-2.5-flash:generateContent" in called_path
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "healthy"),
+        [
+            (200, True),
+            (429, True),
+            (400, False),
+            (401, False),
+            (403, False),
+            (404, False),
+            (500, False),
+        ],
+    )
+    async def test_health_check_status_verdict(self, status, healthy):
+        backend = GeminiBackend(api_key="gm-test", paid_key_acknowledged=True)
+        backend._client.post = AsyncMock(return_value=_mock_response(status, {}))
+        assert await backend.health_check() is healthy
+
+    def test_default_request_timeout_is_900s(self):
+        backend = GeminiBackend()
+        assert backend._client.timeout.read == 900.0
+
+    def test_output_default_meets_argon_recommendation(self):
+        assert DEFAULT_MAX_OUTPUT_TOKENS >= 32768
 
 
 def _mock_response(status_code=200, json_body=None, headers=None):
