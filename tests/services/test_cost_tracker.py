@@ -270,6 +270,12 @@ class TestSubscriptionBackendIsNotPriced:
         # 1000 * $2 + (10 + 90) * $12, per MTok.
         assert row == (1, pytest.approx(0.0032))
 
+    def test_gemini_argon_is_priced(self, db_path: Path) -> None:
+        """Unpriced, a fallback answer would land in the ledger as a $0 row."""
+        tracker = CostTracker(db_path=db_path)
+        # 1M in at $4 + 1M out at $20, flat: no prompt-size tier is declared.
+        assert tracker.calculate_cost("gemini-4-argon", 1_000_000, 1_000_000) == (24.0, True)
+
     @pytest.mark.parametrize(
         ("prompt", "cached", "output", "thinking", "expected"),
         [

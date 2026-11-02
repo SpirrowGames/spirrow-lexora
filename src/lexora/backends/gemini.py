@@ -51,8 +51,8 @@ logger = get_logger(__name__)
 GEMINI_API_VERSION = "v1beta"
 
 # Default output token cap when the caller does not specify max_tokens.
-# reasoning モデル (例: Gemini 3.1 Pro) は thinking が output を消費するため本文確保用に引き上げ。
-DEFAULT_MAX_OUTPUT_TOKENS = 16000
+# reasoning モデルは thinking が output を消費する。Google は Gemini 4 Argon に 32,768 以上を推奨。
+DEFAULT_MAX_OUTPUT_TOKENS = 32768
 
 # Data-governance gate (ADR-2026-05-31-14 D-4 / ADR-2026-05-31-15 C-2):
 # OpenAI-compatible request keys whose presence implies a Gemini surface
@@ -135,7 +135,7 @@ class GeminiBackend(Backend):
         self,
         base_url: str = "https://generativelanguage.googleapis.com",
         api_key: str | None = None,
-        timeout: float = 120.0,
+        timeout: float = 900.0,
         connect_timeout: float = 5.0,
         model_mapping: dict[str, str] | None = None,
         name: str | None = None,
@@ -175,7 +175,7 @@ class GeminiBackend(Backend):
         # Model used by health_check. Defaults to a known model but should be
         # supplied from config so health probes the same model the backend
         # actually serves (rather than a hard-coded name).
-        self.health_check_model = health_check_model or "gemini-2.5-flash"
+        self.health_check_model = health_check_model or "gemini-4-argon"
         # Output cap used when a request omits max_tokens. Configurable so the
         # operator can tune headroom for reasoning models (whose thinking spends
         # the output budget); falls back to the module default when unset.
@@ -805,7 +805,11 @@ class GeminiBackend(Backend):
     async def health_check(self) -> bool:
         """Check if the Gemini API is reachable and the key authenticates.
 
-        Sends a minimal generateContent request.
+        Sends a minimal generateContent request. Healthy means 2xx, or 429:
+        a rate limit is temporary and says nothing is wrong with the key or the
+        model. Every other status is unhealthy, because this backend could not
+        answer: a retired model (404), a bad key (401/403, and 400, which
+        Gemini may return for an invalid key) or an upstream fault (5xx).
         """
         try:
             model = self._map_model(self.health_check_model)
@@ -816,8 +820,8 @@ class GeminiBackend(Backend):
                     "generationConfig": {"maxOutputTokens": 1},
                 },
             )
-            # Any non-5xx means the API is up (401/403 = bad key but reachable).
-            return response.status_code < 500
+            status = response.status_code
+            return 200 <= status < 300 or status == 429
         except (httpx.ConnectError, httpx.TimeoutException):
             return False
         except Exception:

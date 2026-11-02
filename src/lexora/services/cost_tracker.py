@@ -100,6 +100,14 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
             },
         ],
     },
+    # Gemini 4 Argon (the naysayer tier's fallback; T-naysayer-gemini-fallback-to-argon).
+    # Rates are the 2026-12-01 ones from the operator's ruling (msg-960), not read
+    # from Google's pricing page. Until 2026-11-30 Google charges $2/$10, so rows
+    # written before then are over-reported by about 2x; this table has no
+    # date-switch and a month does not justify one. No prompt-size tier and no
+    # `cached_input`: neither rate has been read, and an absent `cached_input`
+    # charges cached tokens at `input`, the over-reporting side.
+    "gemini-4-argon": {"input": 4.00, "output": 20.00},
     #
     # NOTE: `claude-code-opus` / `claude-code-sonnet` are absent, and not by
     # oversight. They are not upstream model IDs: `config/lexora_config.yaml`
