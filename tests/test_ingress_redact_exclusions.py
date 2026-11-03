@@ -283,6 +283,7 @@ class TestD1MustStay:
             "apiKeyFile: /etc/service/credentials\nnext_line_here",
             "tokens: abcdefghijkl\nnext_line_here",
             "TOKENS: abcdefghijkl\nnext_line_here",
+            "TOKENS_USED: abcdefghijkl\nnext_line_here",
             "tokensUsed: abcdefghijkl\nnext_line_here",
             "maxTokens: abcdefghijkl\nnext_line_here",
             "tokenName: abcdefghijkl\nnext_line_here",
@@ -315,6 +316,13 @@ class TestD1MustRedact:
             "TokenValue = abcdefghijkl",
             "TOKENValue = abcdefghijkl",
             "TOKENs = abcdefghijkl",
+            # PR-gate on #102 @ bc27f95: what follows the first two letters
+            # after token is never looked at, so a camelCase word starting
+            # there keeps the key line.
+            "TOKENSalt = abcdefghijkl",
+            "TOKENString = abcdefghijkl",
+            "TOKENSecret = abcdefghijkl",
+            "tokenSalt = abcdefghijkl",
             # One candidate left over makes a key line.
             "max_tokens_secret = abcdefghijkl",
             "max_tokens = 1; api_key = abcdefghijkl",

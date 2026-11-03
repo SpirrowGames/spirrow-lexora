@@ -200,9 +200,6 @@ _KEY_NOT_SECRET_WORDS = (
 )
 _KEY_SEPARATED_WORD_RE = re.compile(rf"(?i)[_\-.](?:{_KEY_NOT_SECRET_WORDS})")
 _KEY_LOWER_WORD_RE = re.compile(rf"(?:{_KEY_NOT_SECRET_WORDS})")
-#: ``token``'s last letter and what follows: the word carries on in the same
-#: case (tokens, TOKENS), rather than a new camelCase word starting.
-_KEY_TOKEN_DERIVED_RE = re.compile(r"[a-z]{2}|[A-Z]{2}(?![a-z])")
 #: The D-1 key names alone, for structured data (a JSON member name).
 _KEY_NAME_RE = re.compile(r"(?i)(?:password|passwd|secret|token|api[_\-]?key)")
 #: The first assignment operator of a key line: D-1 redacts from after it.
@@ -320,12 +317,31 @@ def is_key_name(name: str) -> bool:
     return _KEY_NAME_RE.search(name) is not None
 
 
+def _token_word_continues(last: str, rest: str) -> bool:
+    """Exclusion (i): does ``token`` carry on as one word in the same case?
+
+    Only ``last`` (the key word's last letter) and the first two characters of
+    ``rest`` are looked at, so nothing after them can make the answer True:
+
+    - lower case: the next letter is lower case (tokens, tokenizer, tokensUsed);
+    - upper case: the next letter is upper case and the one after it is not
+      lower case (TOKENS, TOKENS_COUNT). ``TOKENValue`` and ``TOKENSalt`` start
+      a new camelCase word there, so they stay key lines.
+    """
+    first, second = rest[:1], rest[1:2]
+    if not ("a" <= first.lower() <= "z"):
+        return False
+    if last.islower():
+        return first.islower()
+    return first.isupper() and not second.islower()
+
+
 def _key_name_is_excluded(word: str, rest: str) -> bool:
     """True when a key word followed by ``rest`` (the rest of the name) does
     not make a key line."""
     # tokens, TOKENS, tokenizer; secrets and passwords stay key names. A capital
     # starting a new camelCase word is not this: tokenValue, TOKENValue.
-    if word.lower() == "token" and _KEY_TOKEN_DERIVED_RE.match(word[-1] + rest):
+    if word.lower() == "token" and _token_word_continues(word[-1], rest):
         return True
     if _KEY_SEPARATED_WORD_RE.fullmatch(rest):
         return True  # token_count, TOKEN_RE, api-key.file
