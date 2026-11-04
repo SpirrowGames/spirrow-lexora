@@ -1,0 +1,18 @@
+# 根拠: ADR-14 §7.3 / ADR-15 C-2 / spirrow-mindwire docs/deploy.md §N-3。
+# 採用理由: N-3 の経路・codex の分離・backend の送信先と credential（subprocess 経由を含む）・tier 定義・deploy・CI。
+# thread: T-n3-route-config-rollout-to-all-repos
+n3_sensitive_paths = [
+    ".mindwire-n3.toml",
+    "src/lexora/ingress/*",
+    "src/lexora/api/routes.py",
+    "src/lexora/main.py",
+    "src/lexora/services/process_lock.py",
+    "src/lexora/backends/*",
+    "src/lexora/config.py",
+    "config/lexora_config.yaml",
+    "deploy/*",
+    "server/*",
+    ".env.example",
+    "scripts/backup.sh",
+    ".github/workflows/*",
+]
