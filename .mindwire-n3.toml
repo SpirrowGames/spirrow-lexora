@@ -1,6 +1,7 @@
 # 根拠: ADR-14 §7.3 / ADR-15 C-2 / spirrow-mindwire docs/deploy.md §N-3。
 # 採用理由: N-3 の経路・codex の分離・backend の送信先と credential（subprocess 経由を含む）・tier 定義・deploy・CI。
 # thread: T-n3-route-config-rollout-to-all-repos
+# 照合は mindwire n3_routing の fnmatchcase（`*` は `/` も越える）。`dir/*` は配下を再帰的に含む。`**/*` や末尾 `/` に変えると直下のファイルが外れる。
 n3_sensitive_paths = [
     ".mindwire-n3.toml",
     "src/lexora/ingress/*",
