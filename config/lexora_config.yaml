@@ -255,7 +255,15 @@ routing:
     # caller_budget_s=900 は ADR-14 の backend 上限 (mindwire lexora/client.py の
     # LEXORA_BACKEND_TIMEOUT_SECONDS、Lexora 側は config.LEXORA_BACKEND_TIMEOUT_S)。
     # 930 (= 900 + client 側の余裕 30) ではない。900 を超える値は起動しない。
-    # codex_timeout_s=270 は 30 + 270 + 600 = 900 に収めるため (msg-702)。
+    # 2026-11-07 配分変更 (Takahito 判断、operator セッション): 150 + 150 + 600 = 900。
+    # 旧値 30 + 270 + 600 (msg-702) では、mindwire の PR-gate が pass 1 / pass 2 を
+    # 並列に送るため毎回スロットを取り合い、先行の codex 実行が 30 秒を超えると後続が
+    # Gemini に落ちていた (11-04 08:49Z〜11-07 で naysayer 225 件中 15 件、全件が同時到着)。
+    # 実測: codex の実行は中央値 9 秒・最大 67 秒、Gemini は p99 224 秒。
+    # 同じ期間の到着を再生すると、スロット 1 本・待ち 150 秒でフォールバックは 0 件、
+    # 最悪の待ちは 119 秒だった (11-06 05:39Z に 7 レビュー × 2 本が同時に届いた分)。
+    # codex_timeout_s=150 は実測最大の 2 倍強。fallback_floor_s は変えていない。
+    # 3 値とも codex の config hash に入らないので、verify_codex のやり直しは要らない。
     naysayer-codex:
       type: "fallback"
       fallback:
@@ -263,8 +271,8 @@ routing:
         fallback: "gemini"
         mode: "fallback"
         caller_budget_s: 900
-        slot_wait_s: 30
-        codex_timeout_s: 270
+        slot_wait_s: 150
+        codex_timeout_s: 150
         fallback_floor_s: 600
 
     # Claude Code CLI (non-interactive mode)
