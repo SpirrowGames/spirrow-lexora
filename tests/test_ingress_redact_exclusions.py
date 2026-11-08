@@ -396,3 +396,30 @@ def test_json_member_without_key_word_keeps_the_same_value(name: str) -> None:
     counts = redact_request(request)
     assert _tool_use_value(request) == {name: _JSON_VALUE}
     assert sum(counts.values()) == 0
+
+
+# --- JSON members on the plain-text path (msg-988, msg-990) -----------------
+#
+# A JSON member written inside plain text is a key line. When its name falls
+# under the camelCase exclusion, the assignment detection that rests on the
+# name does not redact the value; a bare key word still does. The value is the
+# same low-entropy one as above, so no other detector is involved.
+
+
+def _json_member_line(name: str) -> str:
+    return '"' + name + '": "' + _JSON_VALUE + '"'
+
+
+@pytest.mark.parametrize("name", _JSON_EXCLUDED_NAMES + _JSON_CONTROL_NAMES)
+def test_text_json_member_with_excluded_or_control_name_keeps_the_value(name: str) -> None:
+    line = _json_member_line(name)
+    out, counts = redact(line)
+    assert out == line
+    assert sum(counts.values()) == 0
+
+
+def test_text_json_member_with_bare_key_word_is_redacted() -> None:
+    out, counts = redact(_json_member_line(_JSON_KEY_WORD))
+    assert _JSON_VALUE not in out
+    assert out == '"' + _JSON_KEY_WORD + '": [REDACTED:' + KIND_ASSIGNMENT + "#1]"
+    assert counts[KIND_ASSIGNMENT] == 1
