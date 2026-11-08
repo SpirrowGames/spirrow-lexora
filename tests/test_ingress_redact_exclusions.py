@@ -338,3 +338,61 @@ class TestD1MustRedact:
         lines = ["token = None", "a", "b", "max_tokens = 1", "c", "d", "e", "f", "g"]
         out = redact("\n".join(lines))[0].split("\n")
         assert out[-2:] == ["f", "g"] and out[-3] != "e"
+
+
+# --- JSON members on the structured path (PR-1b, msg-985) -------------------
+#
+# A JSON member whose name holds a D-1 key word has its value redacted even
+# when the name, read as a key line, falls under the camelCase exclusion
+# (ADR-2026-05-31-14 §7.3 after mindwire#515, "remaining over-redaction").
+# Names and values are built by concatenation so that the gate input, which
+# itself passes through this redactor, still shows what is tested. The value
+# is 8+ characters without its quotes and has entropy 0, so only the member
+# name can cause a redaction (not the entropy detector, not the length floor).
+
+_JSON_VALUE = "a" * 12
+_JSON_KEY_WORD = "sec" + "ret"
+_JSON_EXCLUDED_NAMES = [_JSON_KEY_WORD + suffix for suffix in ("Name", "Regex", "Count", "Path")]
+_JSON_CONTROL_NAMES = ["user" + "Label", "display" + "Name"]
+
+
+def _tool_use_request(name: str) -> dict[str, object]:
+    return {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {name: _JSON_VALUE}}],
+            }
+        ]
+    }
+
+
+def _tool_use_value(request: dict[str, object]) -> object:
+    return request["messages"][0]["content"][0]["input"]  # type: ignore[index]
+
+
+def test_json_value_entropy_is_below_threshold() -> None:
+    assert shannon_entropy(_JSON_VALUE) < ENTROPY_THRESHOLD
+    assert len(_JSON_VALUE) >= 8
+
+
+@pytest.mark.parametrize("name", _JSON_EXCLUDED_NAMES)
+def test_json_member_with_key_word_is_redacted_even_when_camelcase_excluded(name: str) -> None:
+    from lexora.ingress.gate import redact_request
+
+    request = _tool_use_request(name)
+    counts = redact_request(request)
+    value = _tool_use_value(request)[name]  # type: ignore[index]
+    assert value != _JSON_VALUE
+    assert value == "[REDACTED:" + KIND_ASSIGNMENT + "#1]"
+    assert counts[KIND_ASSIGNMENT] == 1
+
+
+@pytest.mark.parametrize("name", _JSON_CONTROL_NAMES)
+def test_json_member_without_key_word_keeps_the_same_value(name: str) -> None:
+    from lexora.ingress.gate import redact_request
+
+    request = _tool_use_request(name)
+    counts = redact_request(request)
+    assert _tool_use_value(request) == {name: _JSON_VALUE}
+    assert sum(counts.values()) == 0
