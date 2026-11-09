@@ -1,4 +1,4 @@
-"""``type: fallback`` -- codex first, Gemini when codex cannot answer.
+"""``type: fallback`` -- codex first, Gemini (or nobody) when codex cannot answer.
 
 T-naysayer-codex-backend PR-2b, specified by msg-448 (B-1 to B-6) and
 msg-450 (B-7), endorsed by Einstein after msg-450.
@@ -14,6 +14,18 @@ backends, and a ``mode``:
   sent to the client**: codex produces its whole answer before its stream
   yields anything, so the switch is decided on the first ``__anext__`` of
   the codex stream; once a codex byte is out, any later error propagates.
+* ``codex_only`` (2026-11-10, Takahito: no Gemini on the naysayer path):
+  the ``fallback`` flow with nothing behind codex. Every case where
+  ``fallback`` mode would call Gemini instead raises
+  :class:`NaysayerCodexUnavailable` (a ``BackendError``: the route answers
+  502 and the ledger records a failed request; no other backend is called).
+  The notices below still go out -- STARTED when the first request is
+  refused, CONTINUING, ENDED -- worded as "codex unavailable" with the
+  count of refused requests instead of Gemini calls, so a closed codex is
+  never silent. ``fallback`` and ``fallback_floor_s`` are not configured
+  (``FallbackSettings``); the budget is ``slot_wait_s + codex_timeout_s <=
+  caller_budget_s``. Text completions and embeddings, which codex does not
+  serve, are refused too.
 * ``shadow`` (B-5): Gemini always answers. At most one codex run goes on in
   the background on the same request (through ``_run_gated``, so latch,
   hold and write-ahead all apply); if one is already running the request is
@@ -180,6 +192,17 @@ FALLBACK_ERRORS: tuple[type[CodexError], ...] = (
 )
 
 
+class NaysayerCodexUnavailable(BackendError):
+    """``codex_only``: codex could not answer and nothing else may (no Gemini)."""
+
+    def __init__(self, reason: str | None, detail: str = "") -> None:
+        self.reason = reason or "unknown"
+        message = f"naysayer codex unavailable (reason={self.reason}); this tier has no fallback (codex_only)"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
+
+
 class FallbackDeadlineExceeded(BackendError):
     """The fallback answer did not finish by the request's deadline
     (msg-687 C). A plain ``BackendError``: the retry handler never retries
@@ -296,8 +319,8 @@ class FallbackBackend(Backend):
         *,
         name: str,
         primary: CodexBackend,
-        fallback: Backend,
-        fallback_name: str,
+        fallback: Backend | None,
+        fallback_name: str | None,
         mode: str,
         webhook_url: str | None = None,
         check_interval_s: float = CHECK_INTERVAL_S,
@@ -311,8 +334,16 @@ class FallbackBackend(Backend):
         fallback_timeout_s: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        if mode not in ("fallback", "shadow"):
-            raise ValueError(f"fallback backend '{name}': mode must be 'fallback' or 'shadow', not {mode!r}")
+        if mode not in ("fallback", "shadow", "codex_only"):
+            raise ValueError(
+                f"fallback backend '{name}': mode must be 'fallback', 'shadow' or 'codex_only', not {mode!r}"
+            )
+        if mode == "codex_only":
+            if fallback is not None:
+                raise ValueError(f"fallback backend '{name}': mode 'codex_only' takes no fallback backend")
+            fallback_floor_s = 0.0
+        elif fallback is None:
+            raise ValueError(f"fallback backend '{name}': mode {mode!r} needs a fallback backend")
         try:
             check_fallback_budget(caller_budget_s, slot_wait_s, codex_timeout_s, fallback_floor_s)
         except ValueError as exc:
@@ -366,6 +397,9 @@ class FallbackBackend(Backend):
         # msg-685: the two inputs of ENDED. Codex answers set the flag only.
         self._last_fallback_at: datetime | None = None
         self._answered_since_fallback = False
+        #: ``codex_only``: requests refused since ``_fallback_since`` (the
+        #: notice's count; there are no Gemini calls to read from the ledger).
+        self._refused_since = 0
         self._loop_task: asyncio.Task[None] | None = None
         self._send_tasks: set[asyncio.Task[None]] = set()
         # A-15-2b pre-expiry warning: UTC date of the last EXPIRING notice
@@ -433,7 +467,7 @@ class FallbackBackend(Backend):
         budget = self.fallback_budget(deadline)
         try:
             async with asyncio.timeout(budget):
-                return await self.fallback.chat_completions(request)
+                return await self._gemini_side("chat").chat_completions(request)
         except TimeoutError as exc:
             raise self._deadline_error(budget) from exc
 
@@ -445,7 +479,7 @@ class FallbackBackend(Backend):
         while the caller is busy with a chunk."""
         budget = self.fallback_budget(deadline)
         ends = self._monotonic() + budget
-        stream = self.fallback.chat_completions_stream(request, usage_sink)
+        stream = self._gemini_side("chat").chat_completions_stream(request, usage_sink)
         try:
             while True:
                 try:
@@ -487,6 +521,8 @@ class FallbackBackend(Backend):
                 self._codex_answered()
                 return response
         self._falling_back(reason)
+        if self.mode == "codex_only":
+            raise NaysayerCodexUnavailable(reason)
         self._route_gemini(ANSWERED_BY_GEMINI_FALLBACK)
         return await self._bounded_fallback_chat(request, deadline)
 
@@ -526,6 +562,8 @@ class FallbackBackend(Backend):
                     yield chunk
                 return
         self._falling_back(reason)
+        if self.mode == "codex_only":
+            raise NaysayerCodexUnavailable(reason)
         self._route_gemini(ANSWERED_BY_GEMINI_FALLBACK)
         async for chunk in self._bounded_fallback_stream(request, usage_sink, deadline):
             yield chunk
@@ -553,8 +591,16 @@ class FallbackBackend(Backend):
         if self._fallback_since is None:
             self._fallback_since = now
             self._last_notice_at = now
-            logger.warning("naysayer_fallback_started", backend=self.name, reason=reason)
+            self._refused_since = 0
+            if self.mode == "codex_only":
+                self._refused_since = 1
+                logger.warning("naysayer_codex_unavailable_started", backend=self.name, reason=reason)
+            else:
+                logger.warning("naysayer_fallback_started", backend=self.name, reason=reason)
             self._notify(self._notice_text("STARTED"))
+        elif self.mode == "codex_only":
+            self._refused_since += 1
+            logger.warning("naysayer_codex_unavailable_refused", backend=self.name, reason=reason)
         self._ensure_loop()
 
     def _codex_answered(self) -> None:
@@ -576,7 +622,11 @@ class FallbackBackend(Backend):
     async def _end_fallback(self) -> None:
         assert self._fallback_since is not None
         text = self._notice_text("ENDED")
-        logger.info("naysayer_fallback_ended", backend=self.name, since=self._fallback_since.isoformat())
+        logger.info(
+            "naysayer_codex_unavailable_ended" if self.mode == "codex_only" else "naysayer_fallback_ended",
+            backend=self.name,
+            since=self._fallback_since.isoformat(),
+        )
         self._fallback_since = None
         self._last_notice_at = None
         self._last_fallback_at = None
@@ -585,6 +635,8 @@ class FallbackBackend(Backend):
             await self._deliver_state(text)
 
     def _totals(self) -> tuple[int, float] | None:
+        if self.mode == "codex_only":
+            return None  # nothing is billed to Gemini; the count is ``_refused_since``
         if self.ledger is None or self._fallback_since is None:
             return None
         try:
@@ -594,6 +646,18 @@ class FallbackBackend(Backend):
             return None
 
     def _notice_text(self, event: str) -> str:
+        if self.mode == "codex_only":
+            since = self._fallback_since.isoformat() if self._fallback_since else "none"
+            hold = self._last_hold.isoformat() if self._last_hold else "unknown"
+            text = (
+                f"[Lexora naysayer] codex unavailable {event} (no fallback: requests are refused): "
+                f"reason={self._last_reason or 'unknown'} since={since} "
+                f"refused_requests={self._refused_since} quota_hold_until={hold} "
+                f"runbook=deploy/RUNBOOK.md#2"
+            )
+            if self._last_reason == REASON_DATA_CONTROLS_UNVERIFIED:
+                text += f" runbook={RUNBOOK_POINTER}"
+            return text[:NOTICE_MAX_CHARS]
         totals = self._totals()
         calls, cost = (str(totals[0]), f"{totals[1]:.4f}") if totals else ("unknown", "unknown")
         since = self._fallback_since.isoformat() if self._fallback_since else "none"
@@ -783,7 +847,7 @@ class FallbackBackend(Backend):
         started = time.monotonic()
         text: str | None = None
         try:
-            response = await self.fallback.chat_completions(request)
+            response = await self._gemini_side("chat").chat_completions(request)
             text = _response_text(response)
             return response
         except asyncio.CancelledError:
@@ -810,7 +874,7 @@ class FallbackBackend(Backend):
         chunks: list[bytes] = []
         completed = False
         try:
-            async for chunk in self.fallback.chat_completions_stream(request, usage_sink):
+            async for chunk in self._gemini_side("chat").chat_completions_stream(request, usage_sink):
                 chunks.append(chunk)
                 yield chunk
             completed = True
@@ -930,6 +994,8 @@ class FallbackBackend(Backend):
         """
         if self.mode == "shadow":
             mode = "shadow"
+        elif self.mode == "codex_only":
+            mode = "codex" if availability.open else "unavailable"
         else:
             mode = "codex" if availability.open else "fallback"
         totals = self._totals()
@@ -939,25 +1005,36 @@ class FallbackBackend(Backend):
             "fallback_calls": totals[0] if totals else None,
             "fallback_cost_usd": totals[1] if totals else None,
             "shadow_skipped": self.shadow_skipped,
+            "configured_mode": self.mode,
+            "refused_since": self._refused_since if self.mode == "codex_only" else None,
         }
 
     # ---- the rest of the Backend interface -----------------------------------
 
+    def _gemini_side(self, what: str) -> Backend:
+        """The fallback backend for a call codex cannot serve; refused in ``codex_only``."""
+        if self.fallback is None:
+            raise NaysayerCodexUnavailable("unsupported", f"codex does not serve {what}")
+        return self.fallback
+
     async def completions(self, request: dict[str, Any]) -> dict[str, Any]:
         """Text completions: codex has none, so Gemini answers (routed as
-        a fallback answer in fallback mode, as the primary in shadow mode)."""
+        a fallback answer in fallback mode, as the primary in shadow mode).
+        Refused in ``codex_only``."""
+        backend = self._gemini_side("text completions")
         self._route_gemini(ANSWERED_BY_GEMINI_FALLBACK if self.mode == "fallback" else None)
-        return await self.fallback.completions(request)
+        return await backend.completions(request)
 
     async def completions_stream(
         self, request: dict[str, Any], usage_sink: UsageSink | None = None
     ) -> AsyncIterator[bytes]:
+        backend = self._gemini_side("text completions")
         self._route_gemini(ANSWERED_BY_GEMINI_FALLBACK if self.mode == "fallback" else None)
-        async for chunk in self.fallback.completions_stream(request, usage_sink):
+        async for chunk in backend.completions_stream(request, usage_sink):
             yield chunk
 
     async def embeddings(self, request: dict[str, Any]) -> dict[str, Any]:
-        return await self.fallback.embeddings(request)
+        return await self._gemini_side("embeddings").embeddings(request)
 
     async def list_models(self) -> dict[str, Any]:
         return {"object": "list", "data": []}
@@ -967,6 +1044,8 @@ class FallbackBackend(Backend):
         codex side; the Gemini side's probe is whatever its backend does."""
         if (await self.primary.codex_availability()).open:
             return True
+        if self.fallback is None:
+            return False
         return await self.fallback.health_check()
 
     async def close(self) -> None:

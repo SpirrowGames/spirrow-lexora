@@ -49,9 +49,13 @@ class TestStartupChecks:
             _routing(tmp_path, t={"backend": backend, "redact": False, "unrouted": "gemini"})
 
     @pytest.mark.parametrize("backend", ["codex", "wrapped"], ids=["direct-codex", "behind-wrapper"])
-    def test_s2_codex_chain_without_unrouted(self, tmp_path: Path, backend: str) -> None:
-        with pytest.raises(ValidationError, match=r"tier 't'.*'unrouted' must name.*\(S-2\)"):
-            _routing(tmp_path, t={"backend": backend, "redact": True})
+    def test_s2_dropped_codex_chain_without_unrouted_loads(self, tmp_path: Path, backend: str) -> None:
+        # 2026-11-10 (Takahito): every naysayer request goes to codex, N-3
+        # included, so a codex tier no longer has to name an ``unrouted``
+        # backend. Without one the ingress gate sends every request to the
+        # tier's backend (tests/api/test_ingress_routes.py).
+        r = _routing(tmp_path, t={"backend": backend, "redact": True})
+        assert r.tiers["t"].unrouted is None
 
     def test_s3_unrouted_not_configured(self, tmp_path: Path) -> None:
         with pytest.raises(ValidationError, match=r"'unrouted' names 'nope', which is not a configured backend \(S-3\)"):
@@ -89,7 +93,8 @@ class TestShippedConfig:
             "medium": False,
             "heavy": False,
             "naysayer": True,
-            "naysayer-gemini": True,
             "frontier": False,
         }
-        assert {name: t.unrouted for name, t in tiers.items() if t.unrouted} == {"naysayer": "gemini"}
+        # 2026-11-10: no tier names an ``unrouted`` backend -- every naysayer
+        # request goes to codex, declared or not.
+        assert {name: t.unrouted for name, t in tiers.items() if t.unrouted} == {}

@@ -386,18 +386,28 @@ LEXORA_BACKEND_TIMEOUT_S = 900.0
 class FallbackSettings(BaseModel):
     """Settings for a ``fallback`` backend (T-naysayer-codex-backend msg-448 B-1).
 
-    Names two other backends of this config: ``primary`` must be a ``codex``
+    Names other backends of this config: ``primary`` must be a ``codex``
     backend and ``fallback`` a ``gemini`` backend (``RoutingSettings``
     checks both). ``mode``: ``fallback`` answers with codex and falls back
     to Gemini; ``shadow`` answers with Gemini and runs codex alongside for
-    comparison (B-5). Behaviour: ``lexora/backends/fallback.py``.
+    comparison (B-5); ``codex_only`` answers with codex and, when codex
+    cannot answer, refuses the request instead of calling anything else
+    (2026-11-10, Takahito: no Gemini on the naysayer path). ``codex_only``
+    takes no ``fallback`` and no ``fallback_floor_s``; the other two modes
+    require ``fallback``. Behaviour: ``lexora/backends/fallback.py``.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     primary: str = Field(description="Name of the codex backend tried first.")
-    fallback: str = Field(description="Name of the gemini backend used when codex cannot answer.")
-    mode: Literal["fallback", "shadow"] = Field(default="fallback")
+    fallback: str | None = Field(
+        default=None,
+        description=(
+            "Name of the gemini backend used when codex cannot answer. Required in "
+            "modes 'fallback' and 'shadow'; refused in 'codex_only'."
+        ),
+    )
+    mode: Literal["fallback", "shadow", "codex_only"] = Field(default="fallback")
     # Time budget of one request (msg-687 C, from msg-677 objection 2).
     caller_budget_s: float = Field(
         default=LEXORA_BACKEND_TIMEOUT_S,
@@ -410,7 +420,9 @@ class FallbackSettings(BaseModel):
         ),
     )
     slot_wait_s: float = Field(
-        default=30.0, gt=0, description="Longest wait for the codex slot before falling back."
+        default=30.0,
+        gt=0,
+        description="Longest wait for the codex slot before falling back (or, in codex_only, refusing).",
     )
     codex_timeout_s: float = Field(
         default=270.0,
@@ -420,19 +432,49 @@ class FallbackSettings(BaseModel):
             "(270 = 900 - 30 - 600: the share the budget cuts, msg-702)."
         ),
     )
-    fallback_floor_s: float = Field(
-        default=600.0,
+    fallback_floor_s: float | None = Field(
+        default=None,
         gt=0,
-        description="Time Gemini is guaranteed to get after codex has used its whole share.",
+        description=(
+            "Time Gemini is guaranteed to get after codex has used its whole share. "
+            "Defaults to 600 in modes 'fallback' and 'shadow'; refused in 'codex_only', "
+            "where nothing runs after codex."
+        ),
     )
+
+    @model_validator(mode="after")
+    def _fallback_matches_mode(self) -> "FallbackSettings":
+        """``codex_only`` names no Gemini backend and no Gemini floor, so a
+        config cannot look as if Gemini were still wired behind codex; the
+        other two modes need both (the floor defaults to 600)."""
+        if self.mode == "codex_only":
+            if self.fallback is not None:
+                raise ValueError(
+                    f"mode 'codex_only' calls no other backend, so 'fallback' must not be set "
+                    f"(got {self.fallback!r})"
+                )
+            if self.fallback_floor_s is not None:
+                raise ValueError("mode 'codex_only' runs nothing after codex, so 'fallback_floor_s' must not be set")
+            return self
+        if self.fallback is None:
+            raise ValueError(f"mode '{self.mode}' requires 'fallback' (the gemini backend)")
+        if self.fallback_floor_s is None:
+            self.fallback_floor_s = 600.0
+        return self
+
+    @property
+    def floor_s(self) -> float:
+        """The floor the budget reserves: 0 in ``codex_only``."""
+        return self.fallback_floor_s if self.fallback_floor_s is not None else 0.0
 
     @model_validator(mode="after")
     def _budget_holds(self) -> "FallbackSettings":
         """``slot_wait_s + codex_timeout_s + fallback_floor_s <= caller_budget_s``
         (msg-687 C): otherwise a request that waits for the slot and then
-        times out in codex leaves Gemini less than its floor. Refused at
-        load time, so Lexora does not start with such a budget."""
-        check_fallback_budget(self.caller_budget_s, self.slot_wait_s, self.codex_timeout_s, self.fallback_floor_s)
+        times out in codex leaves Gemini less than its floor. In
+        ``codex_only`` the floor is 0: codex alone must fit the budget.
+        Refused at load time, so Lexora does not start with such a budget."""
+        check_fallback_budget(self.caller_budget_s, self.slot_wait_s, self.codex_timeout_s, self.floor_s)
         return self
 
 
@@ -676,10 +718,11 @@ class TierSettings(BaseModel):
         default=None,
         description=(
             "Backend that answers this tier when a request lacks the "
-            "'X-Mindwire-N3-Route: v1' declaration. Required on a tier whose "
-            "backend chain contains codex (S-2), must name a configured "
-            "backend whose own chain has no codex (S-3), and is refused on a "
-            "tier without codex (S-4)."
+            "'X-Mindwire-N3-Route: v1' declaration. Optional on a tier whose "
+            "backend chain contains codex (S-2 was dropped on 2026-11-10: "
+            "without it every request goes to the tier's backend); when set it "
+            "must name a configured backend whose own chain has no codex (S-3), "
+            "and it is refused on a tier without codex (S-4)."
         ),
     )
     model: str | None = Field(
@@ -741,6 +784,8 @@ class RoutingSettings(BaseModel):
                 ("primary", backend.fallback.primary, "codex"),
                 ("fallback", backend.fallback.fallback, "gemini"),
             ):
+                if target is None:  # codex_only: no fallback (FallbackSettings checks the mode)
+                    continue
                 other = self.backends.get(target)
                 if other is None:
                     raise ValueError(f"fallback backend '{name}': {role} '{target}' is not a configured backend")
@@ -768,7 +813,9 @@ class RoutingSettings(BaseModel):
             if backend.type == "codex":
                 return True
             if backend.type == "fallback" and backend.fallback is not None:
-                pending.extend((backend.fallback.primary, backend.fallback.fallback))
+                pending.append(backend.fallback.primary)
+                if backend.fallback.fallback is not None:
+                    pending.append(backend.fallback.fallback)
         return False
 
     @model_validator(mode="after")
@@ -784,12 +831,10 @@ class RoutingSettings(BaseModel):
                     f"tier '{tier_name}': backend chain of '{tier.backend}' contains codex, "
                     f"so 'redact' must be true (S-1)"
                 )
-            if has_codex and tier.unrouted is None:
-                raise ValueError(
-                    f"tier '{tier_name}': backend chain of '{tier.backend}' contains codex, "
-                    f"so 'unrouted' must name the backend that answers requests without "
-                    f"the N-3 route declaration (S-2)"
-                )
+            # S-2 is no longer required (2026-11-10, Takahito: every naysayer
+            # request goes to codex, N-3 included). A codex tier without
+            # ``unrouted`` sends every request to its backend, declared or not;
+            # one that names ``unrouted`` keeps the old gate (S-3/S-4 below).
             if tier.unrouted is None:
                 continue
             if not has_codex:

@@ -6,6 +6,11 @@
 
 以下の例では Lexora が `http://127.0.0.1:8001` で動いているものとします。
 
+> **2026-11-10 以降の出荷 mode は `codex_only` です**（Takahito 判断。`config/lexora_config.yaml` の `naysayer-codex.fallback.mode`）。
+> codex が答えられないときは Gemini に回さず、そのリクエストは **502（`NaysayerCodexUnavailable`）で断られます**。Gemini の backend も `naysayer-gemini` ティアも設定から外しました。
+> 以下で「Gemini にフォールバック」「Gemini が答える」とある箇所は、`codex_only` では「断られる（naysayer はその間止まる）」と読み替えてください。通知（6）は `codex unavailable STARTED / CONTINUING / ENDED` として同じ webhook に届きます。
+> deploy の再起動で codex が閉じたままにならないよう、リリースの手順に codex の復帰を組み込みました（下の 11）。
+
 ---
 
 ## 0. 前提: Lexora はワーカー 1 つでしか動かさない（msg-450 B-7）
@@ -26,6 +31,7 @@
    ```
 
 2. `codex.inflight_runs` が **0** であることを確かめてから、`systemctl restart lexora` を実行します。
+   - magickit の deploy runner 経由のリリースでは、この確認と再起動後の復帰を runner が `scripts/pre_restart.sh` / `scripts/post_restart.sh` で行います（下の 11）。手で再起動するときだけ、この手順をそのまま使います。
    - 0 でないまま再起動すると、実行中の codex の run（shadow の run を含む）が打ち切られます。その run は `run_unfinished` として latch され、人が解除するまで codex は止まります（下の 3）。
    - systemd の再起動は、古いプロセスが止まってから新しいプロセスを起動するので、B-7 のロックはぶつかりません。
 
@@ -39,8 +45,8 @@
 | 値 | 意味 | 対処 |
 |---|---|---|
 | `null` | codex が使える | なし |
-| `quota_hold` | 枠切れのあと、`quota_hold_until` まで codex を止めている | 待つ（その間は Gemini にフォールバック） |
-| `failure_hold` | 分類できない失敗（`CodexFailed`）のあと、5 分 codex を止めている（msg-765 L-2a） | 待つ（その間は Gemini にフォールバック）。繰り返すなら、ログの `naysayer_codex_failed_fallback` の snippet を見る（下の 6 の 4） |
+| `quota_hold` | 枠切れのあと、`quota_hold_until` まで codex を止めている | 待つ（その間 naysayer は断られる。`fallback` mode なら Gemini） |
+| `failure_hold` | 分類できない失敗（`CodexFailed`）のあと、5 分 codex を止めている（msg-765 L-2a） | 待つ（その間 naysayer は断られる。`fallback` mode なら Gemini）。繰り返すなら、ログの `naysayer_codex_failed_fallback` の snippet を見る（下の 6 の 4） |
 | `launch_failed` | `codex --version` が動かない | CLI のインストールと PATH を確かめる |
 | `verification_missing` / `verification_stale` | verification が無いか、設定・CLI の版・モデルカタログの中身が変わった | CLI の版が変わったなら先に `python -m lexora.tools.codex_catalog`（下の 10）。それから `python -m lexora.tools.verify_codex` を通す |
 | `tool_use_violation` / `run_unfinished` | latch 中 | 下の 3 |
@@ -129,7 +135,7 @@
 
 ## 7. shadow モードと `shadow_report`（msg-448 B-5）
 
-- **出荷時の mode は `fallback` です**（2026-10-13、msg-762 / msg-763 L-1）。codex が答え、codex が閉じている間だけ Gemini が答えます。`shadow` は、比較を取り直すときにだけ使います（`config/lexora_config.yaml` の `naysayer-codex.fallback.mode`）。
+- **出荷時の mode は `codex_only` です**（2026-11-10。それ以前は `fallback`、2026-10-13 msg-762 / msg-763 L-1）。`shadow` で比較を取り直すには、git 履歴から `gemini` backend を戻し、`fallback: "gemini"` を書き足す必要があります（`codex_only` は `fallback` を受け付けません）。
 - `mode: shadow` のとき、答えを返すのは常に Gemini です。codex は、同じリクエストを裏で 1 本まで走らせます。
 - 結果は `data/costs.db` の `shadow_comparisons` に、verdict と所要時間だけが残ります。本文は残りません。
 - 集計を出すには、次を実行します。
@@ -306,3 +312,24 @@ python -m lexora.tools.verify_codex             # カタログを書いたら必
   - 空の要素（先頭・末尾・連続した `:`）、空白や `#` を含む要素、`codex` の backend が無い構成での設定は、起動を拒否します。
   - `verify_codex` は同じ `EnvironmentFile` を読み込んだシェルで撃ちます（上の 9 の C-2′）。
 - 別のホストに移すときは、そのホストの `/etc/resolv.conf` の実体を確かめ、そのホストの `EnvironmentFile` に合うパスを書きます（`/etc` は sandbox に読み取り専用で入るので、`/etc/resolv.conf` が実ファイルならこの変数は要りません。`/etc` の外を指す symlink なら、その先の実ファイルのパスを書きます）。
+
+## 11. リリース（deploy）と codex の復帰（2026-11-10、Takahito）
+
+`codex_only` では codex が閉じている間 naysayer が止まるので、**リリースは codex が開いた状態で終わるところまで**を含めます。
+きっかけは 2026-11-08 の lexora#108 の deploy です。再起動が 3 秒前に始まった codex の run を殺し（`aborted:signal`、violation 1017）、codex は 2 日間閉じたままでした（その間の naysayer 332 件は、当時の `fallback` mode で全部 Gemini が答えた）。
+
+magickit の deploy runner は、spirrow-lexora の再起動の前後で次の 2 つを実行します（`magickit/deploy/registry.py` の `pre_restart_script` / `post_restart_script`）。
+
+1. **再起動の前: `scripts/pre_restart.sh`** — `codex.inflight_runs == 0` になるまで最大 300 秒待ちます。待ちきれなくても deploy は止めません（取りこぼしは次の 2 が片付けます）。上の 1 の手順を runner が代わりに行うものです。
+2. **再起動の後: `scripts/post_restart.sh`** — 動いているサービスの環境（`/proc/<MainPID>/environ`。`EnvironmentFile` の `LEXORA_CODEX_RO_BINDS` を含む）で `python -m lexora.tools.codex_restore` を実行します。runner は再起動の直前と直後の時刻を `MAGICKIT_DEPLOY_RESTART_STARTED_AT` / `_FINISHED_AT` で渡します。
+   - **再起動が原因の latch だけを解除します。** 条件は、violation の detail が `["aborted:signal"]` か `["aborted:cancelled"]` で、再起動の時間帯（前後 5 秒）に書かれたもの。または、未完了の run で、再起動の時刻より `codex_timeout_s` 以内に始まったもの（再起動のときに走っていた run）。
+   - **それ以外の latch が 1 つでもあれば、何も解除しません**（exit 3）。本物のツール使用、timeout の latch、以前のクラッシュの残りなどは、上の 3 の手順で人が調べます。
+   - 解除したとき、またはサービスが `verification_missing` / `verification_stale` を返すとき（設定やカタログが変わった deploy）は、`verify_codex` と同じ検査を実行して記録します。`fail` なら exit 4。
+   - 最後に、動いているサービスの `/v1/naysayer/status` を読みます。`codex_disabled_reason` が `null` でなければ exit 5 で、理由を出力します（`quota_hold` や `data_controls_unverified` は deploy では直せません。上の 2 と 8）。
+   - **0 以外で終わると、runner はその deploy を `failed` として記録します**（サービスは新しいコードで動いています。残っているのは codex の復帰だけで、`error` に理由が書かれます）。
+
+手で確かめるとき（何も書き込まない）:
+
+```sh
+python -m lexora.tools.codex_restore --restart-started-at <ISO> --restart-finished-at <ISO> --dry-run
+```
