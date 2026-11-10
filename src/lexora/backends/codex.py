@@ -126,6 +126,16 @@ MODEL_CATALOG_OVERRIDE_KEY = "model_catalog_json"
 #:   anyway: a plugin can add an MCP server to ``CODEX_HOME`` after
 #:   verification, and the config hash does not cover ``CODEX_HOME``.
 #:
+#: * ``web_search="disabled"`` -- added 2026-11-10 after violation 1191: in
+#:   production codex emitted a ``web_search`` item (the hosted Responses
+#:   ``web_search`` tool) although the measured first request declared no
+#:   tool. The mock run cannot show it -- with a custom provider the CLI does
+#:   not attach the hosted tool -- so it was missed. The CLI's ``web_search``
+#:   mode (``cached`` / ``live`` / ``disabled``) is separate from the
+#:   ``features.*`` flags; ``disabled`` is accepted by codex-cli 0.160.0
+#:   (checked: ``codex -c web_search="disabled" features list`` loads, a bogus
+#:   value fails to load the config).
+#:
 #: Each of the others was dropped in turn and its tools came back, so none
 #: is redundant. ``features.unified_exec`` and ``features.sleep_tool`` were
 #: measured redundant and are not set.
@@ -137,6 +147,7 @@ TOOL_DISABLE_FEATURE_OVERRIDES: tuple[str, ...] = (
     "tools.experimental_request_user_input.enabled=false",
     "features.apps=false",
     "features.plugins=false",
+    'web_search="disabled"',
 )
 
 #: Catalog-entry keys whose tools no flag removes (same measurement):

@@ -67,7 +67,20 @@ def _bundled(**changes: Any) -> dict[str, Any]:
 
 def test_disable_keys_are_the_catalog_override_and_every_flag() -> None:
     assert TOOL_DISABLE_OVERRIDE_KEYS == {MODEL_CATALOG_OVERRIDE_KEY} | {override_key(o) for o in TOOL_DISABLE_FEATURE_OVERRIDES}
-    assert all(override_value(o) == "false" for o in TOOL_DISABLE_FEATURE_OVERRIDES)
+    # Every override turns something off: the flags are ``false``; ``web_search`` (a mode, not
+    # a flag) is ``disabled`` (2026-11-10, violation 1191).
+    off = {o: override_value(o) for o in TOOL_DISABLE_FEATURE_OVERRIDES}
+    assert {o: v for o, v in off.items() if override_key(o) != "web_search"} == {
+        o: "false" for o in off if override_key(o) != "web_search"
+    }
+    assert [v for o, v in off.items() if override_key(o) == "web_search"] == ["disabled"]
+
+
+def test_hosted_web_search_is_turned_off() -> None:
+    """Violation 1191 (2026-11-10): codex used the hosted ``web_search`` tool in production,
+    which the mock-based verification cannot surface. It is off by CLI override."""
+    assert 'web_search="disabled"' in TOOL_DISABLE_FEATURE_OVERRIDES
+    assert "web_search" in TOOL_DISABLE_OVERRIDE_KEYS
 
 
 def test_control_clone_drops_the_catalog_and_the_flags(tmp_path: Path) -> None:

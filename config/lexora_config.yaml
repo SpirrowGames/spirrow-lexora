@@ -202,6 +202,9 @@ routing:
           - "tools.experimental_request_user_input.enabled=false"
           - "features.apps=false"
           - "features.plugins=false"
+          # 2026-11-10 violation 1191: codex が hosted の web_search を使った。
+          # web_search は features.* とは別の設定で、既定のままだった (backends/codex.py)。
+          - 'web_search="disabled"'
 
     # naysayer ティアの実体 (T-naysayer-codex-backend msg-687 E)。
     # mode: codex_only (2026-11-10, Takahito 判断) — codex が答え、codex が閉じている・
