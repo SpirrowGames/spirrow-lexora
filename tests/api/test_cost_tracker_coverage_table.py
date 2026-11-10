@@ -1,4 +1,4 @@
-"""The `backend | fills the sink | why` table in `get_cost_tracker.__doc__`, checked.
+"""The `backend | fills_usage_sink | why` table in `get_cost_tracker.__doc__`, checked.
 
 That table went stale three times at the same site (T-claims-need-detectors
 msg-204 §1 rows 3 and 5, msg-1107 §0): it said five backends while the config
@@ -21,6 +21,9 @@ What it does NOT detect:
   the right class is left to manual review.
 - which class the factory actually builds for a type (the construction-site
   enumeration is out of scope, msg-204 §5).
+- anything in the ``why`` column. The second column is the class's one-bit
+  declaration, not what each stream does: a ``no`` class can still fill the
+  sink on some stream (``vllm`` chat), and only ``why`` says so, unchecked.
 """
 
 from __future__ import annotations
@@ -54,7 +57,7 @@ TYPE_TO_CLASS: dict[str, type[Backend]] = {
     "fallback": FallbackBackend,
 }
 
-_HEADER = re.compile(r"^(?P<indent> *)backend +fills the sink +why *$")
+_HEADER = re.compile(r"^(?P<indent> *)backend +fills_usage_sink +why *$")
 _NAME = re.compile(r"[a-z_]+")
 
 
@@ -69,7 +72,7 @@ def parse_coverage_table(doc: str) -> dict[str, bool]:
     Inside, every line is either
       - a head row: at the header's indent, ``<name> <yes|no> <why...>`` with
         ``<name>`` matching ``[a-z_]+``; or
-      - a continuation: indented deeper than the header's `fills the sink`
+      - a continuation: indented deeper than the header's `fills_usage_sink`
         column, with an empty name column, after at least one head row.
     Anything else fails. Duplicates are rejected before building the dict.
     """
@@ -80,7 +83,7 @@ def parse_coverage_table(doc: str) -> dict[str, bool]:
     start = header_at[0]
     header = lines[start]
     indent = len(_HEADER.match(header).group("indent"))  # type: ignore[union-attr]
-    fills_col = header.index("fills the sink")
+    fills_col = header.index("fills_usage_sink")
 
     rows: list[tuple[str, bool]] = []
     for lineno, line in enumerate(lines[start + 1 :], start=start + 2):
@@ -208,7 +211,7 @@ def test_mutation_vii_a_line_of_neither_shape_fails() -> None:
 
 
 def test_a_missing_header_fails() -> None:
-    doc = _doc().replace("fills the sink", "fills  the sink")
+    doc = _doc().replace("fills_usage_sink why", "fills_usage_sink  why  extra")
     with pytest.raises(TableError, match="found 0"):
         parse_coverage_table(doc)
 
@@ -229,3 +232,11 @@ def test_a_continuation_before_any_row_fails() -> None:
     header = next(ln for ln in _doc().splitlines() if _HEADER.match(ln))
     with pytest.raises(TableError, match="before any row"):
         parse_coverage_table(header + "\n" + " " * 60 + "orphan\n")
+
+
+def test_mutation_viii_the_old_header_fails() -> None:
+    """The header used to read `fills the sink`, which overstated a `no` cell
+    (msg-1112): restoring it must not parse."""
+    doc = _replace_once(_doc(), "fills_usage_sink why", "fills the sink   why")
+    with pytest.raises(TableError, match="found 0"):
+        parse_coverage_table(doc)

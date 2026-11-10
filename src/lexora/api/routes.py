@@ -397,7 +397,14 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
         /chat                  records a row     (no streaming form)
         /v1/messages           records a row     records a row if filled
 
-        backend             fills the sink   why
+    The second column below is each backend class's declaration,
+    ``Backend.fills_usage_sink``, and nothing more: one bit per class. A `no`
+    there does not mean no stream of that backend ever fills the sink -- a
+    class can fill it on one stream and not another (`vllm`). What each
+    stream actually does is in the `why` column, and that column is not
+    checked by anything.
+
+        backend             fills_usage_sink why
         anthropic           yes              already parses `message_start`
                                              and `message_delta`
         claude_code         yes              the CLI's `result` event, read
@@ -415,19 +422,18 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
                                              it (row when the upstream sends
                                              the usage event, always
                                              requested); the completions
-                                             stream does not (no row). The
-                                             cell is the class's declaration
+                                             stream does not (no row), so
+                                             the class declares False
 
-    That second column is now carried by a value as well as by this prose:
-    ``Backend.fills_usage_sink``, True on every `yes` row and False on every
-    `no` row. The value is what lets a handler tell the *defect* -- a declaring
+    The declaration is what lets a handler tell the *defect* -- a declaring
     backend whose stream completed normally and still left the sink empty
     -- from the legitimate silences below, and count it
-    (``lexora_stream_usage_missing_total``). The two must be changed
-    together. `tests/api/test_cost_tracker_coverage_table.py` checks that
+    (``lexora_stream_usage_missing_total``). The table and the declarations
+    must be changed together. `tests/api/test_cost_tracker_coverage_table.py` checks that
     the table's names are exactly the configurable backend types and that
-    each cell agrees with the declaration of the class the test maps that
-    name to; whether that name-to-class mapping is right is left to review.
+    each `yes`/`no` agrees with the declaration of the class the test maps
+    that name to; whether that name-to-class mapping is right is left to
+    review, and the `why` column is not checked.
     `vllm` is the one split
     row: its chat stream fills the sink but the class stays False, because
     the flag is per class and its completions stream does not fill, so
