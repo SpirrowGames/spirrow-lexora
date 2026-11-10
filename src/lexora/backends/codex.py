@@ -126,16 +126,6 @@ MODEL_CATALOG_OVERRIDE_KEY = "model_catalog_json"
 #:   anyway: a plugin can add an MCP server to ``CODEX_HOME`` after
 #:   verification, and the config hash does not cover ``CODEX_HOME``.
 #:
-#: * ``web_search="disabled"`` -- added 2026-11-10 after violation 1191: in
-#:   production codex emitted a ``web_search`` item (the hosted Responses
-#:   ``web_search`` tool) although the measured first request declared no
-#:   tool. The mock run cannot show it -- with a custom provider the CLI does
-#:   not attach the hosted tool -- so it was missed. The CLI's ``web_search``
-#:   mode (``cached`` / ``live`` / ``disabled``) is separate from the
-#:   ``features.*`` flags; ``disabled`` is accepted by codex-cli 0.160.0
-#:   (checked: ``codex -c web_search="disabled" features list`` loads, a bogus
-#:   value fails to load the config).
-#:
 #: Each of the others was dropped in turn and its tools came back, so none
 #: is redundant. ``features.unified_exec`` and ``features.sleep_tool`` were
 #: measured redundant and are not set.
@@ -147,8 +137,32 @@ TOOL_DISABLE_FEATURE_OVERRIDES: tuple[str, ...] = (
     "tools.experimental_request_user_input.enabled=false",
     "features.apps=false",
     "features.plugins=false",
-    'web_search="disabled"',
 )
+
+#: Hosted (server-side) tools the CLI attaches only when it talks to the
+#: built-in ``openai`` provider. Kept apart from the ``features.*`` flags
+#: above because they are a separate setting family, and because the
+#: custom-provider mock that ``verify_codex`` V-2/3 talks to never sees them.
+#:
+#: * ``web_search="disabled"`` -- added 2026-11-10 after violation 1191: in
+#:   production codex emitted a ``web_search`` item (the hosted Responses
+#:   ``web_search`` tool) although the measured first request declared no
+#:   tool. The mock run cannot show it -- with a custom provider the CLI does
+#:   not attach the hosted tool -- so it was missed. The CLI's ``web_search``
+#:   mode (``cached`` / ``live`` / ``disabled``) is separate from the
+#:   ``features.*`` flags and was left at its default when the flags were
+#:   set; ``disabled`` is accepted by codex-cli 0.160.0 (checked:
+#:   ``codex -c web_search="disabled" features list`` loads, a bogus value
+#:   fails to load the config).
+#:
+#: This list holds the hosted tools we KNOW of. A hosted tool a later CLI
+#: adds is not in it; only the runtime latch catches that (RUNBOOK §11).
+HOSTED_TOOL_OVERRIDES: tuple[str, ...] = ('web_search="disabled"',)
+
+#: Every override whose value is protected: ``protected_override_problems``
+#: requires each key to appear in ``cli_overrides`` exactly once with exactly
+#: this value.
+PROTECTED_TOOL_OVERRIDES: tuple[str, ...] = (*TOOL_DISABLE_FEATURE_OVERRIDES, *HOSTED_TOOL_OVERRIDES)
 
 #: Catalog-entry keys whose tools no flag removes (same measurement):
 #: ``tool_mode`` (``code_mode_only``: the custom ``exec`` tool and ``wait``)
@@ -166,7 +180,7 @@ CATALOG_KEYS_SET: Mapping[str, Any] = {"apply_patch_tool_type": None, "experimen
 #: the control runs the CLI's defaults (code mode, ``exec_command``) and must
 #: execute a tool; the production run must declare none (msg-294 go/no-go).
 TOOL_DISABLE_OVERRIDE_KEYS: frozenset[str] = frozenset(
-    {MODEL_CATALOG_OVERRIDE_KEY, *(o.split("=", 1)[0] for o in TOOL_DISABLE_FEATURE_OVERRIDES)}
+    {MODEL_CATALOG_OVERRIDE_KEY, *(o.split("=", 1)[0] for o in PROTECTED_TOOL_OVERRIDES)}
 )
 
 
@@ -187,6 +201,56 @@ def override_value(override: str) -> str:
     except tomllib.TOMLDecodeError:
         return raw
     return parsed if isinstance(parsed, str) else raw
+
+
+def protected_override_problems(cli_overrides: Sequence[str]) -> list[str]:
+    """Why ``cli_overrides`` does not pin every protected tool override; ``[]``
+    when it does (T-incident-codex-web-search-2026-11-10, D-2 / Obj-1-1).
+
+    For every key of ``PROTECTED_TOOL_OVERRIDES`` the overrides must carry it
+    exactly once and with exactly the protected value (compared the way the
+    CLI reads it, ``override_value``). Containment alone is not enough: with
+    ``web_search="disabled"`` AND a later ``web_search="live"`` the protected
+    entry is present yet the later one wins. Rather than re-implement the
+    CLI's precedence, a duplicate is refused, so the effective value is the
+    one listed. An override whose key is a dotted prefix of a protected key
+    (``features={shell_tool=true}``, ``tools.experimental_request_user_input=
+    {...}``) could set the protected key as a table, so it is refused too.
+
+    Keys are compared CASE-SENSITIVELY (``override_key_exact``), because TOML
+    keys -- and so the CLI's ``-c`` keys -- are: ``Web_Search="disabled"``
+    does not set ``web_search``, so it must not count as the protected entry
+    (PR-gate on lexora#117). A differently cased spelling of a protected key
+    is refused outright rather than interpreted: whether the CLI ignores it
+    or rejects it, it pins nothing, and accepting it would let a typo pass.
+
+    What this does NOT cover: the same key in ``CODEX_HOME/config.toml`` (a
+    ``-c`` override takes precedence over it), and any tool the CLI attaches
+    under a setting this list does not know.
+    """
+    keys = [override_key(o) for o in cli_overrides]
+    problems: list[str] = []
+    for protected in PROTECTED_TOOL_OVERRIDES:
+        key = override_key_exact(protected)
+        want = override_value(protected)
+        found = [o for o in cli_overrides if override_key_exact(o) == key]
+        variants = [
+            override_key_exact(o)
+            for o in cli_overrides
+            if override_key_exact(o) != key and override_key_exact(o).lower() == key.lower()
+        ]
+        for variant in variants:
+            problems.append(f"{key}: alternative spelling {variant!r} refused (keys are case-sensitive)")
+        if not found:
+            problems.append(f"{key}: missing")
+        elif len(found) > 1:
+            problems.append(f"{key}: appears {len(found)} times")
+        elif override_value(found[0]) != want:
+            problems.append(f"{key}: value {override_value(found[0])!r}, expected {want!r}")
+        for other in sorted(set(keys)):
+            if key.startswith(other + "."):
+                problems.append(f"{key}: overridden as a table by {other!r}")
+    return problems
 
 
 def model_catalog_path(cli_overrides: Sequence[str]) -> str | None:
@@ -243,6 +307,15 @@ def verify_provider_overrides(base_url: str, wire_api: str) -> list[str]:
 def override_key(override: str) -> str:
     """Key part of a ``key=value`` ``-c`` override, stripped and lowercased."""
     return override.split("=", 1)[0].strip().lower()
+
+
+def override_key_exact(override: str) -> str:
+    """Key part of a ``key=value`` ``-c`` override, stripped but NOT case-folded:
+    the spelling the CLI resolves (TOML keys are case-sensitive). Use this,
+    not ``override_key``, wherever a match certifies that a key is SET;
+    ``override_key`` folds case and so over-matches, which is only safe where
+    over-matching removes or refuses more (the control clone, table check)."""
+    return override.split("=", 1)[0].strip()
 
 
 @dataclass(frozen=True)
