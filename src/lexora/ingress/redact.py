@@ -40,6 +40,12 @@ What the scanner guarantees
   ends the run on its first line, so a marker quoted in a message no longer
   wipes the rest of the prompt. A run of PEM body lines with neither marker
   is recognised by shape (see ``_body_runs``).
+* **Markers pair per sequence, in (line, column) order
+  (T-redactor-quoted-pem-begin-pairs-with-later-end msg-1028 / msg-1032 /
+  msg-1034).** No marker of a line is skipped. In the plain sequence a begin
+  followed by another begin before any end is unclosed (R-1), so a begin
+  quoted in prose no longer pairs with the end of a later real key. On a
+  hunk side a begin still pairs with the next end. See ``_pem_blocks``.
 
 What gets redacted (kinds, final): ``pem`` (PEM blocks and PEM body runs),
 ``key`` (known key prefixes), ``assignment`` (rule D-1 below), ``bearer``
@@ -83,6 +89,20 @@ Accepted limits (msg-834; reported to D8 with the "stricter than D8" list)
   line is not caught;
 * **(b)** a secret assembled through names that do not look sensitive
   (``a = "correct"; API_KEY = a + b``) is not caught.
+
+PEM pairing (T-redactor-quoted-pem-begin-pairs-with-later-end msg-1032 /
+msg-1034), all on the side of redacting too much:
+
+* **(c)** a begin quoted in prose followed by the second half of a key with
+  no begin of its own (body and end only) pairs with that end: everything
+  from the quote to the end is one block;
+* **(d)** on a hunk side, a begin quoted in prose still pairs with a later
+  end, so the prose between them stays redacted (a side's unclosed begin runs
+  to the side's end anyway, P-3);
+* **(e)** on a hunk side, the C of an end with no open begin runs from the
+  existing ``floor`` (the side's first content line, or the line after the
+  block handled last), so prose between ``floor`` and that end is redacted
+  too.
 
 Known prefixes, PEM blocks, Bearer and D-2 still apply to every line D-1
 does not cover.
@@ -630,79 +650,115 @@ class Redactor:
 
     # -- multi-line: PEM ------------------------------------------------
     def _pem_blocks(self, lines: list[_Line], seq: list[int], *, bounded: bool = False) -> None:
-        """Mark PEM blocks in one sequence. Begin..end. Unclosed blocks
-        (ADR-14 §7.3, bounded by msg-898 PR-1):
+        """Mark PEM blocks in one sequence (ADR-14 §7.3; msg-898 PR-1 bounds;
+        T-redactor-quoted-pem-begin-pairs-with-later-end msg-1028 / msg-1032 /
+        msg-1034 pairing).
 
-        * ``bounded=False`` (a hunk side, P-3): a begin without an end runs
-          to the sequence's last line; an end without a begin runs from the
-          sequence's first line.
-        * ``bounded=True`` (the plain sequence, P-1): a begin without an end
-          is redacted from the marker to the end of its line, then down
-          while each next line has a PEM body shape (``_pem_body_shape``);
-          an end without a begin from the start of its line, then up the
-          same way, never into the previous block."""
+        Every begin and end marker of the sequence is read in (line, column)
+        order -- several markers on one line included, none skipped -- by one
+        state machine:
+
+        * no begin open: a begin opens; an end is an orphan end (C);
+        * a begin open: an end closes it (A, begin..end), and the markers to
+          the right of that end on the same line are read next; a begin is
+          handled per sequence (R-1 below).
+
+        **The state transitions are the same in the plain sequence and on a
+        hunk side.** The only difference is a begin that arrives while
+        another is open: in the plain sequence (``bounded=True``, R-1) the
+        open begin is settled as unclosed (B) and the new begin opens; on a
+        hunk side it is absorbed into the open block -- no label, no count --
+        so a side keeps pairing a begin with the next end (P-3; widening a
+        side's B to its end would only redact more). **The spans of B and C
+        use each sequence's existing rule:**
+
+        * B: plain -- marker to end of line, then down while each next line
+          has a PEM body shape (``_run_down``, P-1/P-2); side -- to the
+          side's last line.
+        * C: plain -- from the start of its line up while the lines have a
+          body shape (``_run_up``), never into the previous block; side --
+          from the existing ``floor`` (the side's first content line, or the
+          line after the block handled last) down to the end."""
         idx = [k for k in seq if lines[k].content]
         where = {k: n for n, k in enumerate(seq)}
-        pos = 0
+        markers: list[tuple[int, int, bool, re.Match[str]]] = []
+        for p, k in enumerate(idx):
+            core = lines[k].core
+            markers += [(p, m.start(), True, m) for m in _PEM_BEGIN_RE.finditer(core)]
+            markers += [(p, m.start(), False, m) for m in _PEM_END_RE.finditer(core)]
+        markers.sort(key=lambda t: (t[0], t[1]))
+        #: The open begin: (position in ``idx``, match).
+        open_: tuple[int, re.Match[str]] | None = None
         #: First position an orphan end may reach back to: the line after
         #: the previous block, never into it.
         floor = 0
-        while pos < len(idx):
-            k = idx[pos]
-            core = lines[k].core
-            begin = _PEM_BEGIN_RE.search(core)
-            end = _PEM_END_RE.search(core)
-            if begin is not None:
-                # Same-line end after the begin (escaped ``\n`` in JSON, or a
-                # one-line block): one match inside the line.
-                same = _PEM_END_RE.search(core, begin.end())
-                if same is not None:
-                    self._mark(lines, [(k, begin.start(), same.end())], core[begin.start():same.end()])
-                    pos += 1
-                    floor = pos
-                    continue
-                # Look for the end in the following lines of the sequence.
-                span = [(k, begin.start(), len(core))]
-                closing = None
-                for later in range(pos + 1, len(idx)):
-                    kk = idx[later]
-                    e = _PEM_END_RE.search(lines[kk].core)
-                    if e is not None:
-                        closing = later
-                        span.append((kk, 0, e.end()))
-                        break
-                    span.append((kk, 0, len(lines[kk].core)))
-                if closing is None and bounded:
-                    span = [(k, begin.start(), len(core))]
-                    span += [(kk, 0, len(lines[kk].core)) for kk in self._run_down(lines, seq, where[k] + 1)]
-                    last = where[span[-1][0]]
-                    nxt = next((n for n in range(pos + 1, len(idx)) if where[idx[n]] > last), len(idx))
-                    self._mark_unclosed(lines, span, "\n".join(lines[a].core for a, _, _ in span))
-                    pos = floor = nxt
-                    continue
-                if closing is None:
-                    self._mark_unclosed(lines, span, "\n".join(lines[a].core for a, _, _ in span))
-                else:
-                    self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span))
-                pos = (closing if closing is not None else len(idx) - 1) + 1
-                floor = pos
+        #: Where the last block ended on its line: (position, column).
+        last_end: tuple[int, int] | None = None
+        for p, _, is_begin, m in markers:
+            k = idx[p]
+            if is_begin:
+                if open_ is None:
+                    open_ = (p, m)
+                elif bounded:
+                    past = self._unclosed_begin(lines, seq, idx, where, *open_, bounded=True)
+                    if past > floor:
+                        floor = past
+                    open_ = (p, m)
+                # On a hunk side the begin is absorbed into the open block.
                 continue
-            if end is not None:
-                if bounded:
-                    # Up from this end while the lines have a body shape,
-                    # never into the previous block.
-                    low = where[idx[floor - 1]] + 1 if floor > 0 else 0
-                    above = self._run_up(lines, seq, where[k] - 1, low)
-                    span = [(kk, 0, len(lines[kk].core)) for kk in above]
+            if open_ is not None:
+                bp, bm = open_
+                bk = idx[bp]
+                if bp == p:
+                    self._mark(lines, [(k, bm.start(), m.end())], lines[k].core[bm.start() : m.end()])
                 else:
-                    # An end with no begin before it: from the sequence's
-                    # first content line -- or the line after the previous
-                    # block, whose lines are already redacted -- up to this end.
-                    span = [(kk, 0, len(lines[kk].core)) for kk in idx[floor:pos]]
-                span.append((k, 0, end.end()))
+                    span = [(bk, bm.start(), len(lines[bk].core))]
+                    span += [(kk, 0, len(lines[kk].core)) for kk in idx[bp + 1 : p]]
+                    span.append((k, 0, m.end()))
+                    self._mark(lines, span, "\n".join(lines[a].core for a, _, _ in span))
+                open_ = None
+            else:
+                # Orphan end (C). On the line of the previous block's end it
+                # starts where that block stopped and reaches no line above.
+                start = last_end[1] if last_end is not None and last_end[0] == p else 0
+                span = []
+                if start == 0 and bounded:
+                    low = where[idx[floor - 1]] + 1 if floor > 0 else 0
+                    span = [(kk, 0, len(lines[kk].core)) for kk in self._run_up(lines, seq, where[k] - 1, low)]
+                elif start == 0:
+                    span = [(kk, 0, len(lines[kk].core)) for kk in idx[floor:p]]
+                span.append((k, start, m.end()))
                 self._mark_unclosed(lines, span, "\n".join(lines[a].core for a, _, _ in span))
-                floor = pos + 1
-            pos += 1
+            floor = p + 1
+            last_end = (p, m.end())
+        if open_ is not None:
+            self._unclosed_begin(lines, seq, idx, where, *open_, bounded=bounded)
+
+    def _unclosed_begin(
+        self,
+        lines: list[_Line],
+        seq: list[int],
+        idx: list[int],
+        where: dict[int, int],
+        p: int,
+        m: re.Match[str],
+        *,
+        bounded: bool,
+    ) -> int:
+        """Mark a begin that has no end (B) and return the first position of
+        ``idx`` past its span. Plain: the marker's line, then ``_run_down``
+        (P-1). Side: to the side's last line (P-3). The span is never cut at
+        a later begin (msg-1021): a begin line has no body shape, so a plain
+        B stops before it anyway."""
+        k = idx[p]
+        span = [(k, m.start(), len(lines[k].core))]
+        if bounded:
+            span += [(kk, 0, len(lines[kk].core)) for kk in self._run_down(lines, seq, where[k] + 1)]
+        else:
+            span += [(kk, 0, len(lines[kk].core)) for kk in idx[p + 1 :]]
+        self._mark_unclosed(lines, span, "\n".join(lines[a].core for a, _, _ in span))
+        last = where[span[-1][0]]
+        return next((n for n in range(p + 1, len(idx)) if where[idx[n]] > last), len(idx))
 
     @staticmethod
     def _run_down(lines: list[_Line], seq: list[int], start: int) -> list[int]:
