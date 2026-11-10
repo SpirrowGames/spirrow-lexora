@@ -125,9 +125,37 @@ def test_duplicate_with_the_same_value_is_still_refused() -> None:
     assert protected_override_problems(overrides) == ["features.apps: appears 2 times"]
 
 
-def test_key_spelling_is_normalised_like_the_cli_key() -> None:
-    overrides = [*PROTECTED_TOOL_OVERRIDES, " Web_Search = 'live'"]
+def test_surrounding_whitespace_still_counts_as_the_same_key() -> None:
+    overrides = [*PROTECTED_TOOL_OVERRIDES, " web_search = 'live'"]
     assert protected_override_problems(overrides) == ["web_search: appears 2 times"]
+
+
+def test_differently_cased_key_does_not_count_as_the_protected_entry() -> None:
+    """PR-gate on lexora#117: TOML keys are case-sensitive, so
+    ``Web_Search="disabled"`` does not set ``web_search`` and must not pass."""
+    overrides = [*TOOL_DISABLE_FEATURE_OVERRIDES, 'Web_Search="disabled"']
+    assert protected_override_problems(overrides) == [
+        "web_search: alternative spelling 'Web_Search' refused (keys are case-sensitive)",
+        "web_search: missing",
+    ]
+
+
+def test_differently_cased_extra_entry_is_refused_too() -> None:
+    overrides = [*PROTECTED_TOOL_OVERRIDES, " Web_Search = 'live'"]
+    assert protected_override_problems(overrides) == [
+        "web_search: alternative spelling 'Web_Search' refused (keys are case-sensitive)",
+    ]
+
+
+def test_differently_cased_feature_key_is_refused() -> None:
+    overrides = [
+        *(o for o in PROTECTED_TOOL_OVERRIDES if not o.startswith("features.shell_tool=")),
+        "features.Shell_Tool=false",
+    ]
+    assert protected_override_problems(overrides) == [
+        "features.shell_tool: alternative spelling 'features.Shell_Tool' refused (keys are case-sensitive)",
+        "features.shell_tool: missing",
+    ]
 
 
 def test_table_override_of_a_protected_key_is_refused() -> None:

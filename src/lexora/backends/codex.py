@@ -217,6 +217,13 @@ def protected_override_problems(cli_overrides: Sequence[str]) -> list[str]:
     (``features={shell_tool=true}``, ``tools.experimental_request_user_input=
     {...}``) could set the protected key as a table, so it is refused too.
 
+    Keys are compared CASE-SENSITIVELY (``override_key_exact``), because TOML
+    keys -- and so the CLI's ``-c`` keys -- are: ``Web_Search="disabled"``
+    does not set ``web_search``, so it must not count as the protected entry
+    (PR-gate on lexora#117). A differently cased spelling of a protected key
+    is refused outright rather than interpreted: whether the CLI ignores it
+    or rejects it, it pins nothing, and accepting it would let a typo pass.
+
     What this does NOT cover: the same key in ``CODEX_HOME/config.toml`` (a
     ``-c`` override takes precedence over it), and any tool the CLI attaches
     under a setting this list does not know.
@@ -224,9 +231,16 @@ def protected_override_problems(cli_overrides: Sequence[str]) -> list[str]:
     keys = [override_key(o) for o in cli_overrides]
     problems: list[str] = []
     for protected in PROTECTED_TOOL_OVERRIDES:
-        key = override_key(protected)
+        key = override_key_exact(protected)
         want = override_value(protected)
-        found = [o for o in cli_overrides if override_key(o) == key]
+        found = [o for o in cli_overrides if override_key_exact(o) == key]
+        variants = [
+            override_key_exact(o)
+            for o in cli_overrides
+            if override_key_exact(o) != key and override_key_exact(o).lower() == key.lower()
+        ]
+        for variant in variants:
+            problems.append(f"{key}: alternative spelling {variant!r} refused (keys are case-sensitive)")
         if not found:
             problems.append(f"{key}: missing")
         elif len(found) > 1:
@@ -293,6 +307,15 @@ def verify_provider_overrides(base_url: str, wire_api: str) -> list[str]:
 def override_key(override: str) -> str:
     """Key part of a ``key=value`` ``-c`` override, stripped and lowercased."""
     return override.split("=", 1)[0].strip().lower()
+
+
+def override_key_exact(override: str) -> str:
+    """Key part of a ``key=value`` ``-c`` override, stripped but NOT case-folded:
+    the spelling the CLI resolves (TOML keys are case-sensitive). Use this,
+    not ``override_key``, wherever a match certifies that a key is SET;
+    ``override_key`` folds case and so over-matches, which is only safe where
+    over-matching removes or refuses more (the control clone, table check)."""
+    return override.split("=", 1)[0].strip()
 
 
 @dataclass(frozen=True)

@@ -156,7 +156,7 @@ from lexora.backends.codex import (
     EventFindings,
     _error_text,
     is_terminal_event,
-    override_key,
+    override_key_exact,
     protected_override_problems,
     verify_provider_overrides,
 )
@@ -295,7 +295,7 @@ def check_protected_overrides(cli_overrides: Sequence[str]) -> list[Check]:
     problems = protected_override_problems(cli_overrides)
     checks = []
     for protected in codex_backend.PROTECTED_TOOL_OVERRIDES:
-        key = override_key(protected)
+        key = override_key_exact(protected)
         mine = [p.split(": ", 1)[1] for p in problems if p.split(": ", 1)[0] == key]
         checks.append(Check(f"V-1/protected_override:{key}", not mine, "; ".join(mine)))
     return checks

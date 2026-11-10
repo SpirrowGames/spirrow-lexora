@@ -245,6 +245,24 @@ class TestProtectedOverrides:
         assert f"V-1/protected_override:{FLAG}" in _names(checks, False)
         assert "protected_override_not_pinned" in _note(backend)["fail_reasons"]
 
+    def test_differently_cased_web_search_fails_statically(self) -> None:
+        """PR-gate on lexora#117: ``Web_Search="disabled"`` does not set the
+        CLI's case-sensitive ``web_search`` key, so it must not pass V-1."""
+        overrides = [
+            *(o for o in codex_mod.PROTECTED_TOOL_OVERRIDES if not o.startswith("web_search=")),
+            'Web_Search="disabled"',
+        ]
+        checks = vc.check_protected_overrides(overrides)
+        assert _names(checks, False) == {"V-1/protected_override:web_search"}
+
+    @pytest.mark.usefixtures("v1_ok", "flag_registered")
+    async def test_differently_cased_protected_key_fails_verification(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "contained", cli_overrides=[f"{FLAG.upper()}=true"])
+        result, checks = await vc.verify(backend)
+        assert result == "fail"
+        assert f"V-1/protected_override:{FLAG}" in _names(checks, False)
+        assert "protected_override_not_pinned" in _note(backend)["fail_reasons"]
+
     @pytest.mark.usefixtures("v1_ok", "flag_registered")
     async def test_record_names_the_v2_provider_mode(self, tmp_path: Path) -> None:
         backend = v2_backend(tmp_path, "contained")

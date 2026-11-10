@@ -281,7 +281,7 @@ naysayer の codex はツール無しで動かします（Takahito の方針、s
 - `config/lexora_config.yaml` の `codex.cli_overrides` に、フラグ（`features.*=false` と `tools.experimental_request_user_input.enabled=false`）と `model_catalog_json` を入れています。
   - 何がどのツールを消すかの根拠は `backends/codex.py` の `TOOL_DISABLE_FEATURE_OVERRIDES`・`HOSTED_TOOL_OVERRIDES`・`CATALOG_KEYS_*` にあります。
   - `web_search="disabled"` は `features.*` とは別の設定（hosted tool の `web_search` のモード）です。`HOSTED_TOOL_OVERRIDES` に分けて置いています（2026-11-10 violation 1191）。
-  - 保護するキー（`PROTECTED_TOOL_OVERRIDES` = feature 側 + hosted 側）は、`cli_overrides` に**ちょうど 1 回**、**期待値どおり**に書きます。同じキーを 2 回書く（値が同じでも）、別の値にする、書かない、親のキーを表で上書きする（`features={...}` など）と、`verify_codex` の `V-1/protected_override:<key>` が fail します（`protected_override_not_pinned`）。CLI の優先順位をまねる代わりに、重複を拒否して実効値を 1 つに決めています。
+  - 保護するキー（`PROTECTED_TOOL_OVERRIDES` = feature 側 + hosted 側）は、`cli_overrides` に**ちょうど 1 回**、**期待値どおり**に書きます。同じキーを 2 回書く（値が同じでも）、別の値にする、書かない、親のキーを表で上書きする（`features={...}` など）と、`verify_codex` の `V-1/protected_override:<key>` が fail します（`protected_override_not_pinned`）。CLI の優先順位をまねる代わりに、重複を拒否して実効値を 1 つに決めています。キーは CLI と同じく**大文字小文字を区別して**照合します。`Web_Search="disabled"` は `web_search` を設定しないので、保護対象のエントリとは数えず、大文字小文字だけ違う綴りはそれ自体を拒否します（lexora#117 の PR-gate）。
   - 同じキーを `codex_home` の `config.toml` に書いても、`-c` が優先されます。
   - フラグだけでは、code mode の `exec`、`apply_patch`、`collaboration.*`（`spawn_agent` など）、`clock.*` が残ります。そこで、pin したモデルの項目からそれらを外したモデルカタログを `model_catalog_json` で渡します。
   - `features.apps=false` が無いと、ログイン済みの `codex_home` では ChatGPT のコネクタ（MCP）のツールが付きます。空の `codex_home` で試すと出ないので注意してください。
