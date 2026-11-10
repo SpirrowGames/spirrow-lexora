@@ -202,6 +202,8 @@ from lexora.api.routes import (
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend, BackendError, BackendUpstreamError
 from lexora.backends.claude_code import ClaudeCodeBackend
+from lexora.backends.codex import CodexBackend
+from lexora.backends.fallback import FallbackBackend
 from lexora.backends.gemini import GeminiBackend
 from lexora.backends.openai_compatible import OpenAICompatibleBackend
 from lexora.backends.vllm import VLLMBackend
@@ -798,18 +800,28 @@ class TestTheDeclarationIsNotAnExistingFlagInDisguise:
     has to re-derive.
     """
 
-    #: The three that assign to the sink, measured at `bdfc185`:
-    #: `anthropic.py:528/575`, `gemini.py:619/623`, `claude_code.py:485-488`.
-    WRITERS = (AnthropicBackend, ClaudeCodeBackend, GeminiBackend)
+    #: The declarers. The first three assign to the sink themselves (measured
+    #: at `bdfc185`: `anthropic.py:528/575`, `gemini.py:619/623`,
+    #: `claude_code.py:485-488`); `codex` assigns from its `turn.completed`
+    #: usage (ASSUMED shape) and `fallback` forwards the sink to whichever
+    #: side answers. The full per-type check is
+    #: `tests/api/test_cost_tracker_coverage_table.py`.
+    WRITERS = (
+        AnthropicBackend,
+        ClaudeCodeBackend,
+        GeminiBackend,
+        CodexBackend,
+        FallbackBackend,
+    )
     #: Non-*declarers*. Since T-streaming-ledger-row PR-C `vllm`'s chat stream
     #: does assign to the sink, but its completions stream does not and the
     #: flag is per class, so it stays undeclared on purpose (`vllm.py`).
     NON_WRITERS = (OpenAICompatibleBackend, VLLMBackend)
 
     def test_the_declaration_matches_which_backends_write_the_sink(self) -> None:
-        """Three declare, two do not -- and the default is False.
+        """The declarers declare, the two others do not -- and the default is False.
 
-        The default matters as much as the three: a sixth backend added
+        The default matters as much as the declarers: a backend added
         without thinking about the sink is silently correct rather than
         silently alarming.
         """
@@ -833,7 +845,7 @@ class TestTheDeclarationIsNotAnExistingFlagInDisguise:
         assert AnthropicBackend.fills_usage_sink is True
 
     def test_taking_the_sink_argument_is_not_the_discriminator(self) -> None:
-        """All five accept it; only three assign to it.
+        """Every backend here accepts it; not every one assigns to it.
 
         This is why the fact had to become a value: the signature carries no
         information about it, so before this change the only carrier was two
