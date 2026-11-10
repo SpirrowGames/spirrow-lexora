@@ -52,35 +52,22 @@ routing:
       backend: "deep"
       redact: false
       description: "複雑なタスク (Qwen3.8-27B, reasoning_effort=xhigh)"
-    # role ルート: naysayer は別訓練分布 (Gemini) で最大独立性を取る
-    # (ADR-2026-05-31-15 D-2「2 協調 1 独立」)。呼び出し側は model: "naysayer"
-    # 2026-10-13 (T-naysayer-codex-backend msg-762 / msg-763 L-1): fallback
-    # wrapper `naysayer-codex` の mode: fallback に接続。codex (ChatGPT Pro
-    # サブスク) が答え、台帳の行は answered_by=codex。codex が閉じている・
-    # 枠切れ・失敗した時だけ Gemini が答える (answered_by=gemini-fallback)。
-    # mindwire の attestation は {codex, gemini-fallback} を受け入れる版
-    # (spirrow-mindwire#463/#464) と同時に着地させる (RUNBOOK §9)。
-    # model の gemini-3.1-pro-preview は fallback 先の解決
-    # (resolve_model("naysayer")) に使うので残す。codex には渡らない。
-    # 切替は Takahito の Tier-C 判断 (msg-762、2026-10-13) で決着済み。
-    # redact / unrouted (ADR-14 §7.3, spirrow-mindwire#482; msg-800/802):
-    # 連鎖に codex を含むので redact: true が必須 (S-1)。
-    # X-Mindwire-N3-Route: v1 の無い要求は codex を試さず unrouted (Gemini) が
-    # 答え、n3_route=absent をログに残す (S-2/S-3)。
+    # role ルート: naysayer。2026-11-10 (Takahito 判断、operator セッション):
+    # Gemini を naysayer の経路から外し、全リクエストを codex に流す。
+    #   - fallback wrapper `naysayer-codex` は mode: codex_only。codex が閉じている・
+    #     枠切れ・失敗した時は Gemini に回さず 502 で断る (Discord 通知は従来どおり)。
+    #   - N-3 の Gemini 直結ティア `naysayer-gemini` は削除。mindwire 側も全件を
+    #     このティアに送る (ADR-14 §10)。「機密情報そのものはどちらにも送らない
+    #     (redact が担う)、機密を扱うファイルという理由だけなら codex でよい」。
+    #   - unrouted は置かない: X-Mindwire-N3-Route の有無にかかわらず codex
+    #     (S-2 は 2026-11-10 に任意化)。redact: true は codex を含む連鎖なので必須 (S-1)。
+    # 旧経緯: ADR-2026-05-31-15 D-2 (Gemini で独立性) → 2026-10-13 msg-762/763 L-1
+    # (codex 主・Gemini fallback) → 本変更。
     naysayer:
       backend: "naysayer-codex"
-      model: "gemini-3.1-pro-preview"
+      model: "gpt-6.1-sol"
       redact: true
-      unrouted: "gemini"
-      description: "naysayer (codex が回答、閉じている間は Gemini にフォールバック)"
-    # Gemini だけに直結する naysayer (msg-687 E)。codex を一切通さない入口。
-    # redact: true は Takahito の「伏せ字」がベンダーを問わず naysayer の
-    # 通信に対するものだから (ADR-14 §7.3)。codex は無いので unrouted は置かない (S-4)。
-    naysayer-gemini:
-      backend: "gemini"
-      model: "gemini-3.1-pro-preview"
-      redact: true
-      description: "naysayer (Gemini 直結、codex を通さない)"
+      description: "naysayer (codex のみ。codex が答えられない時は断り、他のモデルには回さない)"
     # frontier: heavy とは別に「一番賢い有料モデル」の入口を独立させる
     # (T-frontier-tier, 2026-08-31)。heavy はローカル vLLM (限界費用ゼロ)、
     # frontier は Anthropic の課金モデル ∴ 呼び出し側は「コストを払う意思表示」
@@ -162,38 +149,10 @@ routing:
     # その機構 (FallbackService) はそもそも配線されておらず動いていなかった
     # (2026-08-31 に撤去。末尾の記録を参照)。再導入するならキー設定が先。
 
-    # Google Gemini API (native generateContent, naysayer 用)
-    gemini:
-      type: "gemini"
-      url: "https://generativelanguage.googleapis.com"
-      api_key_env: "GEMINI_API_KEY"
-      # paid 鍵の構造的保証 (ADR-14 D-4): Gemini 鍵は文字列から paid/free を判別
-      # できないため、運用者が「課金有効 project の鍵である」ことを明示 affirm する。
-      # false のままだと鍵設定時に backend 構築が fail-closed で拒否される。
-      paid_key_acknowledged: true
-      # データガバナンスgate無効化 (2026-06-04, オーナー Takahito 判断)。
-      # tools / grounding / cached-content / 非テキスト part を拒否しなくなる。
-      # ADR-2026-05-31-14 D-4 / ADR-15 C-2 の不変条件を緩める設定 — 再有効化は true。
-      governance_gate_enabled: false
-      # naysayer の長い生成 (output budget 32k, reasoning 込み) が Gemini 高レイテンシ
-      # 時間帯に 120s を超えて 502 になっていたため、呼び出し側 mindwire の想定
-      # ゲートウェイ timeout=900s (client は 930s 待機) に合わせる。2026-06-11。
-      timeout: 900.0
-      connect_timeout: 5.0
-      # max_tokens 未指定リクエスト時の出力上限。reasoning モデル (Gemini 3.1 Pro)
-      # は thinking が output 枠を消費するため、本文確保用に余裕を持たせる。
-      # リクエストが max_tokens を明示した場合はそちらが優先される。
-      default_max_tokens: 16000
-      # health probe を外す (2026-08-11)。この backend の health_check は本物の
-      # generateContent を投げる ∴ /health の 1 回ごとに課金対象の推論が 1 回走り、
-      # Google 側のレイテンシ (実測 中央値 1.2s) をそのまま /health が被る。
-      # 異常が出ても運用側に打てる手が無いため、確認しない方を選ぶ。
-      # backend 自体は有効 — naysayer はこれで動いている。
-      health_check: false
-      models:
-        - name: "gemini-3.1-pro-preview"
-          capabilities: ["code", "reasoning", "analysis", "general"]
-          description: "Google Gemini 3.1 Pro Preview (naysayer, native generateContent)"
+    # Google Gemini API backend は 2026-11-10 に削除 (naysayer の経路から Gemini を
+    # 外した。唯一の利用者が naysayer だった)。再導入するなら git 履歴の設定と
+    # /etc/spirrow-lexora.env の GEMINI_API_KEY (残置) を使う。shadow mode
+    # (RUNBOOK §7) で比較を取り直す時も同じ。
 
     # Codex CLI (`codex exec` under bwrap, ChatGPT Pro サブスク認証)。
     # T-D8-codex-backend-adr14-15-amendment msg-5940 / msg-5942。
@@ -201,7 +160,7 @@ routing:
     # `naysayer-codex` (mode: fallback) を経由してこの backend を使う
     # (2026-10-13, T-naysayer-codex-backend msg-763 L-1)。
     # 検証ゲート (verify_codex) が閉じている間は全リクエストを拒否する
-    # (fallback mode ではそのリクエストを Gemini が答える)。
+    # (codex_only mode ではそのリクエストは 502 で断られる。他のモデルは答えない)。
     # max_concurrency: 1 は必須 — 1 つの auth.json のトークン更新を競合させない。
     # 1 以外は起動時に拒否される (msg-687 A)。
     # health_check: false — ゲートが閉じている間は unhealthy を返し、
@@ -245,35 +204,30 @@ routing:
           - "features.plugins=false"
 
     # naysayer ティアの実体 (T-naysayer-codex-backend msg-687 E)。
-    # mode: fallback — codex が答え、codex が閉じている・枠切れ・失敗した時だけ
-    # Gemini が答える (msg-763 L-1、Takahito の Tier-C 判断 msg-762 で決着)。
-    # mode: shadow (Gemini が答え、codex は裏で比較だけ) は比較を取り直す時に
-    # だけ使う (RUNBOOK §7)。mode は codex の config hash に入らないので、
-    # 切り替えても verify_codex の pass は stale にならない。
-    # 時間の予算 (msg-687 C): slot_wait_s + codex_timeout_s + fallback_floor_s
-    # <= caller_budget_s を起動時に検査し、成り立たなければ起動しない。
-    # caller_budget_s=900 は ADR-14 の backend 上限 (mindwire lexora/client.py の
-    # LEXORA_BACKEND_TIMEOUT_SECONDS、Lexora 側は config.LEXORA_BACKEND_TIMEOUT_S)。
-    # 930 (= 900 + client 側の余裕 30) ではない。900 を超える値は起動しない。
-    # 2026-11-07 配分変更 (Takahito 判断、operator セッション): 150 + 150 + 600 = 900。
-    # 旧値 30 + 270 + 600 (msg-702) では、mindwire の PR-gate が pass 1 / pass 2 を
-    # 並列に送るため毎回スロットを取り合い、先行の codex 実行が 30 秒を超えると後続が
-    # Gemini に落ちていた (11-04 08:49Z〜11-07 で naysayer 225 件中 15 件、全件が同時到着)。
-    # 実測: codex の実行は中央値 9 秒・最大 67 秒、Gemini は p99 224 秒。
-    # 同じ期間の到着を再生すると、スロット 1 本・待ち 150 秒でフォールバックは 0 件、
-    # 最悪の待ちは 119 秒だった (11-06 05:39Z に 7 レビュー × 2 本が同時に届いた分)。
-    # codex_timeout_s=150 は実測最大の 2 倍強。fallback_floor_s は変えていない。
-    # 3 値とも codex の config hash に入らないので、verify_codex のやり直しは要らない。
+    # mode: codex_only (2026-11-10, Takahito 判断) — codex が答え、codex が閉じている・
+    # 枠切れ・失敗した時は他のモデルに回さず NaysayerCodexUnavailable (502) で断る。
+    # Discord の STARTED / CONTINUING / ENDED 通知は "codex unavailable" として出る。
+    # 旧 mode: fallback (codex 主・Gemini 従、2026-10-13 msg-762/763 L-1) は、
+    # 11-08 の deploy の restart で codex が latch したまま 2 日間 naysayer 332 件が
+    # 全部 Gemini に回ったことを受けて止めた。latch の自動復帰は deploy 後の
+    # `python -m lexora.tools.codex_restore` (deploy/RUNBOOK.md §11) が担う。
+    # 時間の予算 (msg-687 C): codex_only では fallback_floor_s が無く、
+    # slot_wait_s + codex_timeout_s <= caller_budget_s を起動時に検査する。
+    # caller_budget_s=900 は ADR-14 の backend 上限 (mindwire の
+    # LEXORA_BACKEND_TIMEOUT_SECONDS)。900 を超える値は起動しない。
+    # 600 + 270 = 870: スロットは 1 本 (auth.json の共有を避ける msg-687 A) なので
+    # 待ちに大半を回す。11-06 05:39Z の 7 レビュー × 2 本の同時到着を再生した時の
+    # 最悪の待ちは 119 秒。codex_timeout_s=270 は実測最大 67 秒の 4 倍 — timeout は
+    # aborted:timeout の latch になり、fallback が無い今は naysayer が止まるので余裕を取る。
+    # 2 値とも codex の config hash に入らないので、verify_codex のやり直しは要らない。
     naysayer-codex:
       type: "fallback"
       fallback:
         primary: "codex"
-        fallback: "gemini"
-        mode: "fallback"
+        mode: "codex_only"
         caller_budget_s: 900
-        slot_wait_s: 150
-        codex_timeout_s: 150
-        fallback_floor_s: 600
+        slot_wait_s: 600
+        codex_timeout_s: 270
 
     # Claude Code CLI (non-interactive mode)
     claude_code:

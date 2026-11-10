@@ -43,25 +43,29 @@ REPO_CONFIG = Path(__file__).parent.parent / "config" / "lexora_config.yaml"
 class TestNaysayerRouteInvariance:
     """The naysayer tier resolution must survive the frontier tier addition."""
 
-    def test_shipped_config_naysayer_is_codex_with_gemini_fallback(self) -> None:
-        """The naysayer tier goes through the fallback wrapper (msg-687 E) in
-        fallback mode since T-naysayer-codex-backend msg-763 L-1: codex
-        answers, the `gemini` backend answers only when codex is closed;
-        `naysayer-gemini` is the direct route."""
+    def test_shipped_config_naysayer_is_codex_only(self) -> None:
+        """The naysayer tier goes through the wrapper (msg-687 E) in
+        ``codex_only`` mode since 2026-11-10 (Takahito): codex answers and
+        nothing else may -- no ``fallback`` backend, no ``naysayer-gemini``
+        tier, no ``gemini`` backend at all."""
         settings = create_settings(REPO_CONFIG)
         assert settings.routing.tiers["naysayer"].backend == "naysayer-codex"
         wrapper = settings.routing.backends["naysayer-codex"].fallback
         assert wrapper is not None
-        assert (wrapper.mode, wrapper.primary, wrapper.fallback) == ("fallback", "codex", "gemini")
-        assert settings.routing.tiers["naysayer-gemini"].backend == "gemini"
+        assert (wrapper.mode, wrapper.primary, wrapper.fallback) == ("codex_only", "codex", None)
+        assert "naysayer-gemini" not in settings.routing.tiers
+        assert not [n for n, b in settings.routing.backends.items() if b.type == "gemini"]
 
-    def test_shipped_config_naysayer_model_is_gemini_31_pro(self) -> None:
+    def test_shipped_config_naysayer_model_is_the_codex_model(self) -> None:
         settings = create_settings(REPO_CONFIG)
-        assert settings.routing.tiers["naysayer"].model == "gemini-3.1-pro-preview"
+        assert settings.routing.tiers["naysayer"].model == "gpt-6.1-sol"
 
-    def test_router_resolves_naysayer_to_gemini_backend_and_model(self) -> None:
+    def test_router_resolves_naysayer_to_the_codex_wrapper(self) -> None:
         """End-to-end: BackendRouter built from the shipped config with the
-        real backend factory still produces the same tier resolution."""
+        real backend factory; the old Gemini tier is an unknown name now
+        (refused, never silently routed: T-silent-routing R-1a)."""
+        from lexora.backends.base import ModelNotFoundError
+
         settings = create_settings(REPO_CONFIG)
         router = BackendRouter(
             routing_settings=settings.routing,
@@ -69,9 +73,11 @@ class TestNaysayerRouteInvariance:
         )
         try:
             assert router.get_backend_name_for_model("naysayer") == "naysayer-codex"
-            assert router.resolve_model("naysayer") == "gemini-3.1-pro-preview"
-            assert router.get_backend_name_for_model("naysayer-gemini") == "gemini"
-            assert router.resolve_model("naysayer-gemini") == "gemini-3.1-pro-preview"
+            assert router.resolve_model("naysayer") == "gpt-6.1-sol"
+            with pytest.raises(ModelNotFoundError):
+                router.get_backend_for_model("naysayer-gemini")
+            with pytest.raises(ModelNotFoundError):
+                router.get_backend_for_model("gemini-3.1-pro-preview")
         finally:
             # Backends spin up httpx.AsyncClient / subprocess handles.
             import asyncio
@@ -85,7 +91,7 @@ class TestNaysayerRouteInvariance:
         monkeypatch.setenv("LEXORA_FRONTIER_MODEL", "claude-opus-5-20260601")
         settings = create_settings(REPO_CONFIG)
         assert settings.routing.tiers["naysayer"].backend == "naysayer-codex"
-        assert settings.routing.tiers["naysayer"].model == "gemini-3.1-pro-preview"
+        assert settings.routing.tiers["naysayer"].model == "gpt-6.1-sol"
 
 
 class TestFrontierTierConfig:

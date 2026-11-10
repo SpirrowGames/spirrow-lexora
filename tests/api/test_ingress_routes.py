@@ -28,6 +28,8 @@ from tests.backends.test_fallback import GEMINI_MODEL, FakeGemini
 
 SECRET = "sk-proj-abcdefghij1234567890KLMNOP"
 CODEX_TIER = TierIngress(redact=True, codex_chain=True, unrouted="gemini")
+#: A codex tier that names no ``unrouted`` (2026-11-10): no N-3 declaration is read.
+CODEX_TIER_NO_UNROUTED = TierIngress(redact=True, codex_chain=True, unrouted=None)
 REDACT_ONLY = TierIngress(redact=True, codex_chain=False, unrouted=None)
 PLAIN = TierIngress(redact=False, codex_chain=False, unrouted=None)
 
@@ -90,6 +92,23 @@ class TestN3Route:
         if value is not None:
             expected["n3_route_value"] = value[:32]
         log.info.assert_any_call("n3_route_unrouted", **expected)
+
+    @pytest.mark.parametrize(("path", "body"), ALL_ROUTES)
+    @pytest.mark.parametrize("value", [None, "v1", "v2"])
+    def test_codex_tier_without_unrouted_always_reaches_the_tier_backend(
+        self, tmp_path: Path, path: str, body: dict[str, Any], value: str | None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = MagicMock()
+        monkeypatch.setattr(gate, "logger", log)
+        primary, unrouted = _backend(), _backend()
+        app = _app(primary, CostTracker(tmp_path / "c.db"), backend_name="naysayer-codex")
+        _wire(app, CODEX_TIER_NO_UNROUTED, unrouted)
+        headers = {} if value is None else {N3_ROUTE_HEADER: value}
+        response = TestClient(app).post(path, json=body, headers=headers)
+        assert response.status_code == 200, response.text
+        assert _called(primary) and not _called(unrouted)
+        assert _rows(tmp_path / "c.db") == [("naysayer-codex", None, None)]
+        assert not any(c.args and c.args[0] == "n3_route_unrouted" for c in log.info.call_args_list)
 
     @pytest.mark.parametrize(("path", "body"), ALL_ROUTES)
     @pytest.mark.parametrize("ingress", [REDACT_ONLY, PLAIN, None], ids=["redact-only", "plain", "not-a-tier"])
