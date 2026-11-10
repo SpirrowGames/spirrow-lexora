@@ -34,7 +34,7 @@ Two things that run also settled, both of which shape the code:
 1. The `assistant` event carries a `message.usage` of its own, with the same
    keys. On this single-turn call it agreed with the result event. On a
    multi-turn call there is one assistant event per turn and only `result`
-   carries the invocation's total, so filling from assistant events is exactly
+   carries the total across turns, so filling from assistant events is exactly
    the "second summation" this work is forbidden to write.
    `test_assistant_event_usage_is_not_the_source` drives that difference.
 2. `modelUsage` again listed two models (`claude-sonnet-5` **and**

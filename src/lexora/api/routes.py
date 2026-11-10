@@ -380,9 +380,9 @@ def get_task_classifier(request: Request) -> TaskClassifier | None:
 def get_cost_tracker(request: Request) -> CostTracker | None:
     """Get cost tracker from app state.
 
-    Ledger coverage, measured 2026-09-07 at `d8b9698`. Every row in
-    `request_costs` is written through this dependency, so the table below is
-    what `/stats/costs` and `/stats/costs/recent` are summing over.
+    Ledger coverage, as of PR #118. Every row in `request_costs` is written
+    through this dependency, so the table below is what `/stats/costs` and
+    `/stats/costs/recent` are summing over.
 
     The streaming column is per-backend and conditional, so it says *when* a
     row appears rather than whether one does. `if filled` means the routed
@@ -397,28 +397,44 @@ def get_cost_tracker(request: Request) -> CostTracker | None:
         /chat                  records a row     (no streaming form)
         /v1/messages           records a row     records a row if filled
 
-        backend             fills the sink   why
+    The second column below is each backend class's declaration,
+    ``Backend.fills_usage_sink``, and nothing more: one bit per class. A `no`
+    there does not mean no stream of that backend ever fills the sink -- a
+    class can fill it on one stream and not another (`vllm`). What each
+    stream actually does is in the `why` column, and that column is not
+    checked by anything.
+
+        backend             fills_usage_sink why
         anthropic           yes              already parses `message_start`
                                              and `message_delta`
         claude_code         yes              the CLI's `result` event, read
                                              with `_tokens_from_result`
         gemini              yes              `usageMetadata` on the events it
                                              already decodes
+        codex               yes              the `turn.completed` usage; that
+                                             event's shape is ASSUMED, not
+                                             measured (`codex.py`)
+        fallback            yes              forwards the sink to whichever
+                                             side answers: codex, or gemini
         openai_compatible   no               relays bytes verbatim, and the
                                              number is not in those bytes
-        vllm                chat stream:     chat stream: row when the upstream
-                            yes; completions sends the usage event (always
-                            stream: no       requested); completions stream:
-                                             no row; not counted by
-                                             `fills_usage_sink`
+        vllm                no               split: the chat stream does fill
+                                             it (row when the upstream sends
+                                             the usage event, always
+                                             requested); the completions
+                                             stream does not (no row), so
+                                             the class declares False
 
-    That second column is now carried by a value as well as by this prose:
-    ``Backend.fills_usage_sink``, True on the three and False on the two.
-    The value is what lets a handler tell the *defect* -- a declaring
+    The declaration is what lets a handler tell the *defect* -- a declaring
     backend whose stream completed normally and still left the sink empty
     -- from the legitimate silences below, and count it
-    (``lexora_stream_usage_missing_total``). The two must be changed
-    together; nothing yet checks that they agree. `vllm` is the one split
+    (``lexora_stream_usage_missing_total``). The table and the declarations
+    must be changed together. `tests/api/test_cost_tracker_coverage_table.py` checks that
+    the table's names are exactly the configurable backend types and that
+    each `yes`/`no` agrees with the declaration of the class the test maps
+    that name to; whether that name-to-class mapping is right is left to
+    review, and the `why` column is not checked.
+    `vllm` is the one split
     row: its chat stream fills the sink but the class stays False, because
     the flag is per class and its completions stream does not fill, so
     declaring would count every streamed `/v1/completions` as the defect.

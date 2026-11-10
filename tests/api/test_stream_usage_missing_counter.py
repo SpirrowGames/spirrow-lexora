@@ -42,7 +42,8 @@ Two discriminators that look right and are not, both measured here at
   take `usage_sink: UsageSink | None = None`, and only `anthropic`,
   `claude_code` and `gemini` assign to it. Before this change that fact was
   carried only by two docstrings.
-  `test_the_declaration_matches_which_backends_write_the_sink` holds it.
+  `test_taking_the_sink_argument_is_not_the_discriminator` holds it; which
+  backend declares what is held by `test_cost_tracker_coverage_table.py`.
 
 Why the positive and each negative is its OWN named test rather than one
 case with four branches: the four legitimate causes of an empty sink are the
@@ -201,14 +202,11 @@ from lexora.api.routes import (
 )
 from lexora.backends.anthropic import AnthropicBackend
 from lexora.backends.base import Backend, BackendError, BackendUpstreamError
-from lexora.backends.claude_code import ClaudeCodeBackend
-from lexora.backends.gemini import GeminiBackend
-from lexora.backends.openai_compatible import OpenAICompatibleBackend
-from lexora.backends.vllm import VLLMBackend
 from lexora.config import ERROR_PASSTHROUGH_TYPES
 from lexora.services.rate_limiter import RateLimiter
 from lexora.services.retry_handler import RetryHandler
 from lexora.services.stats import StatsCollector
+from tests.api.test_cost_tracker_coverage_table import TYPE_TO_CLASS
 
 REQUESTED = "heavy"
 RESOLVED = "claude-fable-5"
@@ -798,33 +796,26 @@ class TestTheDeclarationIsNotAnExistingFlagInDisguise:
     has to re-derive.
     """
 
-    #: The three that assign to the sink, measured at `bdfc185`:
-    #: `anthropic.py:528/575`, `gemini.py:619/623`, `claude_code.py:485-488`.
-    WRITERS = (AnthropicBackend, ClaudeCodeBackend, GeminiBackend)
-    #: Non-*declarers*. Since T-streaming-ledger-row PR-C `vllm`'s chat stream
-    #: does assign to the sink, but its completions stream does not and the
-    #: flag is per class, so it stays undeclared on purpose (`vllm.py`).
-    NON_WRITERS = (OpenAICompatibleBackend, VLLMBackend)
+    def test_the_default_declaration_is_false(self) -> None:
+        """The default is False; the per-backend values are checked elsewhere.
 
-    def test_the_declaration_matches_which_backends_write_the_sink(self) -> None:
-        """Three declare, two do not -- and the default is False.
-
-        The default matters as much as the three: a sixth backend added
+        The default matters as much as the declarers: a backend added
         without thinking about the sink is silently correct rather than
-        silently alarming.
+        silently alarming. Which backend declares what is checked once, per
+        configured type, by `tests/api/test_cost_tracker_coverage_table.py`
+        against the table in `get_cost_tracker.__doc__` -- this class used to
+        keep its own WRITERS / NON_WRITERS lists for the same check, and a
+        second hand-kept enumeration is how those lists missed `codex` and
+        `fallback` (T-claims-need-detectors msg-1107 §0).
         """
         assert Backend.fills_usage_sink is False
-        for cls in self.WRITERS:
-            assert cls.fills_usage_sink is True, cls.__name__
-        for cls in self.NON_WRITERS:
-            assert cls.fills_usage_sink is False, cls.__name__
 
     def test_error_passthrough_is_not_the_discriminator(self) -> None:
         """It is anti-correlated, not merely different.
 
         `error_passthrough` is an error-shape flag about forwarding upstream
         4xx/5xx, it is implemented on exactly one backend, and that backend
-        is `anthropic` -- one of the three that DO fill the sink. Using it as
+        is `anthropic` -- one of the backends that DO fill the sink. Using it as
         a stand-in would mark the best-instrumented backend as the
         un-instrumented one. Written as a test so the coincidence cannot be
         reached for again by someone reading the two flags side by side.
@@ -833,13 +824,13 @@ class TestTheDeclarationIsNotAnExistingFlagInDisguise:
         assert AnthropicBackend.fills_usage_sink is True
 
     def test_taking_the_sink_argument_is_not_the_discriminator(self) -> None:
-        """All five accept it; only three assign to it.
+        """Every configured backend accepts it; not every one assigns to it.
 
         This is why the fact had to become a value: the signature carries no
         information about it, so before this change the only carrier was two
         docstrings saying "accepted and never filled".
         """
-        for cls in self.WRITERS + self.NON_WRITERS:
+        for cls in TYPE_TO_CLASS.values():
             params = inspect.signature(cls.chat_completions_stream).parameters
             assert "usage_sink" in params, cls.__name__
 
