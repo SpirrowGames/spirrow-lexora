@@ -61,6 +61,10 @@ class Result:
     dry_run: bool = False
 
 
+class ConnectionInTransactionError(RuntimeError):
+    """Raised when the caller's connection already has an open transaction."""
+
+
 def parse_ids(lines: Iterable[str]) -> list[str]:
     """Strip whitespace, drop blank lines, de-duplicate keeping first order."""
     seen: dict[str, None] = {}
@@ -87,7 +91,17 @@ def delete_decisions(
 
     All counting and deleting happens in one transaction. Under
     ``dry_run`` the transaction is rolled back, so nothing is written.
+
+    ``conn`` must not have an open transaction: switching
+    ``isolation_level`` to ``None`` would implicitly commit the caller's
+    pending writes. Such a connection is refused with
+    :class:`ConnectionInTransactionError` before anything is changed.
     """
+    if conn.in_transaction:
+        raise ConnectionInTransactionError(
+            "connection has an open transaction; commit or roll it back "
+            "before calling delete_decisions"
+        )
     unique = parse_ids(ids)
     id_set = set(unique)
     previous_isolation = conn.isolation_level

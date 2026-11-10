@@ -176,3 +176,52 @@ def test_help_states_safety_boundary(capsys: pytest.CaptureFixture[str]) -> None
     out = " ".join(capsys.readouterr().out.split())
     assert "input list is the only safety boundary" in out
     assert "run --dry-run separately first" in out
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_open_transaction_is_refused_and_pending_work_not_committed(
+    db: Path, dry_run: bool
+) -> None:
+    """PR-gate round 1: isolation_level=None would commit pending writes."""
+    before = _dump(db)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("DELETE FROM decisions WHERE decision_id = 'o-2'")  # pending
+        assert conn.in_transaction
+        with pytest.raises(dd.ConnectionInTransactionError):
+            dd.delete_decisions(conn, ["t-1"], dry_run=dry_run)
+        # Still the caller's open transaction, untouched by the tool.
+        assert conn.in_transaction
+        assert conn.isolation_level == ""
+        assert _dump(db) == before  # nothing committed yet
+        conn.rollback()
+    finally:
+        conn.close()
+    assert _dump(db) == before  # the pending delete never became permanent
+
+
+def test_failure_after_earlier_chunk_rolls_back_everything(tmp_path: Path) -> None:
+    """A delete failing in the second chunk undoes the first chunk's deletes."""
+    path = tmp_path / "fail.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute(_CREATE_TABLE_SQL)
+    _insert(conn, [(f"id-{i:04d}", "p", None) for i in range(1200)])
+    # id-0700 is in the second 500-ID chunk; the first chunk deletes fine.
+    conn.execute(
+        "CREATE TRIGGER block_one BEFORE DELETE ON decisions "
+        "WHEN OLD.decision_id = 'id-0700' "
+        "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+    )
+    conn.commit()
+    conn.close()
+    before = _dump(path)
+
+    conn = sqlite3.connect(str(path))
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="blocked"):
+            dd.delete_decisions(conn, [f"id-{i:04d}" for i in range(1200)])
+        assert not conn.in_transaction
+        assert conn.isolation_level == ""  # restored
+    finally:
+        conn.close()
+    assert _dump(path) == before
