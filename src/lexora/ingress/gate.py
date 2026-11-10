@@ -10,14 +10,16 @@ backend is called. For a tier with neither ``redact: true`` nor codex in its
 chain it returns the backend unchanged, so every other tier behaves exactly
 as before.
 
-* **N-3 route.** For a tier whose chain contains codex, a request without
+* **N-3 route.** For a tier whose chain contains codex AND that names an
+  ``unrouted`` backend, a request without
   ``X-Mindwire-N3-Route: v1`` (missing, malformed or another version) never
   reaches codex: the tier's ``unrouted`` backend answers, ``n3_route=absent``
   is logged at INFO with the tier, and a present-but-wrong value is logged
   as ``n3_route_value`` (first 32 characters). The ledger row's ``backend``
   and ``answered_by`` name the backend that answered. The header only
   *permits* codex on a tier that already uses it; on a tier without codex it
-  is not read at all.
+  is not read at all. A codex tier without ``unrouted`` (2026-11-10,
+  Takahito: every naysayer request goes to codex) does not read it either.
 * **Redaction.** For a ``redact: true`` tier every text of the request --
   system, every message, every content block (``tool_use`` input,
   ``thinking`` and unknown block types included; binary media excepted),
@@ -296,10 +298,12 @@ def apply_ingress(
         return backend
 
     route: AnswerRoute | None = None
-    if ingress.codex_chain and n3_route != N3_ROUTE_V1:
-        # S-2/S-3 guarantee a configured, codex-free ``unrouted`` here.
+    if ingress.codex_chain and ingress.unrouted is not None and n3_route != N3_ROUTE_V1:
+        # S-3 guarantees a configured, codex-free ``unrouted`` here. A codex
+        # tier without ``unrouted`` (allowed since 2026-11-10) skips this:
+        # every request goes to its backend, declared or not.
         unrouted_name = ingress.unrouted
-        target = backend_router.get_backend_by_name(unrouted_name) if unrouted_name else None
+        target = backend_router.get_backend_by_name(unrouted_name)
         if target is None:  # unreachable after the startup checks
             raise RuntimeError(f"tier '{requested}' has no usable 'unrouted' backend")
         fields: dict[str, Any] = {"tier": requested, "unrouted": unrouted_name}

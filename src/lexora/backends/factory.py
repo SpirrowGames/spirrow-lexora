@@ -250,13 +250,13 @@ def create_fallback_backend(
     return FallbackBackend(
         name=name,
         primary=primary,
-        fallback=backends[section.fallback],
+        fallback=backends[section.fallback] if section.fallback is not None else None,
         fallback_name=section.fallback,
         mode=section.mode,
         webhook_url=os.environ.get(WEBHOOK_ENV) or None,
         caller_budget_s=section.caller_budget_s,
         slot_wait_s=section.slot_wait_s,
         codex_timeout_s=section.codex_timeout_s,
-        fallback_floor_s=section.fallback_floor_s,
+        fallback_floor_s=section.floor_s,
         fallback_timeout_s=fallback_timeout_s,
     )
