@@ -207,7 +207,7 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 ## 9. codex を primary にした切替の記録（2026-10-13〜11-04、fallback mode。msg-953 / msg-974 / msg-975 / msg-976）
 
 > **この節は、2026-10-13〜11-04 に行った `fallback` mode（codex が答え、閉じている間は Gemini が答える）への切替の記録です。** 実際に行った順序に合わせて書き直しました（2026-11-10、msg-976 の 1 件目）。
-> **2026-11-10 以降の出荷 mode は `codex_only` です**（冒頭の注記と下の 11）。いまのリリースと codex の復帰は 11 の手順で行い、この節の手順は繰り返しません。
+> **2026-11-10 以降の出荷 mode は `codex_only` です**（冒頭の注記と下の 11）。いまのリリースと codex の復帰は 11 の手順で行い、この節の**切替のフェーズ（フェーズ 0・1）は繰り返しません**。ただし下の「ロールバック」（A・B）は**いま適用する手順**で、記録ではありません。
 > この節で `gemini-fallback`・`unrouted`（S-2）・「Gemini が答える」と書いてあるのは、**当時の `fallback` mode の挙動**です。`codex_only` では Gemini の backend も `naysayer-gemini` ティアも `unrouted` も設定に無く、codex が答えられないリクエストは 502（`NaysayerCodexUnavailable`）で断られます。
 
 出典: `T-naysayer-codex-backend` の msg-762（Takahito の Tier-C 判断）、msg-763（手順）、msg-765（`failure_hold` と C-3 の注）、msg-778（条件 1〜3）、msg-950（Takahito の裁定: shadow を挟まない）、msg-953 / msg-974 / msg-975 / msg-976（実際に行った順序と、この書き直しの範囲）。
@@ -273,6 +273,8 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
   - 伏せ字をした行は `redactions` に `kind:count,…`（数だけ）が入ります。
 
 ### ロールバック（mindwire の #463/#464 が merge 済みである前提）
+
+> **この小節は記録ではなく、2026-11-10 以降に適用する現行の手順です。**
 
 mindwire の #463/#464 はすでに main に merge され、deploy されています。旧版にあった「#463/#464 を merge せずに Lexora を `dbe1170`（shadow）に戻す」ロールバックは、もう取れません（`dbe1170` と組み合わせる前提だった旧 mindwire は残っていません）。いまのロールバックは次の 2 つで、**どちらを取るかで手順がまったく違います**。
 
@@ -343,6 +345,7 @@ python -m lexora.tools.verify_codex             # カタログを書いたら必
 ## 11. リリース（deploy）と codex の復帰（2026-11-10、Takahito）
 
 `codex_only` では codex が閉じている間 naysayer が止まるので、**リリースは codex が開いた状態で終わるところまで**を含めます。
+ロールバックの手順（今のリリースの中で戻す A と、Gemini に戻す B）は 9 の「ロールバック」にあります。
 きっかけは 2026-11-08 の lexora#108 の deploy です。再起動が 3 秒前に始まった codex の run を殺し（`aborted:signal`、violation 1017）、codex は 2 日間閉じたままでした（その間の naysayer 332 件は、当時の `fallback` mode で全部 Gemini が答えた）。
 
 magickit の deploy runner は、spirrow-lexora の再起動の前後で次の 2 つを実行します（`magickit/deploy/registry.py` の `pre_restart_script` / `post_restart_script`）。
