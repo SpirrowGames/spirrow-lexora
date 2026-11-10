@@ -10,6 +10,7 @@
 > codex が答えられないときは Gemini に回さず、そのリクエストは **502（`NaysayerCodexUnavailable`）で断られます**。Gemini の backend も `naysayer-gemini` ティアも設定から外しました。
 > 以下で「Gemini にフォールバック」「Gemini が答える」とある箇所は、`codex_only` では「断られる（naysayer はその間止まる）」と読み替えてください。通知（6）は `codex unavailable STARTED / CONTINUING / ENDED` として同じ webhook に届きます。
 > deploy の再起動で codex が閉じたままにならないよう、リリースの手順に codex の復帰を組み込みました（下の 11）。
+> 下の 9 は、2026-10-13〜11-04 に行った `fallback` mode への切替の記録です。いまのリリースの手順は 11 です。
 
 ---
 
@@ -194,23 +195,36 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
 - 送ったことはメモリに持っています。その日のうちに Lexora を再起動すると、同じ日にもう 1 回届くことがあります。送信に失敗したときは、10 分後の確認でもう一度送ります。
 - 期限が切れた後は予告は止まり、上のフォールバック通知（STARTED、6 時間ごとの CONTINUING、ENDED）に替わります。shadow モードでは Gemini が答えるのでフォールバック通知は出ません。止まっている間は、`shadow_report` の `codex_not_run` に `data_controls_unverified` として数えられます。
 
-## 9. codex を primary に切り替える手順（msg-763 / msg-765 / msg-778）
+### 再発防止: 2026-11-01〜11-04 の停止（msg-953 / msg-974 / msg-975 / msg-976）
 
-出典: `T-naysayer-codex-backend` の msg-762（Takahito の Tier-C 判断）、msg-763（手順）、msg-765（`failure_hold` と C-3 の注）、msg-778（順序 (a) と条件 1〜3。下の 10 の変更で前提が変わったための書き直し）、Einstein の承認。
-ホスト上の作業は Takahito か、ホスト上の operator lane が {{HOST_SERVICES}}（[[platform:infra-registry]]）で行います。
+- 下の 9 の切替のときに書いた記録が、**30 日で期限切れ**になりました。更新が間に合わず、2026-11-01〜11-04 の間、codex は `data_controls_unverified` で止まっていました（当時の `fallback` mode では、その間の naysayer は Gemini が答えた）。
+- **`codex_only` の今は、期限が切れると naysayer は止まります**（Gemini に回らず、502 で断られる）。deploy でも直りません（下の 11 の `post_restart.sh` は `codex_disabled_reason` が `null` でなければ exit 5 で終わるだけです）。
+- したがって、**期限の前に**上の手順で確かめ直し、記録を書き直します。
+  - 7 日前から届く `data controls EXPIRING` の予告を受けたら、その日のうちに行います。予告は `LEXORA_FALLBACK_WEBHOOK_URL` が設定されていないと届きません（上の 6）。
+  - 期限の日時は、記録の `data_controls_verified_at` に 30 日を足したものです。予告とログの `codex_data_controls_reloaded` に `expires_at` として出ます。
+- 期限が切れてしまったときも、手順は同じです（上の「手順」の 1〜3。再起動は要りません）。
 
-> 注: 下の 10 の変更以降、`verify_codex` の `pass` は **deploy されたコードと設定でしか取れません**。config hash に `cli_overrides`・`ro_binds`・カタログの中身が入っているためです。deploy の前の Lexora で取った `pass` は、deploy の後に `verification_stale` になります。したがって `verify_codex` はフェーズ 0 ではなく、フェーズ 1 の C-2′ で撃ちます。
+## 9. codex を primary にした切替の記録（2026-10-13〜11-04、fallback mode。msg-953 / msg-974 / msg-975 / msg-976）
 
-### 順序と fail-closed の窓
+> **この節は、2026-10-13〜11-04 に行った `fallback` mode（codex が答え、閉じている間は Gemini が答える）への切替の記録です。** 実際に行った順序に合わせて書き直しました（2026-11-10、msg-976 の 1 件目）。
+> **2026-11-10 以降の出荷 mode は `codex_only` です**（冒頭の注記と下の 11）。いまのリリースと codex の復帰は 11 の手順で行い、この節の手順は繰り返しません。
+> この節で `gemini-fallback`・`unrouted`（S-2）・「Gemini が答える」と書いてあるのは、**当時の `fallback` mode の挙動**です。`codex_only` では Gemini の backend も `naysayer-gemini` ティアも `unrouted` も設定に無く、codex が答えられないリクエストは 502（`NaysayerCodexUnavailable`）で断られます。
 
-- 順序は **Lexora の deploy が先、mindwire の #463/#464 の main merge と mindwire の deploy が後** です（#463 の HOLD 条件 (i′) が「本番 Lexora が fallback で動き、status が `codex_disabled_reason: null`」のため）。
-- その間は、codex が答えた行が旧 mindwire（`expected=gemini`）の attestation で落ち、naysayer の呼び出しが fail closed になります。間違った verdict が通ることはなく、gate や design レビューが止まって後でやり直されるだけです。
-- deploy（C-2）から `verify_codex` の `pass`（C-2′）までの間（約 1 分）は codex が閉じているので、Gemini が `gemini-fallback` で答えます。これも旧 mindwire が弾くので、同じ種類の fail-closed の窓です。
-- 窓を短くするため、フェーズ 0 はすべて切り替えの前に済ませ、フェーズ 1 は 1 回の作業で続けて行い、naysayer の呼び出しが流れていない時間帯を選びます。shadow のリリースを挟む案（msg-777 の (b)）は採りません（msg-778）。
+出典: `T-naysayer-codex-backend` の msg-762（Takahito の Tier-C 判断）、msg-763（手順）、msg-765（`failure_hold` と C-3 の注）、msg-778（条件 1〜3）、msg-950（Takahito の裁定: shadow を挟まない）、msg-953 / msg-974 / msg-975 / msg-976（実際に行った順序と、この書き直しの範囲）。
+ホスト上の作業は Takahito か、ホスト上の operator lane が {{HOST_SERVICES}}（[[platform:infra-registry]]）で行いました。
 
-### フェーズ 0: 切り替えの前（今の deploy のまま。費用は変わらない）
+> 注: 下の 10 の変更以降、`verify_codex` の `pass` は **deploy されたコードと設定でしか取れません**。config hash に `cli_overrides`・`ro_binds`・カタログの中身が入っているためです。deploy の前の Lexora で取った `pass` は、deploy の後に `verification_stale` になります。したがって `verify_codex` はフェーズ 0 ではなく、フェーズ 1 の C-2′ で撃ちました。
 
-- **H-1**（msg-267）: ChatGPT Pro $100 を契約し、ChatGPT のセキュリティ設定で device code 認証を有効にします。済んでいれば飛ばします。
+### 実際に行った順序
+
+- 順序は **mindwire が先（#463/#464 の main merge と mindwire の deploy）、Lexora の deploy が後** でした。
+  - 当初の計画（msg-778 の順序 (a)）は逆で、Lexora の deploy を先にするものでした。この節は実際の順序に合わせて書き直したものです。
+- **shadow のリリースは挟みませんでした**（Takahito の裁定、msg-950。msg-777 の (b) も採っていません）。
+- deploy（C-2）から `verify_codex` の `pass`（C-2′）までの間は codex が閉じているので、当時の `fallback` mode では Gemini が `gemini-fallback` で答えました（`codex_only` の今は、この間のリクエストは断られます）。窓を短くするため、フェーズ 0 はすべて切り替えの前に済ませ、フェーズ 1 は 1 回の作業で続けて行い、naysayer の呼び出しが流れていない時間帯を選びました。
+
+### フェーズ 0: 切り替えの前
+
+- **H-1**（msg-267）: ChatGPT Pro $100 を契約し、ChatGPT のセキュリティ設定で device code 認証を有効にします。
 - **H-2**: Lexora の**サービスユーザ**として、設定の `codex_home` にログインします。`~/.codex` にログインしても Lexora からは見えません。
 
   ```sh
@@ -219,58 +233,71 @@ codex はサブスクの login で動くため、「OpenAI が私たちのプロ
   ```
 
   - `auth.json` はパスワードと同じ扱いです（リポジトリ・ログ・チャットに出さない）。
-- **H-3**（上の 8）: データ設定を確かめ、`data/codex_data_controls.yaml` に記録します。30 日ごとに繰り返す作業で、期限の 7 日前から webhook に予告が届きます。
+- **H-3**（上の 8）: データ設定を確かめ、`data/codex_data_controls.yaml` に記録します。**30 日で期限が切れる記録です。** 切替の後に更新が間に合わず、2026-11-01〜11-04 に codex が `data_controls_unverified` で止まりました（上の 8 の「再発防止」）。
 - **H-4′**（下の 10）: リリースのコードの**新しいチェックアウト**から `python -m lexora.tools.codex_catalog` を撃ち、`codex_home` にカタログを置いておきます（`--check` で exit 0 になること）。
   - deploy の**前**に書きます。deploy の後で書き直すと、C-2′ で取る `pass` の hash とずれます。
-  - 再起動は要りません。カタログの sha256 は `config_hash()` を呼ぶたびにファイルから計算し直しており、起動時にキャッシュしていません（`backends/codex.py` の `model_catalog_digest`）。新しいカタログを読むのは C-2 で起動する新しいサービスです。
-  - 今動いている旧サービス（`dbe1170`）には影響しません。旧設定には `cli_overrides` が無く（`model_catalog_json` も無い）、旧コードの config hash はカタログの中身を含まないので、`codex_home` にファイルが 1 つ増えても CLI も hash も変わりません。
+  - 再起動は要りません。カタログの sha256 は `config_hash()` を呼ぶたびにファイルから計算し直しており、起動時にキャッシュしていません（`backends/codex.py` の `model_catalog_digest`）。
 - **H-4″**（下の 10「sandbox の中の DNS」）: このホストの `EnvironmentFile` に `LEXORA_CODEX_RO_BINDS` を書きます。{{HOST_SERVICES}}（[[platform:infra-registry]]）では `LEXORA_CODEX_RO_BINDS=/run/systemd/resolve/stub-resolv.conf` です。
   - 共有の `config/lexora_config.yaml` にはこのパスを書きません（ホストに依存するため）。
-  - 旧サービス（`dbe1170`）はこの変数を読まないので、deploy の前に書いても影響しません。読むのは C-2 で起動する新しいサービスです。
-- **H-4‴**（ADR-14 §7.3、spirrow-mindwire#482。T-naysayer-codex-backend msg-800 §1 / msg-802）: サービスが共有の `config/lexora_config.yaml` ではなくホストの設定ファイル（例 `/etc/lexora/config.yaml`）を読んでいる場合は、**どの deploy よりも先に**、その中のすべてのティアに `redact:` を書きます。`redact` には既定値が無く、書いていないティアがあると新しいサービスは起動しません。
-  - 値は共有の YAML と同じにします: `naysayer` と `naysayer-gemini` は `true`、ほかは `false`。
-  - 連鎖に codex を含むティア（`naysayer`）には `unrouted: "gemini"` も書きます。書かないと起動しません（S-2）。codex を含まないティアに `unrouted` を書いても起動しません（S-4）。
-  - 旧サービス（`dbe1170`）はこの 2 つのキーを知らず、`extra="forbid"` で起動を拒否します。したがって、ホストの設定ファイルを書き換えるのは C-2 の直前です。共有の YAML を使っている場合は、リリースのコードに入っているので作業はありません。
-- **H-5**（上の 6）: `systemctl cat lexora` で `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` があること、起動ログに `fallback_webhook_unset` が出ていないことを確かめます。書き足したら上の 1 の手順で再起動します。
-- **H-6′**（msg-778。shadow_report による旧 H-6 の置き換え）: deploy の前に、本番の `codex_home` で `CodexBackend.chat_completions` 経由の本物の run を 1 本流し、`tool_use_violation` が記録されないこと、`agent_message` と `turn.completed` が届くこと、usage が読めることを確かめます。shadow_report は使いません（2026-10-13 に operator が実施済み、msg-777）。
+- **H-4‴ は不要でした**（旧版では、ホストの設定ファイルに `redact:` / `unrouted:` を書く手順でした）。
+  - `config/lexora_config.yaml` はリリースに同梱されています。`load_yaml_config`（`src/lexora/config.py`）は、`config/lexora_config.yaml` → `lexora_config.yaml` → `/etc/lexora/config.yaml` の順に**作業ディレクトリから**探し、最初に見つかったものを読みます。サービスはリリースのディレクトリで動くので、同梱の設定が先に見つかり、`/etc/lexora/config.yaml` は使われません。
+  - `redact` / `unrouted` はリリースの設定に入っているので、ホストでの作業はありません。
+- **H-5**（上の 6）: `systemctl cat lexora` で `EnvironmentFile` に `LEXORA_FALLBACK_WEBHOOK_URL` があること、起動ログに `fallback_webhook_unset` が出ていないことを確かめます。
+- **H-6′**（msg-778）: deploy の前に、本番の `codex_home` で `CodexBackend.chat_completions` 経由の本物の run を 1 本流し、`tool_use_violation` が記録されないこと、`agent_message` と `turn.completed` が届くこと、usage が読めることを確かめます（2026-10-13 に operator が実施済み、msg-777）。
 
-### フェーズ 1: 切り替え（1 回の作業で続けて行う）
+### フェーズ 1: 切り替え（1 回の作業で続けて行った）
 
+ステップの番号は msg-763 / msg-778 のものを残し、実際に行った順に並べています（C-4 が先頭）。
+
+- **C-4**（実際には最初）: mindwire の #463/#464 を main に merge し、mindwire を deploy します（attestation が `{codex, gemini-fallback}` を受け入れる版）。
 - **C-1**: Lexora のリリース PR（`naysayer-codex` を `mode: fallback` にし、下の 10 の設定を含むもの）を main に merge します。
-- **C-2**（上の 1）: `codex.inflight_runs == 0` を確かめてから、Lexora の deploy request を出します（前回の deploy と同じ経路）。
+- **C-2**（上の 1）: `codex.inflight_runs == 0` を確かめてから、Lexora の deploy request を出します。
 - **C-2′**（msg-778 の条件 2）: deploy の直後、`codex.inflight_runs == 0` を確かめて `python -m lexora.tools.verify_codex` を撃ち、`pass` を取ります。
-  - **サービスと同じ `EnvironmentFile` を読み込んだシェルで撃ちます**（`set -a; . /etc/lexora/environment; set +a`。パスは `systemctl cat lexora` で確かめる）。`LEXORA_CODEX_RO_BINDS` が無いと `ro_binds` が違う hash になり、その `pass` はサービスから見て `verification_stale` です（DNS も引けず control が落ちます）。
-  - **deploy から 1 分以内に `pass` が取れなければ、窓を延ばさずに下のロールバックに進みます。**
-- **C-3**: status が `mode: codex`、`codex.codex_disabled_reason: null` になることを確かめます。ならなければ、下のロールバックに進みます。
-  - 注: status の `mode` は設定の値ではなく、**次のリクエストの経路**を返します（`fallback.py` の `status_fields`）。設定が `fallback` で codex が開いていれば `codex` になります。`codex` なら成功、`fallback` なら codex が閉じています（`codex_disabled_reason` を見る）。
-- **C-4**: mindwire の #463/#464 を main に merge し、mindwire を deploy します。
-- **C-5**（msg-778 の条件 3 を含む）: 最初の数本の naysayer の呼び出しで、次をすべて確かめます。
+  - **サービスと同じ `EnvironmentFile` を読み込んだシェルで撃ちます**（`set -a; . /etc/lexora/environment; set +a`。パスは `systemctl cat lexora` で確かめる）。`LEXORA_CODEX_RO_BINDS` が無いと `ro_binds` が違う hash になり、その `pass` はサービスから見て `verification_stale` です。
+  - 今のリリースでは、この再検証は deploy runner の `scripts/post_restart.sh`（`codex_restore`）が行います（下の 11）。
+- **C-3**: status が `mode: codex`、`codex.codex_disabled_reason: null` になることを確かめます。
+  - 注: status の `mode` は設定の値ではなく、**次のリクエストの経路**を返します（`fallback.py` の `status_fields`）。設定が `fallback` で codex が開いていれば `codex` になります。
+- **C-5**（msg-778 の条件 3）: 最初の数本の naysayer の呼び出しで、次をすべて確かめます。
   - 台帳に `answered_by='codex'` の行ができ、tokens が 0 でないこと。
   - mindwire の attestation が通ること。
   - status の `codex.codex_disabled_reason` が `failure_hold` を繰り返していないこと。
   - `tool_use_violation` が出ていないこと。
 
   ```sh
-  sqlite3 data/costs.db "SELECT id, backend, answered_by, tokens_input, tokens_output FROM request_costs ORDER BY id DESC LIMIT 5;"
-  ```
-
-  - C-4 の前に `failure_hold` の繰り返しが見えたら、#463/#464 は merge しません。
-  - **N-3 の経路の宣言と伏せ字**（ADR-14 §7.3）: `X-Mindwire-N3-Route: v1` の無い naysayer の要求は codex を試さず、`unrouted`（Gemini）が答えます。その行は `backend='gemini'`・`answered_by='gemini'` で、ジャーナルに `n3_route_unrouted`（`n3_route=absent`）が出ます。ヘッダを付ける mindwire（#463）が deploy されるまでは、すべての naysayer の要求がこの形になります。C-5 で `answered_by='codex'` の行が出ない場合は、まずこれを疑います。
-  - 伏せ字をした行は `redactions` に `kind:count,…`（数だけ）が入ります。
-
-  ```sh
-  sqlite3 data/costs.db "SELECT id, backend, answered_by, redactions FROM request_costs ORDER BY id DESC LIMIT 5;"
+  sqlite3 data/costs.db "SELECT id, backend, answered_by, tokens_input, tokens_output, redactions FROM request_costs ORDER BY id DESC LIMIT 5;"
   journalctl -u lexora --since '-15 min' | grep -E 'n3_route_unrouted|ingress_redaction_failed'
   ```
 
-### ロールバック
+  - **当時の挙動（`fallback` mode の設定）**: `X-Mindwire-N3-Route: v1` の無い naysayer の要求は codex を試さず `unrouted`（Gemini）が答え、その行は `backend='gemini'`・`answered_by='gemini'`、ジャーナルに `n3_route_unrouted`（`n3_route=absent`）が出ました（S-2）。ヘッダを付ける mindwire（#463）を先に deploy したので、Lexora の deploy の時点で mindwire はすでにヘッダを付けていました。
+    - 2026-11-10 以降は `unrouted` を置かず（S-2 は任意化）、ヘッダの有無にかかわらず codex に送ります。
+  - 伏せ字をした行は `redactions` に `kind:count,…`（数だけ）が入ります。
 
-- C-2′ で 1 分以内に `pass` が取れない、C-3 で `mode: codex` かつ `codex_disabled_reason: null` にならない、または C-5 で `failure_hold` を繰り返す場合は、#463/#464 は merge しません。
-- Lexora を直前の deploy（`dbe1170`、shadow）に戻します。戻せば旧 mindwire と組み合わせて元どおり動きます。
+### ロールバック（mindwire の #463/#464 が merge 済みである前提）
+
+mindwire の #463/#464 はすでに main に merge され、deploy されています。旧版にあった「#463/#464 を merge せずに Lexora を `dbe1170`（shadow）に戻す」ロールバックは、もう取れません（`dbe1170` と組み合わせる前提だった旧 mindwire は残っていません）。いまのロールバックは次の 2 つで、**どちらを取るかで手順がまったく違います**。
+
+#### A. 今のリリース（`codex_only`）の中でのロールバック
+
+- codex が答えられないだけなら、ロールバックは要りません。下の 11 の手順と、上の 2・3・8 で codex を開けます（`codex_only` では、その間 naysayer は断られます）。
+- 新しいリリースが原因なら、直前の `codex_only` のリリースに戻します。いつもの deploy と同じ経路で、deploy runner が下の 11 の `pre_restart.sh` / `post_restart.sh` を実行します。mindwire 側の作業はありません。
+
+#### B. Gemini に戻す（`fallback` mode を復元する）
+
+`codex_only` は `fallback` を受け付けないので、**`mode` の値を `fallback` に変えるだけでは戻りません**（`fallback` を書かずに `mode: fallback` にすると、`fallback_floor_s` の既定 600 が足されて時間の予算を超え、起動しません）。Gemini を naysayer の経路に戻すのは 2026-11-10 の Takahito 判断を覆すことなので、その判断を取ってから行います。
+
+1. git 履歴から設定を戻します。`config/lexora_config.yaml` の、lexora#110（commit `c5bf320`）より前の版（例: `git show c5bf320^:config/lexora_config.yaml`）にある次をすべて戻します。
+   - `backends.gemini`（`type: "gemini"`、`api_key_env: "GEMINI_API_KEY"`、`paid_key_acknowledged: true` ほか）。
+   - `naysayer-codex.fallback` の `fallback: "gemini"` と `mode: "fallback"`。
+   - 時間の予算: `slot_wait_s + codex_timeout_s + fallback_floor_s <= caller_budget_s`（900）を満たす値（当時は 150 + 150 + 600）。今の 600 + 270 のままでは起動しません。
+   - `naysayer` ティアの `model`（当時は `gemini-3.1-pro-preview`。fallback 先の解決 `resolve_model("naysayer")` に使う）。`unrouted: "gemini"` と `naysayer-gemini` ティアは、要るかどうかをそのときに決めます（S-2 は任意化済み）。
+2. `GEMINI_API_KEY` がサービスの `EnvironmentFile` に残っていることを確かめます（`config/lexora_config.yaml` のコメントでは `/etc/spirrow-lexora.env` に残置。パスは `systemctl cat lexora` で確かめる）。
+3. 上の 6 の通知の設定（`LEXORA_FALLBACK_WEBHOOK_URL`）が残っていることを確かめます。
+4. mindwire 側が `answered_by='gemini-fallback'` の行を受け入れる版であることを確かめます。#463/#464 は `{codex, gemini-fallback}` を受け入れる版でしたが、2026-11-10 の変更（ADR-14 §10）で mindwire 側の期待値が変わっていれば、その戻しも要ります。
+5. リリース PR を出し、いつもの経路で deploy します（下の 11 の復帰はそのまま動きます）。deploy の後、status の `mode` と `codex_disabled_reason` が想定どおりであることを確かめます。
 
 ### 実際に枠が切れるまで確かめられないこと
 
-- 枠切れのときの stderr の文言と、リセット時刻の書式です。文言が想定と違っても、その失敗は `CodexFailed` として Gemini に落ち、通知は `reason=codex_failed` で届きます（上の 6 の 4）。そうなったら、ログの snippet をもとに `_QUOTA_RE` と `parse_reset_at` を直す別スレッドを切ります。
+- 枠切れのときの stderr の文言と、リセット時刻の書式です。文言が想定と違っても、その失敗は `CodexFailed` として扱われ、通知は `reason=codex_failed` で届きます（上の 6 の 4。当時は Gemini に落ち、`codex_only` では断られる）。そうなったら、ログの snippet をもとに `_QUOTA_RE` と `parse_reset_at` を直す別スレッドを切ります。
 
 ## 10. ツールを全部無効にする設定とモデルカタログ（2026-10-13 実測、codex-cli 0.160.0）
 
