@@ -91,6 +91,37 @@ control run: a nested ``exec_command`` emits ``item.started`` and
 ``item.completed`` of type ``command_execution`` on ``--json``, and its
 result comes back as a ``custom_tool_call_output``.
 
+**V-1/protected_override:<key> (static, T-incident-codex-web-search-2026-11-10
+D-2).** Every protected tool override (``PROTECTED_TOOL_OVERRIDES``: the
+``features.*`` flags and the hosted-tool settings such as
+``web_search="disabled"``) appears in ``cli_overrides`` exactly once with
+exactly its value; a duplicate, another value, a missing key, or a table
+override of a parent key fails (``protected_override_not_pinned``).
+
+**What a pass guarantees, by ``v2_provider_mode`` (recorded in ``note``, D-3).**
+
+* ``custom_provider_mock`` -- the mode this code runs. Guaranteed: the V-1
+  static check above for the KNOWN protected keys, and that the first request
+  the CLI sent to a custom provider (``lexora_verify``) pointed at the
+  loopback mock declared no tool. NOT guaranteed: hosted tools the CLI
+  attaches only for the built-in ``openai`` provider are invisible here --
+  violation 1191's ``web_search`` (2026-11-10) was exactly that kind.
+* ``builtin_openai_loopback`` -- the D-1 design (built-in ``openai`` provider
+  id, base URL on the loopback mock, production argv generator and the
+  production ``config.toml``; differences limited to the base URL, an
+  isolated ``CODEX_HOME`` + dummy key, and the ``web_search`` override in the
+  acceptance run). Not implemented: it is adopted only after it is measured
+  that dropping ``web_search="disabled"`` makes ``web_search`` appear in the
+  mock's first request. Even then it would not cover state in the production
+  ``CODEX_HOME`` other than ``config.toml``, hosted tools the CLI attaches
+  only after a server exchange, or hosted tools a later CLI adds.
+
+In both modes the runtime latch (fail-closed, ``classify_events``) is the last
+line of defence; a genuine violation is cleared by hand, never by
+``codex_restore`` (RUNBOOK §3 / §11). A ``-c`` override takes precedence over
+the same key in ``CODEX_HOME/config.toml``. Re-run ``verify_codex`` after a CLI
+upgrade, and re-check the protected list against the new CLI's settings.
+
 Wire-format details (tool names, event shapes, refusal wording) are ASSUMED
 until measured after login; the go/no-go conditions in msg-294 decide what
 happens if they turn out not to exist.
@@ -115,6 +146,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lexora.backends import codex as codex_backend
 from lexora.backends.codex import (
     _TOOL_ITEM_TYPES,
     _TOOL_MSG_PREFIXES,
@@ -124,6 +156,8 @@ from lexora.backends.codex import (
     EventFindings,
     _error_text,
     is_terminal_event,
+    override_key,
+    protected_override_problems,
     verify_provider_overrides,
 )
 from lexora.backends.codex_verification import (
@@ -132,6 +166,15 @@ from lexora.backends.codex_verification import (
     RunRecord,
     ViolationRecord,
 )
+
+#: How V-2/3 was measured, recorded in every verification's ``note``
+#: (T-incident-codex-web-search-2026-11-10 D-3). ``custom_provider_mock``: the
+#: CLI talks to a custom provider (``lexora_verify``) pointed at the loopback
+#: mock, so hosted tools the CLI attaches only for the built-in ``openai``
+#: provider (``web_search``, violation 1191) never reach the mock and V-2/3
+#: cannot see them. ``builtin_openai_loopback`` is reserved for the measured
+#: D-1 mode (built-in provider id, loopback base URL); it is not implemented.
+V2_PROVIDER_MODE = "custom_provider_mock"
 
 #: Timeout for the V-2' ``codex exec`` run (the mock answers instantly).
 V2_TIMEOUT_S = 120.0
@@ -240,6 +283,21 @@ def evaluate_v1(
     checks.append(Check("V-1/canary_env_absent", ended and canary_env not in env_names))
     leaked_keys = sorted(n for n in env_names if n.upper().endswith("_API_KEY"))
     checks.append(Check("V-1/api_keys_absent", ended and not leaked_keys, ",".join(leaked_keys)))
+    return checks
+
+
+def check_protected_overrides(cli_overrides: Sequence[str]) -> list[Check]:
+    """``V-1/protected_override:<key>`` per protected tool override: the key
+    appears exactly once in ``cli_overrides`` with exactly the protected value
+    (``protected_override_problems``). Static -- no CLI is run. It shows the
+    effective ``-c`` value of each KNOWN key is pinned; it shows nothing about
+    a hosted tool under a setting the list does not know."""
+    problems = protected_override_problems(cli_overrides)
+    checks = []
+    for protected in codex_backend.PROTECTED_TOOL_OVERRIDES:
+        key = override_key(protected)
+        mine = [p.split(": ", 1)[1] for p in problems if p.split(": ", 1)[0] == key]
+        checks.append(Check(f"V-1/protected_override:{key}", not mine, "; ".join(mine)))
     return checks
 
 
@@ -946,6 +1004,7 @@ async def verify(
             backend.name, "fail", "unknown", backend.config_hash(), [c.as_dict() for c in checks], note="cli_version"
         )
         return "fail", checks
+    checks.extend(check_protected_overrides(backend.cli_overrides))
     checks.extend(await run_v1(backend, extra_hidden))
     control_checks, tools, isolation = await run_v2_control(backend, wire_api)
     checks.extend(control_checks)
@@ -972,13 +1031,22 @@ async def verify(
         reasons.append("control_tool_not_executed")
     if "V-2'/tool_stderr_isolated" in failed:
         reasons.append("tool_stderr_not_isolated")
+    if any(name.startswith("V-1/protected_override:") for name in failed):
+        reasons.append("protected_override_not_pinned")
     backend.state_store.record_verification(
         backend.name,
         result,
         version_before,
         backend.config_hash(),
         [c.as_dict() for c in checks],
-        note=json.dumps({"wire_api": wire_api, "fail_reasons": reasons, "failed_checks": failed}),
+        note=json.dumps(
+            {
+                "wire_api": wire_api,
+                "v2_provider_mode": V2_PROVIDER_MODE,
+                "fail_reasons": reasons,
+                "failed_checks": failed,
+            }
+        ),
     )
     return result, checks
 

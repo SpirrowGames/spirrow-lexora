@@ -51,6 +51,8 @@ def v1_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def flag_registered(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(codex_mod, "TOOL_DISABLE_OVERRIDE_KEYS", frozenset({FLAG}))
+    # The stand-in flag is also the one protected override the fake CLI's config carries.
+    monkeypatch.setattr(codex_mod, "PROTECTED_TOOL_OVERRIDES", (f"{FLAG}=true",))
 
 
 def v2_backend(tmp_path: Path, scenario: str) -> CodexBackend:
@@ -212,6 +214,43 @@ def test_provider_override_is_not_hashed(tmp_path: Path) -> None:
     before = backend.config_hash()
     backend._build_exec_argv("m", "/w/l", vc.provider_overrides("http://127.0.0.1:1/v1", "responses"))
     assert backend.config_hash() == before
+
+
+# --------------------------------------------------------------------------
+# Protected tool overrides (V-1 static) and the recorded V-2 provider mode
+# --------------------------------------------------------------------------
+
+
+class TestProtectedOverrides:
+    """D-2 (T-incident-codex-web-search-2026-11-10): V-1 refuses a config whose
+    protected tool overrides are missing, duplicated or set to another value,
+    and every record names how V-2/3 was measured (D-3)."""
+
+    def test_real_protected_overrides_pass_statically(self) -> None:
+        checks = vc.check_protected_overrides(list(codex_mod.PROTECTED_TOOL_OVERRIDES))
+        assert checks and all(c.ok for c in checks)
+        assert "V-1/protected_override:web_search" in _names(checks, True)
+
+    def test_disabled_and_live_web_search_fail_with_the_key_named(self) -> None:
+        overrides = [*codex_mod.PROTECTED_TOOL_OVERRIDES, 'web_search="live"']
+        checks = vc.check_protected_overrides(overrides)
+        assert _names(checks, False) == {"V-1/protected_override:web_search"}
+        assert [c.detail for c in checks if not c.ok] == ["appears 2 times"]
+
+    @pytest.mark.usefixtures("v1_ok", "flag_registered")
+    async def test_unpinned_protected_override_fails_verification(self, tmp_path: Path) -> None:
+        backend = make_backend(tmp_path, "contained", cli_overrides=[f"{FLAG}=true", f"{FLAG}=false"])
+        result, checks = await vc.verify(backend)
+        assert result == "fail"
+        assert f"V-1/protected_override:{FLAG}" in _names(checks, False)
+        assert "protected_override_not_pinned" in _note(backend)["fail_reasons"]
+
+    @pytest.mark.usefixtures("v1_ok", "flag_registered")
+    async def test_record_names_the_v2_provider_mode(self, tmp_path: Path) -> None:
+        backend = v2_backend(tmp_path, "contained")
+        result, _ = await vc.verify(backend)
+        assert result == "pass"
+        assert _note(backend)["v2_provider_mode"] == "custom_provider_mock"
 
 
 # --------------------------------------------------------------------------

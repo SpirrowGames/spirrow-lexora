@@ -279,7 +279,10 @@ naysayer の codex はツール無しで動かします（Takahito の方針、s
 ### 設定の中身
 
 - `config/lexora_config.yaml` の `codex.cli_overrides` に、フラグ（`features.*=false` と `tools.experimental_request_user_input.enabled=false`）と `model_catalog_json` を入れています。
-  - 何がどのツールを消すかの根拠は `backends/codex.py` の `TOOL_DISABLE_FEATURE_OVERRIDES` と `CATALOG_KEYS_*` にあります。
+  - 何がどのツールを消すかの根拠は `backends/codex.py` の `TOOL_DISABLE_FEATURE_OVERRIDES`・`HOSTED_TOOL_OVERRIDES`・`CATALOG_KEYS_*` にあります。
+  - `web_search="disabled"` は `features.*` とは別の設定（hosted tool の `web_search` のモード）です。`HOSTED_TOOL_OVERRIDES` に分けて置いています（2026-11-10 violation 1191）。
+  - 保護するキー（`PROTECTED_TOOL_OVERRIDES` = feature 側 + hosted 側）は、`cli_overrides` に**ちょうど 1 回**、**期待値どおり**に書きます。同じキーを 2 回書く（値が同じでも）、別の値にする、書かない、親のキーを表で上書きする（`features={...}` など）と、`verify_codex` の `V-1/protected_override:<key>` が fail します（`protected_override_not_pinned`）。CLI の優先順位をまねる代わりに、重複を拒否して実効値を 1 つに決めています。
+  - 同じキーを `codex_home` の `config.toml` に書いても、`-c` が優先されます。
   - フラグだけでは、code mode の `exec`、`apply_patch`、`collaboration.*`（`spawn_agent` など）、`clock.*` が残ります。そこで、pin したモデルの項目からそれらを外したモデルカタログを `model_catalog_json` で渡します。
   - `features.apps=false` が無いと、ログイン済みの `codex_home` では ChatGPT のコネクタ（MCP）のツールが付きます。空の `codex_home` で試すと出ないので注意してください。
 - これらのキーは `TOOL_DISABLE_OVERRIDE_KEYS` と同じ集合です（`tests/test_shipped_config.py` が検査します）。V-2′-control はこのキーをすべて外して走るので、control は CLI の既定（code mode の `exec_command`）でツールを実行し、本番の設定では宣言されるツールがゼロであることを `V-2/3_no_tools_declared` が確かめます。
@@ -327,6 +330,25 @@ magickit の deploy runner は、spirrow-lexora の再起動の前後で次の 2
    - 解除したとき、またはサービスが `verification_missing` / `verification_stale` を返すとき（設定やカタログが変わった deploy）は、`verify_codex` と同じ検査を実行して記録します。`fail` なら exit 4。
    - 最後に、動いているサービスの `/v1/naysayer/status` を読みます。`codex_disabled_reason` が `null` でなければ exit 5 で、理由を出力します（`quota_hold` や `data_controls_unverified` は deploy では直せません。上の 2 と 8）。
    - **0 以外で終わると、runner はその deploy を `failed` として記録します**（サービスは新しいコードで動いています。残っているのは codex の復帰だけで、`error` に理由が書かれます）。
+
+### `verify_codex` が保証する範囲と、その先（2026-11-10 violation 1191）
+
+`verify_codex` は、V-2/3 をどの方式で測ったかを記録の `note` の `v2_provider_mode` に残します。保証の範囲は方式で変わります。
+
+**`custom_provider_mock`（今のコードが走らせる方式）**
+- 保証すること:
+  - 既知の保護対象キーに対する V-1 の静的検査（上の 10）
+  - custom provider（`lexora_verify`）に向けた最初の要求に、tool の宣言がないこと
+- 保証しないこと: **本番の provider（built-in の `openai`）でだけ付く hosted tool は、verify では見えません。** 今回の `web_search` が、まさにこの種類です。
+
+**`builtin_openai_loopback`（設計済み・未採用）**
+- built-in の `openai` provider id のまま接続先だけを loopback の mock に向け、本番と同じ argv 生成関数・同じ `config.toml` で測る方式です。`web_search="disabled"` を外すと mock の要求に `web_search` が出ることを実測で確かめるまでは採りません。
+- 採ったとしても保証しないこと: `config.toml` 以外の本番 `codex_home` の状態がもたらす tool、サーバーとのやりとりを受けてはじめて付く hosted tool、将来の CLI で増える hosted tool。
+
+**どちらの方式でも**、その先は runtime の latch（fail-closed）が最後の防御線です。
+- 本物のツール使用の latch は、上の 3 の手順で人が解除します。`codex_restore` の対象にはしません。
+- 例: 2026-11-10 02:55Z、codex-cli 0.160.0 が本番で `web_search` の item を出し、latch が codex を閉じました（violation 1191）。`codex_only` なので naysayer は 03:05Z に手で解除するまで止まりました。恒久対策は `web_search="disabled"`（lexora#113）です。
+- **CLI を上げたら**、`codex_catalog` → `verify_codex` に加えて、新しい CLI の hosted tool の設定が `HOSTED_TOOL_OVERRIDES` で足りているかを確かめ直します。
 
 手で確かめるとき（何も書き込まない）:
 
