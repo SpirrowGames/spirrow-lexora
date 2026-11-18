@@ -24,7 +24,9 @@ from lexora.backends.codex import (
     CATALOG_KEYS_REMOVED,
     CATALOG_KEYS_SET,
     CODEX_MODEL_PIN,
+    HOSTED_TOOL_OVERRIDES,
     MODEL_CATALOG_OVERRIDE_KEY,
+    PROTECTED_TOOL_OVERRIDES,
     TOOL_DISABLE_FEATURE_OVERRIDES,
     TOOL_DISABLE_OVERRIDE_KEYS,
     CodexBackend,
@@ -33,6 +35,7 @@ from lexora.backends.codex import (
     model_catalog_path,
     override_key,
     override_value,
+    protected_override_problems,
 )
 from lexora.backends.codex_verification import CodexStateStore
 from lexora.tools import codex_catalog as cc
@@ -65,22 +68,101 @@ def _bundled(**changes: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def test_disable_keys_are_the_catalog_override_and_every_flag() -> None:
-    assert TOOL_DISABLE_OVERRIDE_KEYS == {MODEL_CATALOG_OVERRIDE_KEY} | {override_key(o) for o in TOOL_DISABLE_FEATURE_OVERRIDES}
-    # Every override turns something off: the flags are ``false``; ``web_search`` (a mode, not
-    # a flag) is ``disabled`` (2026-11-10, violation 1191).
-    off = {o: override_value(o) for o in TOOL_DISABLE_FEATURE_OVERRIDES}
-    assert {o: v for o, v in off.items() if override_key(o) != "web_search"} == {
-        o: "false" for o in off if override_key(o) != "web_search"
+def test_disable_keys_are_the_catalog_override_and_every_protected_override() -> None:
+    assert TOOL_DISABLE_OVERRIDE_KEYS == {MODEL_CATALOG_OVERRIDE_KEY} | {
+        override_key(o) for o in (*TOOL_DISABLE_FEATURE_OVERRIDES, *HOSTED_TOOL_OVERRIDES)
     }
-    assert [v for o, v in off.items() if override_key(o) == "web_search"] == ["disabled"]
+    assert PROTECTED_TOOL_OVERRIDES == (*TOOL_DISABLE_FEATURE_OVERRIDES, *HOSTED_TOOL_OVERRIDES)
+
+
+def test_feature_overrides_are_all_false_flags() -> None:
+    assert all(override_value(o) == "false" for o in TOOL_DISABLE_FEATURE_OVERRIDES)
+    assert not {override_key(o) for o in TOOL_DISABLE_FEATURE_OVERRIDES} & {
+        override_key(o) for o in HOSTED_TOOL_OVERRIDES
+    }
 
 
 def test_hosted_web_search_is_turned_off() -> None:
     """Violation 1191 (2026-11-10): codex used the hosted ``web_search`` tool in production,
-    which the mock-based verification cannot surface. It is off by CLI override."""
-    assert 'web_search="disabled"' in TOOL_DISABLE_FEATURE_OVERRIDES
+    which the mock-based verification cannot surface. It is off by CLI override, kept
+    apart from the ``features.*`` flags (a separate setting family)."""
+    assert HOSTED_TOOL_OVERRIDES == ('web_search="disabled"',)
     assert "web_search" in TOOL_DISABLE_OVERRIDE_KEYS
+
+
+# --------------------------------------------------------------------------
+# protected_override_problems (D-2: exactly once, exact value)
+# --------------------------------------------------------------------------
+
+
+def test_protected_overrides_pass_when_each_key_appears_once_with_its_value() -> None:
+    overrides = ['model_catalog_json="/srv/codex/cat.json"', *PROTECTED_TOOL_OVERRIDES, "features.other=true"]
+    assert protected_override_problems(overrides) == []
+
+
+def test_web_search_disabled_and_live_together_is_refused() -> None:
+    """Containment would pass this; the later ``live`` would win in the CLI."""
+    problems = protected_override_problems([*PROTECTED_TOOL_OVERRIDES, 'web_search="live"'])
+    assert problems == ["web_search: appears 2 times"]
+
+
+def test_web_search_live_alone_is_refused() -> None:
+    overrides = [*TOOL_DISABLE_FEATURE_OVERRIDES, 'web_search="live"']
+    assert protected_override_problems(overrides) == ["web_search: value 'live', expected 'disabled'"]
+
+
+def test_missing_protected_key_is_refused() -> None:
+    assert protected_override_problems(list(TOOL_DISABLE_FEATURE_OVERRIDES)) == ["web_search: missing"]
+
+
+def test_duplicated_feature_key_set_true_is_refused() -> None:
+    overrides = [*PROTECTED_TOOL_OVERRIDES, "features.shell_tool=true"]
+    assert protected_override_problems(overrides) == ["features.shell_tool: appears 2 times"]
+
+
+def test_duplicate_with_the_same_value_is_still_refused() -> None:
+    overrides = [*PROTECTED_TOOL_OVERRIDES, "features.apps=false"]
+    assert protected_override_problems(overrides) == ["features.apps: appears 2 times"]
+
+
+def test_surrounding_whitespace_still_counts_as_the_same_key() -> None:
+    overrides = [*PROTECTED_TOOL_OVERRIDES, " web_search = 'live'"]
+    assert protected_override_problems(overrides) == ["web_search: appears 2 times"]
+
+
+def test_differently_cased_key_does_not_count_as_the_protected_entry() -> None:
+    """PR-gate on lexora#117: TOML keys are case-sensitive, so
+    ``Web_Search="disabled"`` does not set ``web_search`` and must not pass."""
+    overrides = [*TOOL_DISABLE_FEATURE_OVERRIDES, 'Web_Search="disabled"']
+    assert protected_override_problems(overrides) == [
+        "web_search: alternative spelling 'Web_Search' refused (keys are case-sensitive)",
+        "web_search: missing",
+    ]
+
+
+def test_differently_cased_extra_entry_is_refused_too() -> None:
+    overrides = [*PROTECTED_TOOL_OVERRIDES, " Web_Search = 'live'"]
+    assert protected_override_problems(overrides) == [
+        "web_search: alternative spelling 'Web_Search' refused (keys are case-sensitive)",
+    ]
+
+
+def test_differently_cased_feature_key_is_refused() -> None:
+    overrides = [
+        *(o for o in PROTECTED_TOOL_OVERRIDES if not o.startswith("features.shell_tool=")),
+        "features.Shell_Tool=false",
+    ]
+    assert protected_override_problems(overrides) == [
+        "features.shell_tool: alternative spelling 'features.Shell_Tool' refused (keys are case-sensitive)",
+        "features.shell_tool: missing",
+    ]
+
+
+def test_table_override_of_a_protected_key_is_refused() -> None:
+    overrides = [*PROTECTED_TOOL_OVERRIDES, "features={shell_tool=true}"]
+    problems = protected_override_problems(overrides)
+    assert "features.shell_tool: overridden as a table by 'features'" in problems
+    assert all(p.endswith("by 'features'") for p in problems)
 
 
 def test_control_clone_drops_the_catalog_and_the_flags(tmp_path: Path) -> None:
