@@ -629,11 +629,14 @@ class GeminiBackend(Backend):
                     # would multiply the bill on any stream that reports more
                     # than once.
                     #
-                    # PER FIELD, and only when the key is present: an event
-                    # that carries no `usageMetadata`, or carries only one of
-                    # the two counts, must leave the other side standing. An
-                    # unconditional `.get(key, 0)` would let a later partial
-                    # event silently zero a count that had already arrived.
+                    # TWO GUARDS, one case each. An event that carries no
+                    # `usageMetadata` at all is skipped by the block-level
+                    # `isinstance(metadata, dict)` check below; an event that
+                    # carries only one of the two counts is handled PER FIELD,
+                    # assigning a count only when its key is present, so the
+                    # other side stays standing. An unconditional
+                    # `.get(key, 0)` would let such a partial event silently
+                    # zero a count that had already arrived.
                     # That is the weakest premise this can rest on -- it holds
                     # whether the upstream reports usage on every event or only
                     # on the last one, which is the part of the wire shape this
@@ -641,12 +644,14 @@ class GeminiBackend(Backend):
                     # `tests/backends/test_gemini_stream_usage.py`).
                     #
                     # The field names are the same two `_to_openai_response`
-                    # reads. They are not factored into a shared helper: the
-                    # non-streaming path sees one whole response, where a
-                    # missing key genuinely means zero, so the presence check
-                    # above would be wrong there. Two different propositions,
-                    # so two reads -- and a case in that test file drives both
-                    # sites off one fixture so the names cannot drift apart.
+                    # reads. They are read in two places rather than through a
+                    # shared helper: the non-streaming path sees one whole
+                    # response, where a missing key means zero, and this path
+                    # needs "absent" kept apart from zero. A helper could
+                    # carry both (returning `None` for absent), so this is a
+                    # choice, not a necessity; the risk it leaves is the two
+                    # sites' names drifting apart, and a case in that test file
+                    # fences it by driving both sites off one fixture.
                     if usage_sink is not None:
                         metadata = event.get("usageMetadata")
                         if isinstance(metadata, dict):

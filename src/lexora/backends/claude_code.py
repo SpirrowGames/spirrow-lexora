@@ -483,7 +483,7 @@ class ClaudeCodeBackend(Backend):
                     # also carry a `message.usage` of their own. On a
                     # single-turn call they agree; on a multi-turn one there
                     # is an assistant event per turn and only this event
-                    # carries the invocation's total, so filling from those
+                    # carries the total across turns, so filling from those
                     # would be the second summation this must not have.
                     #
                     # ASSIGNED, never accumulated: a second `result` event
