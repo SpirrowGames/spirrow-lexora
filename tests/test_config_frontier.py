@@ -206,10 +206,12 @@ class TestFrontierModelEnvOverride:
     def test_no_env_leaves_shipped_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("LEXORA_FRONTIER_MODEL", raising=False)
         settings = create_settings(REPO_CONFIG)
-        # Whatever the YAML ships; ensure it is at least Fable-shaped and
-        # the tier model resolves through the backend's first model.
+        # Pinned to the shipped default (T-frontier-tier-to-fable-5-2,
+        # 2026-11-20). A loose "is it Fable-shaped" check would stay green if
+        # the switch were reverted to `claude-fable-5`, so the exact ID is
+        # what this asserts.
         first_model = settings.routing.backends["frontier"].models[0].name
-        assert "fable" in first_model.lower() or "claude" in first_model.lower()
+        assert first_model == "claude-fable-5-2"
 
     def test_env_override_reaches_router_resolution(
         self, monkeypatch: pytest.MonkeyPatch
@@ -300,8 +302,8 @@ class TestFrontierPricingRealAndReconcilable:
         )
         rows = tracker.get_recent(limit=1)
         assert rows[0]["pricing_known"] == 1
-        # 100 in @ $10/MTok + 50 out @ $50/MTok
-        assert rows[0]["cost_usd"] == pytest.approx(0.0035)
+        # claude-fable-5-2: 100 in @ $8/MTok + 50 out @ $40/MTok
+        assert rows[0]["cost_usd"] == pytest.approx(0.0028)
 
         report = tracker.get_costs(period="all")
         assert default_model not in report["unpriced_models"]

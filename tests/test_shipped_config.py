@@ -212,7 +212,7 @@ async def test_shipped_listing_is_the_tiers_plus_the_declared_concrete_names() -
         "claude-code-opus",
         "claude-code-sonnet",
         "claude-sonnet-4-20250514",
-        "claude-fable-5",
+        "claude-fable-5-2",
         "light",
         "medium",
         "heavy",
