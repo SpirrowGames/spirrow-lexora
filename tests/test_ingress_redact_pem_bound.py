@@ -168,9 +168,8 @@ def test_6b_hunk_header_begin_opens_both_sides_to_their_end() -> None:
 
 # -- test 7 ---------------------------------------------------------------------
 def test_7_extent_counts_lines_and_characters() -> None:
-    # The closed block comes first. A begin quoted *before* a later real
-    # block pairs with that block's end: closed-block pairing is not part of
-    # PR-1 (reported as a residual for PR-2).
+    # The closed block comes first. The reverse order (a begin quoted before
+    # a later real block) is F-8rev in test_ingress_redact_pem_pairing.py.
     text = "\n".join([BEGIN, *ROWS, END, f"see {BEGIN}", *PROSE, "password = hunter2hunter2"])
     out, r = _run(text)
     pem_chars = len(BEGIN) + len(BEGIN) + sum(len(row) for row in ROWS) + len(END)

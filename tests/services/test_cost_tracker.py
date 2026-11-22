@@ -316,6 +316,8 @@ class TestSubscriptionBackendIsNotPriced:
             "claude-opus-4-20250514": 15.0 + 75.0,
             "claude-fable-5": 10.0 + 50.0,
             "claude-opus-5": 5.0 + 25.0,
+            "claude-fable-5-1": 10.0 + 50.0,
+            "claude-fable-5-2": 8.0 + 40.0,
             "gpt-4": 30.0 + 60.0,
             "gemini-2.5-flash": 0.15 + 0.60,
             "Qwen3-32B": 0.0,

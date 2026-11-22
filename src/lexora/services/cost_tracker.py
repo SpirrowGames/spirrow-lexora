@@ -70,6 +70,16 @@ DEFAULT_PRICING: dict[str, ModelPricing] = {
     # issues. If any of them is ever used, this table starts under-reporting
     # and the schema — not just the numbers — has to change.
     "claude-fable-5": {"input": 10.0, "output": 50.0},
+    # Fable 5.1 / 5.2. Added 2026-11-20 (T-frontier-tier-to-fable-5-2), base
+    # rates read that day from the same pricing page ("Claude Fable 5.2 ...
+    # $8 / MTok, $40 / MTok"; "Claude Fable 5.1 $10 / MTok, $50 / MTok") and
+    # restated in the Fable 5.2 migration guide ("$8 USD per million input
+    # tokens and $40 USD per million output tokens, compared with $10 USD and
+    # $50 USD on Claude Fable 5.1"). 5.2 is the frontier default; 5.1 is
+    # listed so an env roll-back (LEXORA_FRONTIER_MODEL=claude-fable-5-1)
+    # does not produce pricing_known=0 rows. Same base-rate caveats as above.
+    "claude-fable-5-1": {"input": 10.0, "output": 50.0},
+    "claude-fable-5-2": {"input": 8.0, "output": 40.0},
     "claude-opus-5": {"input": 5.0, "output": 25.0},
     # Gemini 3.1 Pro (the naysayer tier). Added 2026-09-23
     # (T-ledger-gemini-thinking-tokens D-2, msg-335 / msg-341).

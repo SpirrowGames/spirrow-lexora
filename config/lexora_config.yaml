@@ -321,18 +321,25 @@ routing:
       health_check: false
       default_max_tokens: 8000
       error_passthrough: true
-      # 2026-09-01 に placeholder を実 ID へ差し替え済み。旧値
-      # `claude-fable-5-20260101` は日付サフィックス付きで、Anthropic の
-      # 実 ID (日付サフィックス無し) とは別物だった。同じ ID を
-      # `src/lexora/services/cost_tracker.py` の DEFAULT_PRICING にも
-      # 実価格つきで登録済み ($10 / $50 per MTok, base rate) ∴ frontier の
-      # 課金行は pricing_known=1 で台帳に載る。
+      # 2026-11-20 に `claude-fable-5` → `claude-fable-5-2` へ切替
+      # (T-frontier-tier-to-fable-5-2)。5.2 も日付サフィックス無しの実 ID。
+      # 同じ ID を `src/lexora/services/cost_tracker.py` の DEFAULT_PRICING に
+      # 実価格つきで登録済み ($8 / $40 per MTok, base rate) ∴ frontier の
+      # 課金行は pricing_known=1 で台帳に載る。env で戻す先になりうる
+      # `claude-fable-5-1` / `claude-fable-5` と、Opus 系の `claude-opus-5` も
+      # 価格表に残してあるので、LEXORA_FRONTIER_MODEL を一行書いて差し替えても
+      # pricing_known=0 にはならない。
       # 片方だけ直すと「実在する ID に価格が無い」か「価格はあるが ID が
       # 実在しない」のどちらかになるので、ID と価格は必ず同じ変更で動かす。
+      #
+      # 5.2 は adaptive thinking が常時 ON (無効化は 400)、effort 既定 high で、
+      # thinking は max_tokens に算入される。いずれも 5.1 と同じ (移行ガイド
+      # 2026-11-20 読了)。default_max_tokens: 8000 はこの切替では据え置き
+      # (msg-1145 Obj-1-4)。
       models:
-        - name: "claude-fable-5"
+        - name: "claude-fable-5-2"
           capabilities: ["code", "reasoning", "analysis", "general", "frontier"]
-          description: "Anthropic Claude Fable 5 (frontier ティア既定モデル、30 日保持・分類器あり)"
+          description: "Anthropic Claude Fable 5.2 (frontier ティア既定モデル、30 日保持・分類器あり)"
 
 # /v1/decide (判断専用エンドポイント) — Jev (TypeSafe) を本番で使う。
 # 2026-09-26 に null/off (出荷時既定) から jev/active へ切替。
