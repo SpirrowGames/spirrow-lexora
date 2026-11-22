@@ -18,6 +18,7 @@ from lexora.backends.base import (
     BackendUpstreamError,
     UsageSink,
 )
+from lexora.services.trace import current_trace_id
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -120,6 +121,43 @@ class AnthropicBackend(Backend):
     def _map_model(self, model: str) -> str:
         """Map requested model name to actual model name."""
         return self.model_mapping.get(model, model)
+
+    def _log_upstream_response(
+        self,
+        sent_model: str,
+        upstream_model: object,
+        block_types: list[str],
+    ) -> None:
+        """Record which model the upstream says answered (T-frontier-tier-to-fable-5-2).
+
+        The OpenAI-shaped response Lexora returns carries ``model`` = the ID
+        Lexora *sent* (``_to_openai_response`` / every stream chunk), so the
+        response alone cannot say what ran upstream. This line is the only
+        place that does: the upstream's own ``model`` field, read off the
+        non-streaming body or off ``message_start.message.model`` in a stream.
+
+        Kept on every Anthropic response, not only during a cut-over
+        (msg-1147 Obj-2-2): it is how a silent upstream alias/model change is
+        noticed later, and how the next env swap (e.g. to an Opus model) is
+        confirmed without a restart to flip a flag. Volume therefore scales
+        with all Anthropic-backend responses, one line each.
+
+        * ``upstream_model`` is logged as-is; absent or non-string -> ``None``.
+          A ``None`` is NOT a match: a confirmation that finds ``None`` (or no
+          line at all for its trace_id) has failed, not passed (msg-1145
+          Obj-1-2). No warning is raised here -- comparison is the reader's.
+        * ``block_types`` are the upstream content block *types* only (e.g.
+          ``["thinking", "text"]``). No text, no thinking body, no signature
+          is logged, so this adds no data-governance exposure.
+        """
+        logger.info(
+            "anthropic_upstream_response",
+            trace_id=current_trace_id(),
+            backend=self.name,
+            sent_model=sent_model,
+            upstream_model=upstream_model if isinstance(upstream_model, str) else None,
+            block_types=block_types,
+        )
 
     @staticmethod
     def _parse_retry_after(response: httpx.Response) -> float | None:
@@ -378,6 +416,16 @@ class AnthropicBackend(Backend):
             response = await self._client.post("/v1/messages", json=anthropic_req)
             self._handle_error_response(response)
             anthropic_resp = response.json()
+            upstream_blocks = anthropic_resp.get("content", [])
+            self._log_upstream_response(
+                sent_model=anthropic_req.get("model", model),
+                upstream_model=anthropic_resp.get("model"),
+                block_types=[
+                    str(b.get("type"))
+                    for b in (upstream_blocks if isinstance(upstream_blocks, list) else [])
+                    if isinstance(b, dict)
+                ],
+            )
             return self._to_openai_response(anthropic_resp, model)
 
         except httpx.ConnectError as e:
@@ -495,6 +543,13 @@ class AnthropicBackend(Backend):
 
                 chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
                 created = int(time.time())
+                # For `anthropic_upstream_response`: the upstream model is on
+                # `message_start.message.model`; block types arrive one per
+                # `content_block_start`. Logged once, at `message_stop` -- a
+                # stream that never reaches it leaves no line, which a
+                # confirmation reads as a failure (msg-1145 Obj-1-2).
+                upstream_model: object = None
+                block_types: list[str] = []
 
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
@@ -528,6 +583,9 @@ class AnthropicBackend(Backend):
                         # `tests/backends/test_anthropic_stream_usage.py`
                         # rather than asserted as known -- the same footing as
                         # the cache-field premise at `:235`.
+                        start_message = event_data.get("message", {})
+                        if isinstance(start_message, dict):
+                            upstream_model = start_message.get("model")
                         if usage_sink is not None:
                             start_usage = event_data.get("message", {}).get("usage", {})
                             if isinstance(start_usage, dict):
@@ -550,6 +608,15 @@ class AnthropicBackend(Backend):
                             ],
                         }
                         yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
+
+                    elif event_type == "content_block_start":
+                        # Recorded for the log only; nothing is yielded. A
+                        # `thinking` block's deltas (`thinking_delta`,
+                        # `signature_delta`) are dropped below exactly as
+                        # before -- only `text_delta` becomes a chunk.
+                        block = event_data.get("content_block", {})
+                        if isinstance(block, dict):
+                            block_types.append(str(block.get("type")))
 
                     elif event_type == "content_block_delta":
                         delta = event_data.get("delta", {})
@@ -608,6 +675,11 @@ class AnthropicBackend(Backend):
                         yield f"data: {json.dumps(openai_chunk)}\n\n".encode()
 
                     elif event_type == "message_stop":
+                        self._log_upstream_response(
+                            sent_model=anthropic_req.get("model", model),
+                            upstream_model=upstream_model,
+                            block_types=block_types,
+                        )
                         yield b"data: [DONE]\n\n"
 
         except httpx.ConnectError as e:
