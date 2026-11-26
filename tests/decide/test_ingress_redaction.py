@@ -10,6 +10,7 @@ nothing.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -163,12 +164,25 @@ class _RecordingJev:
         return ProviderResult(answers={n: {"noul": 0.9} for n in questions})
 
 
+_OPEN_APPS: list[Any] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_decision_logs() -> Iterator[None]:
+    """Close every app's DecisionLog so no ``decision-log`` worker thread
+    outlives its test (test_log_async counts them process-wide)."""
+    yield
+    while _OPEN_APPS:
+        _OPEN_APPS.pop().state.decision_log.close()
+
+
 def _app(monkeypatch: pytest.MonkeyPatch, fake: _RecordingJev, mode: str = "active"):  # type: ignore[no-untyped-def]
     monkeypatch.setenv("TYPESAFE_API_KEY", _JEV_KEY)
     app = create_app(
         settings=Settings(decision=DecisionSettings(primary="jev", mode=mode, log_path=":memory:"))  # type: ignore[arg-type]
     )
     app.state.decision_providers["jev"] = fake
+    _OPEN_APPS.append(app)
     return app
 
 
