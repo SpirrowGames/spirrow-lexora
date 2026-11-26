@@ -129,3 +129,62 @@ def test_redaction_impact_counts_without_values() -> None:
     out = io.StringIO()
     mod.render(stats, out)
     assert secret not in out.getvalue()
+
+
+def _load_impact() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "decide_redaction_impact", _SCRIPT.parent / "decide_redaction_impact.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_redaction_impact_malformed_input_never_echoed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR #121 gate objection: a rejected line is reported as ``line <n>: <category>``
+    only -- no ValidationError text (which carries ``input_value``), no traceback."""
+    import json
+
+    mod = _load_impact()
+    secret = "SENTINEL-sk-ant-api03-1234567890abcdefghij"
+    q = {"q": {"type": "noul", "instructions": "i"}}
+    lines = [
+        json.dumps({"policy": "p", "state": "plain", "questions": q}),
+        json.dumps({"policy": "p", "state": {"password": secret}, "questions": q}),
+        json.dumps({"policy": secret, "state": "s", "questions": {"q": {"type": secret}}}),
+        '{"policy": "p", "state": "' + secret,
+        json.dumps([secret]),
+    ]
+    path = tmp_path / "requests.jsonl"
+    path.write_bytes(
+        ("\n".join(lines) + "\n").encode("utf-8") + b"\xff\xfe" + secret.encode() + b"\n"
+    )
+    assert mod.main([str(path)]) == 1
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.err.splitlines() == [
+        "line 2: invalid_request",
+        "line 3: invalid_request",
+        "line 4: invalid_json",
+        "line 5: invalid_request",
+        "line 6: undecodable",
+    ]
+    assert "p\t1\t0\t0\t0\t-" in captured.out
+
+
+def test_redaction_impact_clean_input_exits_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    mod = _load_impact()
+    path = tmp_path / "requests.jsonl"
+    q = {"q": {"type": "noul", "instructions": "i"}}
+    path.write_text(json.dumps({"policy": "p", "state": "plain", "questions": q}) + "\n\n")
+    assert mod.main([str(path)]) == 0
+    assert capsys.readouterr().err == ""
