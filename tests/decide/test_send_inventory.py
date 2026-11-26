@@ -188,3 +188,23 @@ def test_redaction_impact_clean_input_exits_zero(
     path.write_text(json.dumps({"policy": "p", "state": "plain", "questions": q}) + "\n\n")
     assert mod.main([str(path)]) == 0
     assert capsys.readouterr().err == ""
+
+
+def test_redaction_impact_deeply_nested_line_is_rejected_and_processing_continues(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR #121 gate round 2: ``json.loads`` raises RecursionError (not ValueError)
+    on deep nesting; the line is rejected as ``invalid_json`` and later lines count."""
+    import json
+
+    mod = _load_impact()
+    q = {"q": {"type": "noul", "instructions": "i"}}
+    deep = "[" * 100000 + "0" + "]" * 100000
+    path = tmp_path / "requests.jsonl"
+    path.write_text(
+        deep + "\n" + json.dumps({"policy": "p", "state": "plain", "questions": q}) + "\n"
+    )
+    assert mod.main([str(path)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.splitlines() == ["line 1: invalid_json"]
+    assert "p\t1\t0\t0\t0\t-" in captured.out

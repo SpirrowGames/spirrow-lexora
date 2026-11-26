@@ -52,7 +52,7 @@ def _parse(line: str | bytes) -> DecideRequest | str:
         return ""
     try:
         data = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):  # deep nesting raises RecursionError
         return "invalid_json"
     try:
         return DecideRequest.model_validate(data)
