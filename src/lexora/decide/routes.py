@@ -26,6 +26,19 @@ is under ``asyncio.timeout``) plus one log write — the same bound an
 in-flight ``active`` request already imposes. ``JevProvider.aclose()``
 and ``DecisionLog.close()`` run only after every shadow task finished.
 There is no separate wait mechanism.
+
+Ingress redaction (T-decide-endpoint-bypasses-ingress-redaction, Bohr
+msg-1154 / msg-1156 / msg-1158, cleared by Einstein): before any provider
+is called, ``state`` and ``questions`` go through
+:func:`lexora.ingress.gate.redact_decide_payload` -- the tier path's D-1 /
+D-2 rules, every policy, every mode. The answering call and the shadow call
+send only the redacted values; NullProvider (which sends nothing) answers
+from the caller's own ``questions``. ``state_hash`` / ``questions_hash``
+stay hashes of the values the caller sent, so rows stay comparable with
+the rows written before. When a key matches a rule, or the scanner
+raises, nothing is sent: NullProvider answers exactly as on a Jev failure
+(msg-257 §3) and the row carries ``provider_error="ingress:<code>"``. No
+shadow call runs for such a request.
 """
 
 from __future__ import annotations
@@ -47,6 +60,7 @@ from lexora.decide.providers import (
     ProviderError,
     UpstreamMeta,
 )
+from lexora.ingress.gate import DecidePayload, KeyRedacted, redact_decide_payload
 from lexora.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -106,12 +120,16 @@ async def _run_shadow(
     decision_log: DecisionLog,
     shadow_of: str,
     body: DecideRequest,
+    payload: DecidePayload,
 ) -> None:
     """Call ``provider`` after the response and log it as a shadow row.
 
     Runs as a FastAPI background task under ``mode="shadow"`` (Bohr
     msg-583 v6 §2/§3, msg-585 v7 §2). Nothing here can change the
     response: it was already sent.
+
+    ``payload`` is what is sent (the redacted ``state`` / ``questions``);
+    ``body`` only feeds the hashes and the policy.
 
     * Success → a row with ``provider=<provider.name>``, the answers, the
       upstream meta, ``shadow_of`` = the answering row's ``decision_id``.
@@ -133,7 +151,9 @@ async def _run_shadow(
         provider_error: str | None = None
         upstream: UpstreamMeta | None = None
         try:
-            result = await provider.evaluate(state=body.state, questions=body.questions)
+            result = await provider.evaluate(
+                state=payload.state, questions=payload.questions
+            )
         except ProviderError as err:
             # Plain values only; ``err`` is not kept (msg-344 v7 #2).
             provider_error = f"{provider.name}:{err.code}"
@@ -156,6 +176,7 @@ async def _run_shadow(
             provider_input_tokens=upstream.input_tokens if upstream else None,
             provider_output_tokens=upstream.output_tokens if upstream else None,
             shadow_of=shadow_of,
+            redactions=payload.redactions,
         )
         await decision_log.awrite(row)
     except Exception as exc:  # noqa: BLE001 — v7 §2: nothing may escape to the ASGI layer
@@ -186,8 +207,22 @@ async def decide(
     provider_error: str | None = None
     upstream: UpstreamMeta | None = None
     failure: dict[str, Any] | None = None
+    payload, ingress_error = _redact_or_block(body, decision_id)
+    redactions = payload.redactions if payload is not None else None
+    if payload is None:
+        # Nothing is sent; NullProvider answers as on a provider failure
+        # (the ingress already logged why, in ``_redact_or_block``).
+        provider_error = ingress_error
+        provider = providers["null"]
     try:
-        result = await provider.evaluate(state=body.state, questions=body.questions)
+        if provider.name == "null":
+            # Sends nothing; answers from the caller's own questions.
+            result = await provider.evaluate(state=body.state, questions=body.questions)
+        else:
+            assert payload is not None  # only null runs on a blocked request
+            result = await provider.evaluate(
+                state=payload.state, questions=payload.questions
+            )
     except ProviderError as err:
         # Copy out the five plain values and drop ``err`` right away
         # (Bohr msg-344 v7 #2). The fallback and the log write happen
@@ -239,6 +274,7 @@ async def decide(
         provider_model=upstream.model if upstream else None,
         provider_input_tokens=upstream.input_tokens if upstream else None,
         provider_output_tokens=upstream.output_tokens if upstream else None,
+        redactions=redactions,
     )
     # Off the event loop, on DecisionLog's dedicated single-thread
     # executor (msg-464 v3): a slow or lock-contended commit must not
@@ -247,15 +283,17 @@ async def decide(
     # here and fails the request.
     await decision_log.awrite(row)
 
-    if settings.mode == "shadow":
+    if settings.mode == "shadow" and payload is not None:
         # After the answering row is committed, so ``shadow_of`` always
         # points at an existing row. Runs after the response is sent.
+        # Skipped when the ingress blocked the request: nothing is sent.
         background_tasks.add_task(
             _run_shadow,
             provider=providers[settings.primary],
             decision_log=decision_log,
             shadow_of=decision_id,
             body=body,
+            payload=payload,
         )
 
     # Provider names are constrained to the Literal in DecideResponse,
@@ -275,6 +313,46 @@ async def decide(
         decision_id=decision_id,
         latency_ms=latency_ms,
     )
+
+
+def _redact_or_block(
+    body: DecideRequest, decision_id: str
+) -> tuple[DecidePayload | None, str | None]:
+    """Redact ``body`` for sending, or say why it must not be sent.
+
+    Returns ``(payload, None)`` or ``(None, "ingress:<code>")``:
+    ``key_redacted`` when a key matched a rule, ``redaction_failed`` when
+    the scanner raised. Logs carry the policy, the decision id, counts and
+    the exception type name only -- never ``exc_info`` (the frames hold
+    ``state``; see the note in :func:`decide`).
+    """
+    try:
+        payload = redact_decide_payload(body.state, dict(body.questions))
+    except KeyRedacted:
+        logger.warning(
+            "decide_ingress_blocked",
+            policy=body.policy,
+            decision_id=decision_id,
+            code="key_redacted",
+        )
+        return None, "ingress:key_redacted"
+    except Exception as exc:  # noqa: BLE001 - any scanner failure blocks the send
+        logger.error(
+            "decide_ingress_blocked",
+            policy=body.policy,
+            decision_id=decision_id,
+            code="redaction_failed",
+            exc_type=type(exc).__name__,
+        )
+        return None, "ingress:redaction_failed"
+    if payload.redactions:
+        logger.info(
+            "ingress_redacted",
+            policy=body.policy,
+            decision_id=decision_id,
+            redactions=payload.redactions,
+        )
+    return payload, None
 
 
 def _answers_for_log(answers: dict[str, Any]) -> dict[str, Any]:

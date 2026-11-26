@@ -55,6 +55,7 @@ class TestDecisionRowShape:
             "provider_input_tokens",
             "provider_output_tokens",
             "shadow_of",
+            "redactions",
         }
         fields = {f for f in DecisionRow.__dataclass_fields__ if not f.startswith("_")}
         assert fields == allowed
@@ -203,6 +204,7 @@ class TestDecisionLogSqlite:
             "provider_input_tokens",
             "provider_output_tokens",
             "shadow_of",
+            "redactions",
         }
         # And to satisfy the type checker that sqlite3 is used.
         assert isinstance(log._conn, sqlite3.Connection)  # noqa: SLF001
@@ -232,6 +234,7 @@ _ADDED = (
     "provider_input_tokens",
     "provider_output_tokens",
     "shadow_of",
+    "redactions",
 )
 
 

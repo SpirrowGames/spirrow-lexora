@@ -332,3 +332,99 @@ def apply_ingress(
             )
 
     return IngressBackend(backend, route=route, redactions=redactions, redaction_extent=redaction_extent)
+
+
+# ---------------------------------------------------------------------------
+# /v1/decide (T-decide-endpoint-bypasses-ingress-redaction, Bohr msg-1154 v1,
+# msg-1156 v2, msg-1158 v3; cleared by Einstein)
+# ---------------------------------------------------------------------------
+
+
+class KeyRedacted(Exception):
+    """A dict key (or a question name) matched a redaction rule.
+
+    Keys are never rewritten: question names and choice options are the
+    answer's keys, so a rewritten key breaks the caller's contract (and two
+    keys could collide). The payload must not leave Lexora instead. The
+    message carries no key text."""
+
+
+def check_keys(value: Any) -> None:
+    """Raise ``KeyRedacted`` when any dict key at any depth of ``value``
+    (lists included) is changed by the ingress rules.
+
+    Uses a throwaway ``Redactor`` so a hit does not count toward the
+    request's ``redactions``: nothing is sent, so nothing was redacted.
+    Shared with the tier path, whose JSON keys are tracked in
+    T-ingress-json-keys-not-redacted (not applied there by this change)."""
+    probe = Redactor()
+    stack: list[Any] = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if isinstance(key, str) and probe.redact(key) != key:
+                    raise KeyRedacted("a key matched a redaction rule")
+                stack.append(child)
+        elif isinstance(item, list):
+            stack.extend(item)
+
+
+@dataclass(frozen=True)
+class DecidePayload:
+    """What ``redact_decide_payload`` returns: the values to send and the
+    redactions made (``kind:count,...``; None when nothing was replaced)."""
+
+    state: str
+    questions: dict[str, Any]
+    redactions: str | None
+
+
+def redact_decide_payload(state: str, questions: dict[str, Any]) -> DecidePayload:
+    """Redact a ``/v1/decide`` request with the tier rules (D-1 / D-2,
+    msg-909) and nothing else.
+
+    * One ``Redactor`` for state and questions, so ``#n`` runs through one
+      decision.
+    * ``state``: valid JSON is redacted structurally and serialized back
+      (``_redact_arguments``), so a compact one-line JSON is not wiped by
+      D-1's line rule on a key such as ``max_tokens``; when nothing is found
+      the caller's exact bytes are kept. Anything else is redacted as text.
+    * ``questions``: every field but ``type`` -- ``instructions`` as text,
+      ``criteria`` and every extra field through ``_redact_json``. All of
+      them reach the provider, so none is skipped (fail closed).
+    * Keys: question names, every key in each spec (nested, lists
+      included) and every key of a JSON state are checked first;
+      a hit raises ``KeyRedacted`` and nothing is returned.
+
+    ``questions`` maps names to ``QuestionSpec`` (anything with
+    ``model_dump``); the result holds new specs of the same class.
+    Any other scanner exception propagates: the caller must not send."""
+    dumped = {name: spec.model_dump(mode="python") for name, spec in questions.items()}
+    check_keys(dumped)  # its top-level keys are the question names
+    try:
+        parsed_state = json.loads(state)
+    except ValueError:
+        pass
+    else:
+        check_keys(parsed_state)
+
+    redactor = Redactor()
+    new_state = _redact_arguments(state, redactor)
+    new_questions: dict[str, Any] = {}
+    for name, spec in questions.items():
+        fields = dumped[name]
+        out: dict[str, Any] = {}
+        for field, value in fields.items():
+            if field == "type":
+                out[field] = value
+            elif field == "instructions" and isinstance(value, str):
+                out[field] = redactor.redact(value)
+            else:
+                out[field] = _redact_json(value, redactor)
+        new_questions[name] = type(spec)(**out)
+    return DecidePayload(
+        state=new_state,
+        questions=new_questions,
+        redactions=format_redactions(redactor.counts),
+    )
