@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     provider_model    TEXT NULL,
     provider_input_tokens  INTEGER NULL,
     provider_output_tokens INTEGER NULL,
-    shadow_of         TEXT NULL
+    shadow_of         TEXT NULL,
+    redactions        TEXT NULL
 )
 """
 
@@ -66,11 +67,13 @@ _INSERT_SQL = """
 INSERT INTO decisions (
     decision_id, policy, state_hash, questions_hash, questions_version,
     provider, answers_json, latency_ms, timestamp, provider_error,
-    provider_model, provider_input_tokens, provider_output_tokens, shadow_of
+    provider_model, provider_input_tokens, provider_output_tokens, shadow_of,
+    redactions
 ) VALUES (
     :decision_id, :policy, :state_hash, :questions_hash, :questions_version,
     :provider, :answers_json, :latency_ms, :timestamp, :provider_error,
-    :provider_model, :provider_input_tokens, :provider_output_tokens, :shadow_of
+    :provider_model, :provider_input_tokens, :provider_output_tokens, :shadow_of,
+    :redactions
 )
 """
 
@@ -85,6 +88,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("provider_output_tokens", "INTEGER NULL"),
     # Shadow rows (Bohr msg-583 v6 §3).
     ("shadow_of", "TEXT NULL"),
+    # Ingress redaction counts (T-decide-endpoint-bypasses-ingress-redaction
+    # msg-1154 §4).
+    ("redactions", "TEXT NULL"),
 )
 
 
@@ -194,6 +200,12 @@ class DecisionRow:
       ``decision_id`` on a shadow row. Under ``mode="shadow"`` the
       answering row is ``provider="null"`` with ``provider_error=None``:
       Null answering is the design there, not a failure.
+    * ``redactions`` -- what the ingress redaction replaced in this
+      request's ``state`` / ``questions``, as ``kind:count,...``
+      (``format_redactions``); ``None`` when nothing was replaced. Counts
+      only, never the replaced text. ``provider_error="ingress:key_redacted"``
+      / ``"ingress:redaction_failed"`` marks a request that was not sent to
+      any provider (T-decide-endpoint-bypasses-ingress-redaction).
     * ``answers_json`` — JSON-serialised ``answers`` object. Kept as a
       string rather than a nested dict because SQLite has no JSON
       column type and turning every read into a JSON parse in Python
@@ -220,6 +232,7 @@ class DecisionRow:
     provider_input_tokens: int | None = None
     provider_output_tokens: int | None = None
     shadow_of: str | None = None
+    redactions: str | None = None
 
     def __post_init__(self) -> None:
         # Fixed-width hash discipline lives here so a caller who passes
@@ -252,6 +265,7 @@ def build_decision_row(
     provider_input_tokens: int | None = None,
     provider_output_tokens: int | None = None,
     shadow_of: str | None = None,
+    redactions: str | None = None,
 ) -> DecisionRow:
     """Construct a :class:`DecisionRow` from the request/response shape.
 
@@ -279,6 +293,7 @@ def build_decision_row(
         provider_input_tokens=provider_input_tokens,
         provider_output_tokens=provider_output_tokens,
         shadow_of=shadow_of,
+        redactions=redactions,
     )
 
 
@@ -412,7 +427,7 @@ class DecisionLog:
                 "SELECT decision_id, policy, state_hash, questions_hash, "
                 "questions_version, provider, answers_json, latency_ms, "
                 "timestamp, provider_error, provider_model, provider_input_tokens, "
-                "provider_output_tokens, shadow_of FROM decisions ORDER BY timestamp, decision_id"
+                "provider_output_tokens, shadow_of, redactions FROM decisions ORDER BY timestamp, decision_id"
             )
             columns = [c[0] for c in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -462,4 +477,5 @@ def _row_as_params(row: DecisionRow) -> dict[str, Any]:
         "provider_input_tokens": row.provider_input_tokens,
         "provider_output_tokens": row.provider_output_tokens,
         "shadow_of": row.shadow_of,
+        "redactions": row.redactions,
     }
